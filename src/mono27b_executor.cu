@@ -867,8 +867,7 @@ extern "C" bool mono27b_engine_decode_step(
             MV(L.wqkv, h2, sb);
             MV(L.wqkv_gate, h2, gb);
 
-            // Skip SSM state-dependent path (debugging NaN)
-            if (0 && L.ssm_beta.ptr && L.ssm_alpha.ptr && L.ssm_dt_bias.ptr && L.ssm_a_log.ptr) {
+            if (L.ssm_beta.ptr && L.ssm_alpha.ptr && L.ssm_dt_bias.ptr && L.ssm_a_log.ptr) {
                 int dr = MONO27B_SSM_DT_RANK;
                 MV(L.ssm_beta, h2, kb);
                 k_elem_sigmoid<<<(dr + 31) / 32, 32>>>(kb, dr);
@@ -876,8 +875,8 @@ extern "C" bool mono27b_engine_decode_step(
                 k_elem_softplus<<<(dr + 31) / 32, 32>>>(qb, WV(L.ssm_dt_bias), qb, dr);
                 k_elem_mul<<<(dr + 31) / 32, 32>>>(qb, WV(L.ssm_a_log), dr);
 
-                // Conv1D - skip if NaN issues
-                if (0 && st->conv_state[ssm_i]) {
+                // Conv1D
+                if (st->conv_state[ssm_i]) {
                     k_ssm_conv1d_u<<<(MONO27B_SSM_CONV_CH + 255) / 256, 256>>>(
                         sb, (const float *)L.ssm_conv1d.ptr, st->conv_state[ssm_i], sb,
                         MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_KERN);
@@ -891,8 +890,8 @@ extern "C" bool mono27b_engine_decode_step(
                 k_l2_norm_g<<<MONO27B_SSM_N_GROUP, 128>>>(qr, MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP);
                 k_l2_norm_g<<<MONO27B_SSM_N_GROUP, 128>>>(kr, MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP);
 
-                // Gated DeltaNet
-                if (st->ssm_state[ssm_i]) {
+                // Gated DeltaNet - disable to isolate NaN
+                if (0 && st->ssm_state[ssm_i]) {
                     dim3 dg(MONO27B_SSM_N_GROUP, MONO27B_SSM_DT_RANK, MONO27B_SSM_HEAD_V);
                     k_deltanet<<<dg, 1>>>(qr, kr, vr, qb, kb, st->ssm_state[ssm_i], gb,
                         MONO27B_SSM_N_GROUP, MONO27B_SSM_DT_RANK,
