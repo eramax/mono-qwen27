@@ -48,7 +48,6 @@ int main(int argc, char ** argv) {
 
     cudaDeviceReset();
     cudaSetDevice(0);
-    fprintf(stderr, "[args] ctx=%d gen=%d prompt=%s\n", args.max_ctx, args.max_gen, args.prompt.c_str());
     // Read GGUF info
     Mono27BGgufFile gguf;
     std::string gguf_error;
@@ -164,8 +163,6 @@ int main(int argc, char ** argv) {
                  tokenizer.bos_id(), tokenizer.eos_id());
 
     // Memory tracking
-    { size_t f,t; cudaMemGetInfo(&f,&t); fprintf(stderr, "[mem] before all: free=%zuMB total=%zuMB\n", f/1048576, t/1048576); }
-
     // Initialize runtime state BEFORE loading weights to avoid fragmentation
     cudaDeviceSynchronize();
     Mono27BExecutorState state{};
@@ -176,7 +173,6 @@ int main(int argc, char ** argv) {
         return 1;
     }
     state.max_ctx = args.max_ctx;
-    { size_t f,t; cudaMemGetInfo(&f,&t); fprintf(stderr, "[mem] after state: free=%zuMB\n", f/1048576); }
 
     // Load weights to GPU
     Mono27BExecutorWeights gpu_weights{};
@@ -189,25 +185,19 @@ int main(int argc, char ** argv) {
         munmap(mmap_data, file_size);
         return 1;
     }
-    { size_t f,t; cudaMemGetInfo(&f,&t); fprintf(stderr, "[mem] after weights: free=%zuMB\n", f/1048576); }
-    // Clear any CUDA error state from weight loading
     cudaGetLastError();
     std::fprintf(stderr, "[load] GPU weights ready\n");
 
     // Encode prompt
     std::vector<int32_t> prompt_ids = tokenizer.encode(args.prompt);
     std::fprintf(stderr, "[prompt] tokens=%zu\n", prompt_ids.size());
-    std::fprintf(stderr, "[info] running 64 layers, this may take a while...\n");
 
     char errbuf[512] = {};
     int pos = 0;
     int last_tok = 0;
     std::vector<int32_t> generated;
 
-    // Process prompt tokens
     for (size_t i = 0; i < prompt_ids.size(); ++i) {
-        std::fprintf(stderr, "[tok %zu/%zu]", i+1, prompt_ids.size());
-        fflush(stderr);
         Mono27BLogitsOutput logits{};
         if (!mono27b_engine_decode_step(&gpu_weights, &state,
                                          prompt_ids[i], static_cast<int>(i),

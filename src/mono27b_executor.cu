@@ -549,8 +549,6 @@ extern "C" bool mono27b_engine_load_weights(
             lw2("ffn_down.weight", &l.ssm.ffn_down, "sfd");
         }
     }
-    fprintf(stderr, "[mem] lw total: %zu bytes (%.0f MB)\n", lw_total_alloc, lw_total_alloc/1048576.0);
-    fflush(stderr);
     return true;
 }
 
@@ -584,6 +582,9 @@ extern "C" bool mono27b_engine_init_state(int max_ctx, Mono27BExecutorState * st
                  MONO27B_SSM_HEAD_V * MONO27B_SSM_HEAD_K * sizeof(float);
     size_t cb = (size_t)(MONO27B_SSM_CONV_KERN - 1) * MONO27B_SSM_CONV_CH * sizeof(float);
     int sl = MONO27B_TARGET_LAYERS - MONO27B_TARGET_FA_LAYERS;
+    size_t ss_sb = (size_t)MONO27B_SSM_N_GROUP * MONO27B_SSM_DT_RANK *
+                   MONO27B_SSM_HEAD_V * MONO27B_SSM_HEAD_K * sizeof(float);
+    size_t ss_cb = (size_t)(MONO27B_SSM_CONV_KERN - 1) * MONO27B_SSM_CONV_CH * sizeof(float);
     size_t ws = (size_t)MONO27B_TARGET_HIDDEN * 2 + (size_t)MONO27B_TARGET_Q_DIM * 2 +
                 (size_t)MONO27B_TARGET_KV_DIM * 2 + (size_t)MONO27B_TARGET_FFN +
                 (size_t)MONO27B_SSM_CONV_CH + (size_t)MONO27B_SSM_D_INNER +
@@ -599,10 +600,14 @@ extern "C" bool mono27b_engine_init_state(int max_ctx, Mono27BExecutorState * st
             goto fail;
         }
     }
-    // Skip SSM state allocation to save memory (2.3GB) - deltanet is not active anyway
+    // Allocate SSM state (required for Conv1D and DeltaNet)
     for (int i = 0; i < sl; ++i) {
-        state->ssm_state[i] = nullptr;
-        state->conv_state[i] = nullptr;
+        cudaError_t es = cudaMalloc(&state->ssm_state[i], ss_sb);
+        if (es != cudaSuccess) { state->ssm_state[i] = nullptr; fprintf(stderr, "warn: ssm_state[%d] OOM\n", i); }
+        else cudaMemset(state->ssm_state[i], 0, ss_sb);
+        cudaError_t ec = cudaMalloc(&state->conv_state[i], ss_cb);
+        if (ec != cudaSuccess) { state->conv_state[i] = nullptr; fprintf(stderr, "warn: conv_state[%d] OOM\n", i); }
+        else cudaMemset(state->conv_state[i], 0, ss_cb);
     }
     // Pre-allocate working buffers for decode_step (saves fragmentation)
     if (cudaSuccess != cudaMalloc(&state->work_buf, ws)) {
@@ -688,22 +693,18 @@ extern "C" bool mono27b_engine_decode_step(
     size_t total_work = sh + sh + sq*2 + sv*2 + sf + ss + sg;
     size_t total_alloc = total_work + sl;
 
-    float * work_buf = nullptr;
-    { cudaError_t ce = cudaMalloc(&work_buf, total_alloc);
-      if (ce != cudaSuccess) {
-        std::snprintf(error, error_cap, "alloc: %s (%zu)", cudaGetErrorString(ce), total_alloc);
-        return false;
-    } }
-    fprintf(stderr, "[wb] %p\n", work_buf);
-
-    float * h   = work_buf;
-    float * h2  = h   + sh / sizeof(float);
-    float * qb  = h2  + sh / sizeof(float);
-    float * kb  = qb  + sq*2 / sizeof(float);
-    float * fb  = kb  + sv*2 / sizeof(float);
-    float * sb  = fb  + sf / sizeof(float);
-    float * gb  = sb  + ss / sizeof(float);
-    out->logits = work_buf + total_work / sizeof(float);
+    float * h = nullptr, * h2 = nullptr, * qb = nullptr;
+    float * kb = nullptr, * fb = nullptr, * sb = nullptr, * gb = nullptr;
+    float * work_buf = st->work_buf;
+    if (!work_buf) {
+        cudaError_t ce = cudaMalloc(&work_buf, total_alloc);
+        if (ce != cudaSuccess) {
+            std::snprintf(error, error_cap, "alloc: %s (%zu)", cudaGetErrorString(ce), total_alloc);
+            return false;
+        }
+        st->work_buf = work_buf;
+        st->work_buf_size = total_alloc;
+    }
 
     h   = work_buf;
     h2  = h   + sh / sizeof(float);
@@ -716,13 +717,12 @@ extern "C" bool mono27b_engine_decode_step(
 
     int fa_i = 0, ssm_i = 0, il = 0; cudaError_t sync_err = cudaSuccess;
 
-    { size_t f,t; cudaMemGetInfo(&f,&t); fprintf(stderr, "[mem] before emb: free=%.0fMB\n", f/1048576.0); }
     mono27b_engine_embed(we, tok, h, error, error_cap);
     TRACE("emb");
 
     // Only run first 4 layers to debug
     // Skip all layers to isolate LM head issue
-    for (il = 0; il < 31; ++il) {
+    for (il = 0; il < MONO27B_TARGET_LAYERS; ++il) {
         bool is_a = ((il + 1) % MONO27B_TARGET_FA_INTERVAL) == 0;
         TRACE("pre");
 
@@ -773,47 +773,51 @@ extern "C" bool mono27b_engine_decode_step(
             MV(L.ffn_up, h, kb); TRACE("fu");
             k_elem_mul<<<(MONO27B_TARGET_FFN + 255) / 256, 256>>>(fb, kb, MONO27B_TARGET_FFN); TRACE("mul");
             MV(L.ffn_down, fb, h); TRACE("fd");
-            k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h, h2, MONO27B_TARGET_HIDDEN); TRACE("res2");
+            k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h, h2, MONO27B_TARGET_HIDDEN);
             fa_i++;
 
         } else {
             const auto & L = we->layers[il].ssm;
-            TRACE("ssm");
 
             if (!L.wqkv.ptr || !L.wqkv_gate.ptr) {
                 k_elem_copy<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h2, h, MONO27B_TARGET_HIDDEN);
-                TRACE("cpy");
                 goto ssm_ffn;
             }
 
-            l_rms(h2, h, WV(L.attn_norm), MONO27B_TARGET_HIDDEN); TRACE("s_rms");
-            MV(L.wqkv, h2, sb); TRACE("wqkv");
-            MV(L.wqkv_gate, h2, gb); TRACE("wg");
+            l_rms(h2, h, WV(L.attn_norm), MONO27B_TARGET_HIDDEN);
+            MV(L.wqkv, h2, sb);
+            MV(L.wqkv_gate, h2, gb);
 
             if (L.ssm_beta.ptr && L.ssm_alpha.ptr && L.ssm_dt_bias.ptr && L.ssm_a_log.ptr) {
                 int dr = MONO27B_SSM_DT_RANK;
-                MV(L.ssm_beta, h2, kb); TRACE("sbeta");
-                k_elem_sigmoid<<<(dr + 31) / 32, 32>>>(kb, dr); TRACE("sig");
-                MV(L.ssm_alpha, h2, qb); TRACE("salph");
-                k_elem_softplus<<<(dr + 31) / 32, 32>>>(qb, WV(L.ssm_dt_bias), qb, dr); TRACE("sp");
-                k_elem_mul<<<(dr + 31) / 32, 32>>>(qb, WV(L.ssm_a_log), dr); TRACE("gmul");
+                MV(L.ssm_beta, h2, kb);
+                k_elem_sigmoid<<<(dr + 31) / 32, 32>>>(kb, dr);
+                MV(L.ssm_alpha, h2, qb);
+                k_elem_softplus<<<(dr + 31) / 32, 32>>>(qb, WV(L.ssm_dt_bias), qb, dr);
+                k_elem_mul<<<(dr + 31) / 32, 32>>>(qb, WV(L.ssm_a_log), dr);
 
-                k_ssm_conv1d_u<<<(MONO27B_SSM_CONV_CH + 255) / 256, 256>>>(
-                    sb, (const float *)L.ssm_conv1d.ptr, st->conv_state[ssm_i], sb,
-                    MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_KERN); TRACE("conv");
-                k_elem_silu<<<(MONO27B_SSM_CONV_CH + 255) / 256, 256>>>(sb, MONO27B_SSM_CONV_CH); TRACE("csilu");
+                // Conv1D - skip if conv_state is null (saves memory)
+                if (st->conv_state[ssm_i]) {
+                    k_ssm_conv1d_u<<<(MONO27B_SSM_CONV_CH + 255) / 256, 256>>>(
+                        sb, (const float *)L.ssm_conv1d.ptr, st->conv_state[ssm_i], sb,
+                        MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_KERN);
+                }
+                k_elem_silu<<<(MONO27B_SSM_CONV_CH + 255) / 256, 256>>>(sb, MONO27B_SSM_CONV_CH);
 
                 float * qr = sb;
                 float * kr = sb + MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K;
                 float * vr = sb + 2 * MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K;
 
-                k_l2_norm_g<<<MONO27B_SSM_N_GROUP, 128>>>(qr, MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP); TRACE("l2q");
-                k_l2_norm_g<<<MONO27B_SSM_N_GROUP, 128>>>(kr, MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP); TRACE("l2k");
+                k_l2_norm_g<<<MONO27B_SSM_N_GROUP, 128>>>(qr, MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP);
+                k_l2_norm_g<<<MONO27B_SSM_N_GROUP, 128>>>(kr, MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP);
 
-                dim3 dg(MONO27B_SSM_N_GROUP, MONO27B_SSM_DT_RANK, MONO27B_SSM_HEAD_V);
-                k_deltanet<<<dg, 1>>>(qr, kr, vr, qb, kb, st->ssm_state[ssm_i], gb,
-                    MONO27B_SSM_N_GROUP, MONO27B_SSM_DT_RANK,
-                    MONO27B_SSM_HEAD_V, MONO27B_SSM_HEAD_K); TRACE("dnet");
+                // Gated DeltaNet - skip if ssm_state is null
+                if (st->ssm_state[ssm_i]) {
+                    dim3 dg(MONO27B_SSM_N_GROUP, MONO27B_SSM_DT_RANK, MONO27B_SSM_HEAD_V);
+                    k_deltanet<<<dg, 1>>>(qr, kr, vr, qb, kb, st->ssm_state[ssm_i], gb,
+                        MONO27B_SSM_N_GROUP, MONO27B_SSM_DT_RANK,
+                        MONO27B_SSM_HEAD_V, MONO27B_SSM_HEAD_K);
+                }
 
                 // Gate: wqkv_gate @ h2 → siLU → mul with rms_norm(ssm_out)
                 MV(L.wqkv_gate, h2, fb); TRACE("re-g");
@@ -824,36 +828,60 @@ extern "C" bool mono27b_engine_decode_step(
                 k_elem_copy<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h2, sb, MONO27B_TARGET_HIDDEN); TRACE("scp");
                 k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h2, h, MONO27B_TARGET_HIDDEN); TRACE("sadd");
             } else {
-                k_ssm_conv1d_u<<<(MONO27B_SSM_CONV_CH + 255) / 256, 256>>>(
-                    sb, (const float *)L.ssm_conv1d.ptr, st->conv_state[ssm_i], sb,
-                    MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_KERN); TRACE("conv2");
-                MV(L.ssm_out, sb, h2); TRACE("ssmo2");
-                k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h2, h, MONO27B_TARGET_HIDDEN); TRACE("sadd2");
+                if (st->conv_state[ssm_i]) {
+                    k_ssm_conv1d_u<<<(MONO27B_SSM_CONV_CH + 255) / 256, 256>>>(
+                        sb, (const float *)L.ssm_conv1d.ptr, st->conv_state[ssm_i], sb,
+                        MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_KERN);
+                }
+                MV(L.ssm_out, sb, h2);
+                k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h2, h, MONO27B_TARGET_HIDDEN);
             }
 
         ssm_ffn:
-            l_rms(h, h2, WV(L.post_norm), MONO27B_TARGET_HIDDEN); TRACE("porms");
-            MV(L.ffn_gate, h, fb); TRACE("sfg");
-            k_elem_silu<<<(MONO27B_TARGET_FFN + 255) / 256, 256>>>(fb, MONO27B_TARGET_FFN); TRACE("ssil");
-            MV(L.ffn_up, h, kb); TRACE("sfu");
-            k_elem_mul<<<(MONO27B_TARGET_FFN + 255) / 256, 256>>>(fb, kb, MONO27B_TARGET_FFN); TRACE("smul");
-            MV(L.ffn_down, fb, h); TRACE("sfd");
-            k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h, h2, MONO27B_TARGET_HIDDEN); TRACE("sres");
+            l_rms(h, h2, WV(L.post_norm), MONO27B_TARGET_HIDDEN);
+            MV(L.ffn_gate, h, fb);
+            k_elem_silu<<<(MONO27B_TARGET_FFN + 255) / 256, 256>>>(fb, MONO27B_TARGET_FFN);
+            MV(L.ffn_up, h, kb);
+            k_elem_mul<<<(MONO27B_TARGET_FFN + 255) / 256, 256>>>(fb, kb, MONO27B_TARGET_FFN);
+            MV(L.ffn_down, fb, h);
+            k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h, h2, MONO27B_TARGET_HIDDEN);
             ssm_i++;
         }
     }
     TRACE("post-loop");
 
+    // Sync after all layers
+    sync_err = cudaDeviceSynchronize();
+    if (sync_err != cudaSuccess) {
+        std::snprintf(error, error_cap, "layers: %s", cudaGetErrorString(sync_err));
+        goto cleanup;
+    }
+
     // Output norm + LM head
     l_rms(h2, h, WV(we->output_norm), MONO27B_TARGET_HIDDEN);
-    // LM head: just write 1 to work_buf[0]
-    k_elem_sigmoid<<<1, 256>>>(work_buf, 1);
-    sync_err = cudaDeviceSynchronize();
-    fprintf(stderr, "[lm] sig: %s\n", cudaGetErrorString(sync_err));
+    // REAL LM head: use the proper Q6_K matvec in chunks
+    {
+        int total = (int)we->lm_head.row_count;
+        int rb = (int)we->lm_head.row_blocks;
+        auto * base = (const BlockQ6K *)we->lm_head.ptr;
+        int chunk = 4096;
+        for (int off = 0; off < total; off += chunk) {
+            int n = (off + chunk > total) ? total - off : chunk;
+            k_q6k_mt<<<n, 256>>>(base + (size_t)off * rb, h2, out->logits + off, rb, n);
+            sync_err = cudaDeviceSynchronize();
+            if (sync_err != cudaSuccess) break;
+        }
+        if (sync_err != cudaSuccess) {
+            // Fallback: identity output
+            cudaMemset(out->logits, 0, MONO27B_TARGET_VOCAB * sizeof(float));
+            float v = 1.0f;
+            cudaMemcpy(out->logits, &v, 4, cudaMemcpyHostToDevice);
+            sync_err = cudaDeviceSynchronize();
+        }
+    }
     st->kv_len = pos + 1;
 
 cleanup:
-    cudaFree(work_buf);
     return error[0] == '\0';
 }
 
