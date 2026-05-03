@@ -1,5 +1,6 @@
 #include "mono27b_tokenizer.h"
 
+#include <algorithm>
 #include <climits>
 #include <cstdio>
 
@@ -21,6 +22,7 @@ bool Mono27BTokenizer::load_from_blob(const std::string & blob_path,
     vocab_.clear();
     str_to_id_.clear();
     merge_rank_.clear();
+    special_tokens_.clear();
 
     std::FILE * fp = std::fopen(blob_path.c_str(), "rb");
     if (!fp) {
@@ -71,6 +73,17 @@ bool Mono27BTokenizer::load_from_blob(const std::string & blob_path,
     }
 
     std::fclose(fp);
+    for (int32_t i = 0; i < static_cast<int32_t>(vocab_.size()); ++i) {
+        const std::string & token = vocab_[static_cast<size_t>(i)];
+        if (token.size() >= 4 && token.rfind("<|", 0) == 0) {
+            special_tokens_.emplace_back(token, i);
+        }
+    }
+    std::sort(special_tokens_.begin(), special_tokens_.end(),
+              [](const auto & a, const auto & b) {
+                  if (a.first.size() != b.first.size()) return a.first.size() > b.first.size();
+                  return a.second < b.second;
+              });
     init_byte_tables();
     return vocab_.size() == tokenizer_.vocab_size;
 }
@@ -118,6 +131,20 @@ std::vector<int32_t> Mono27BTokenizer::encode(const std::string & text) const {
     std::vector<std::string> chunks;
     size_t i = 0;
     while (i < text.size()) {
+        bool matched_special = false;
+        for (const auto & sp : special_tokens_) {
+            const std::string & token = sp.first;
+            if (i + token.size() <= text.size() && text.compare(i, token.size(), token) == 0) {
+                chunks.push_back(token);
+                i += token.size();
+                matched_special = true;
+                break;
+            }
+        }
+        if (matched_special) {
+            continue;
+        }
+
         unsigned char c = static_cast<unsigned char>(text[i]);
         std::string chunk;
         if (c == ' ') {

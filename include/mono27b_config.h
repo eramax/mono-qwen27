@@ -66,6 +66,7 @@ struct Mono27BSSMLayerWeights {
     WeightView ssm_alpha;
     WeightView ssm_dt_bias;
     WeightView ssm_a_log;
+    WeightView ssm_norm;
     WeightView ssm_out;
     WeightView post_norm;
     WeightView ffn_gate;

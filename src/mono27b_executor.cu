@@ -95,8 +95,10 @@ __global__ static void k_elem_silu(float * x, int n) {
 }
 
 __global__ static void k_elem_softplus(const float * x, const float * bias, float * out, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
-        out[i] = logf(1.0f + expf(x[i] + bias[i]));
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        float z = x[i] + bias[i];
+        out[i] = fmaxf(z, 0.0f) + log1pf(expf(-fabsf(z)));
+    }
 }
 
 __global__ static void k_elem_sigmoid(float * x, int n) {
@@ -165,6 +167,22 @@ __global__ static void k_q4k_mv(const BlockQ4K * W, const float * x, float * y, 
 
 // ─── Q5_K matvec ─────────────────────────────────────────────────────────────
 
+static __device__ inline float q5k_val(const BlockQ5K & qb, int e) {
+    const int n64 = e / 64;
+    const int l   = e % 32;
+    const int hi  = (e % 64) / 32;
+    uint8_t sc, m;
+    get_scale_min_k4(n64 * 2 + hi, qb.scales, sc, m);
+    const float d = __half2float(qb.d);
+    const float mn = __half2float(qb.dmin);
+    const float d0 = d * (float)sc;
+    const float m0 = mn * (float)m;
+    const uint8_t qsrc = qb.qs[n64 * 32 + l];
+    const int qv = (hi == 0 ? (qsrc & 0x0F) : (qsrc >> 4)) +
+                   ((qb.qh[l] & (1 << (n64 * 2 + hi))) ? 16 : 0);
+    return d0 * (float)qv - m0;
+}
+
 template <int BLK>
 __global__ static void k_q5k_mv(const BlockQ5K * W, const float * x, float * y, int rb, int rc) {
     int row = blockIdx.x;
@@ -172,25 +190,10 @@ __global__ static void k_q5k_mv(const BlockQ5K * W, const float * x, float * y, 
     __shared__ float sh[BLK];
     float sum = 0.0f;
     const BlockQ5K * rp = W + (size_t)row * rb;
-    for (int b = threadIdx.x; b < rb; b += BLK) {
+    for (int b = 0; b < rb; ++b) {
         const BlockQ5K & qb = rp[b];
-        float d = __half2float(qb.d);
-        float mn = __half2float(qb.dmin);
-        for (int g = 0; g < 8; ++g) {
-            uint8_t s0, m0;
-            get_scale_min_k4(g, qb.scales, s0, m0);
-            float d0 = d * (float)s0;
-            float mn0 = mn * (float)m0;
-            int base = b * 256 + g * 32;
-            const uint8_t * qs = qb.qs + (g / 2) * 32;
-            int use_high = g & 1;
-            uint8_t qhm = 1 << g;
-            for (int i = 0; i < 32; ++i) {
-                int nib = use_high ? (qs[i] >> 4) : (qs[i] & 0x0F);
-                int qv = nib + ((qb.qh[i] & qhm) ? 16 : 0);
-                sum += (d0 * qv - mn0) * x[base + i];
-            }
-        }
+        for (int e = threadIdx.x; e < 256; e += BLK)
+            sum += q5k_val(qb, e) * x[b * 256 + e];
     }
     sh[threadIdx.x] = sum;
     __syncthreads();
@@ -235,7 +238,24 @@ __global__ static void k_iq4xs_mv(const BlockIQ4XS * W, const float * x, float *
 
 // ─── Q6_K matvec ─────────────────────────────────────────────────────────────
 
-// Q6_K matvec: correct strided layout matching ggml reference
+static __device__ inline float q6k_val(const BlockQ6K & qb, int e) {
+    const int n128 = e / 128;
+    const int l    = e % 32;
+    const int r    = (e % 128) / 32;
+    const int is   = l / 16;
+    const int8_t * sc = qb.scales + n128 * 8;
+    const uint8_t * ql = qb.ql + n128 * 64;
+    const uint8_t * qh = qb.qh + n128 * 32;
+    int qv;
+    if (r == 0) qv = (int)((ql[l + 0] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
+    else if (r == 1) qv = (int)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+    else if (r == 2) qv = (int)((ql[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+    else qv = (int)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+    const int sc_idx = is + (r * 2);
+    return __half2float(qb.d) * (float)sc[sc_idx] * (float)qv;
+}
+
+// Q6_K matvec: direct dequantization matching ggml reference
 __global__ static void k_q6k_mt(const BlockQ6K * W, const float * x, float * y, int rb, int rc) {
     int row = blockIdx.x;
     if (row >= rc) return;
@@ -244,29 +264,9 @@ __global__ static void k_q6k_mt(const BlockQ6K * W, const float * x, float * y, 
     const BlockQ6K * rp = W + (size_t)row * rb;
     for (int b = 0; b < rb; ++b) {
         const BlockQ6K & qb = rp[b];
-        float d = __half2float(qb.d);
-        // Each thread handles element at its own index within the block
-        int e = threadIdx.x;  // 0..255
-        // Two 128-element halves
-        int n = e / 128;          // 0 or 1
-        int pos = e % 128;        // position within half
-        int subpos = pos % 32;    // 0..31
-        int group = pos / 32;     // 0,1,2,3
-        // ql offset: each half uses 64 bytes of ql
-        int ql_off = n * 64;
-        // qh offset: each half uses 32 bytes of qh
-        int qh_off = n * 32;
-        // For group 0,1: use ql[subpos + 0/32], low nibble
-        // For group 2,3: use ql[subpos + 0/32], high nibble
-        int use_high = (group >= 2) ? 1 : 0;
-        int ql_idx = ql_off + subpos + (group % 2 == 1 ? 32 : 0);
-        int lo = (qb.ql[ql_idx] >> (4 * use_high)) & 0x0F;
-        int hi = (qb.qh[qh_off + subpos] >> (2 * group)) & 3;
-        int qv = (lo | (hi << 4)) - 32;
-        // Scale: 8 scales per half
-        int sc_idx = n * 8 + group * 2 + subpos / 16;
-        int base = b * 256 + e;
-        sum += d * (float)qb.scales[sc_idx] * (float)qv * x[base];
+        for (int e = threadIdx.x; e < 256; e += 256) {
+            sum += q6k_val(qb, e) * x[b * 256 + e];
+        }
     }
     sh[threadIdx.x] = sum;
     __syncthreads();
@@ -325,13 +325,16 @@ __global__ static void k_l2_norm_g(float * d, int gs, int ng) {
     int g = blockIdx.x;
     if (g >= ng) return;
     float * gd = d + (size_t)g * gs;
+    __shared__ float sh[128];
     float sq = 0.0f;
     for (int i = threadIdx.x; i < gs; i += blockDim.x) sq += gd[i] * gd[i];
-    sq = warp_reduce_sum<32>(sq);
-    __shared__ float sh;
-    if (threadIdx.x == 0) sh = sq;
+    sh[threadIdx.x] = sq;
     __syncthreads();
-    float inv = rsqrtf(sh + 1e-10f);
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv = rsqrtf(sh[0] + 1e-10f);
     for (int i = threadIdx.x; i < gs; i += blockDim.x) gd[i] *= inv;
 }
 
@@ -429,7 +432,7 @@ __global__ static void k_ssm_conv1d_u(const float * inp, const float * w, float 
     out[ch] = s;
 }
 
-// ─── Gated DeltaNet (1 thread per group, dt_rank, column) ────────────────────
+// ─── Gated DeltaNet (1 thread per rank, column) ─────────────────────────────
 
 __global__ static void k_deltanet(
     const float * q, const float * k, const float * v,
@@ -437,17 +440,18 @@ __global__ static void k_deltanet(
     float * state, float * out,
     int ng, int dr, int hv, int hk)
 {
-    int g_idx = blockIdx.x;  // [0..ng)
-    int r_idx = blockIdx.y;  // [0..dr)
-    int col   = blockIdx.z;  // [0..hv)
-    if (g_idx >= ng || r_idx >= dr || col >= hv) return;
+    int r_idx = blockIdx.x;  // [0..dr)
+    int col   = blockIdx.y;  // [0..hv)
+    if (r_idx >= dr || col >= hv) return;
 
-    float g_raw = g[r_idx + (size_t)g_idx * dr];
+    int g_idx = r_idx % ng;
+
+    float g_raw = g[r_idx];
     if (isnan(g_raw)) g_raw = -1.0f;  // prevent NaN propagation
     if (g_raw < -80.0f) g_raw = -80.0f;
     if (g_raw > 80.0f) g_raw = 80.0f;
     float gv = expf(g_raw);
-    float bv = beta[r_idx + (size_t)g_idx * dr];
+    float bv = beta[r_idx];
     if (isnan(bv)) bv = 0.5f;
     if (bv < 0.0f) bv = 0.0f;
     if (bv > 1.0f) bv = 1.0f;
@@ -458,7 +462,7 @@ __global__ static void k_deltanet(
 
     // State is stored transposed: M[col][i] = S[i][col], row col is contiguous
     // Flat layout: state[base + col * hk + i] = S[i][col]
-    float * S = state + ((size_t)g_idx * dr + r_idx) * (size_t)hv * hk + col * (size_t)hk;
+    float * S = state + (size_t)r_idx * hv * hk + col * (size_t)hk;
 
     float kv = 0.0f;
     for (int i = 0; i < hk; ++i) kv += S[i] * kg[i];
@@ -471,7 +475,7 @@ __global__ static void k_deltanet(
         attn += sn * qg[i];
     }
 
-    out[(size_t)r_idx * hv + col] = attn;
+    out[(size_t)r_idx * hv + col] = attn * rsqrtf((float)hv);
 }
 
 // ─── Quant info helpers ──────────────────────────────────────────────────────
@@ -628,6 +632,7 @@ extern "C" bool mono27b_engine_load_weights(
                     }
                 }
             }
+            lw2("ssm_norm.weight", &l.ssm.ssm_norm, "snorm");
             lw2("ssm_out.weight", &l.ssm.ssm_out, "sso");
             lw2("post_attention_norm.weight", &l.ssm.post_norm, "spn");
             lw2("ffn_gate.weight", &l.ssm.ffn_gate, "sfg");
@@ -649,7 +654,7 @@ extern "C" void mono27b_engine_free_weights(Mono27BExecutorWeights * w) {
         } else {
             auto & s = w->layers[il].ssm;
             ff(s.attn_norm); ff(s.wqkv); ff(s.wqkv_gate); ff(s.ssm_conv1d);
-            ff(s.ssm_beta); ff(s.ssm_alpha); ff(s.ssm_dt_bias); ff(s.ssm_a_log);
+            ff(s.ssm_beta); ff(s.ssm_alpha); ff(s.ssm_dt_bias); ff(s.ssm_a_log); ff(s.ssm_norm);
             ff(s.ssm_out); ff(s.post_norm);
             ff(s.ffn_gate); ff(s.ffn_up); ff(s.ffn_down);
         }
@@ -664,11 +669,8 @@ extern "C" bool mono27b_engine_init_state(int max_ctx, Mono27BExecutorState * st
                                            char * error, size_t error_cap) {
     std::memset(state, 0, sizeof(*state));
     size_t kb = (size_t)max_ctx * MONO27B_TARGET_N_KV_HEAD * MONO27B_TARGET_HEAD_DIM * sizeof(float);
-    size_t sb = (size_t)MONO27B_SSM_N_GROUP * MONO27B_SSM_DT_RANK *
-                 MONO27B_SSM_HEAD_V * MONO27B_SSM_HEAD_K * sizeof(float);
-    size_t cb = (size_t)(MONO27B_SSM_CONV_KERN - 1) * MONO27B_SSM_CONV_CH * sizeof(float);
     int sl = MONO27B_TARGET_LAYERS - MONO27B_TARGET_FA_LAYERS;
-    size_t ss_sb = (size_t)MONO27B_SSM_N_GROUP * MONO27B_SSM_DT_RANK *
+    size_t ss_sb = (size_t)MONO27B_SSM_DT_RANK *
                    MONO27B_SSM_HEAD_V * MONO27B_SSM_HEAD_K * sizeof(float);
     size_t ss_cb = (size_t)(MONO27B_SSM_CONV_KERN - 1) * MONO27B_SSM_CONV_CH * sizeof(float);
     size_t ws = (size_t)MONO27B_TARGET_HIDDEN * 2 + (size_t)MONO27B_TARGET_Q_DIM * 2 +
@@ -752,6 +754,23 @@ static void l_mv(void * W, uint32_t ggml_type, int rb, int rc, const float * x, 
 
 static void l_rms(float * dst, const float * x, const float * w, int n) {
     k_rms_norm_mulw<256><<<1, 256>>>(x, w, dst, n, MONO27B_RMS_EPS);
+}
+
+static bool check_finite_device(const char * label, const float * ptr, size_t n,
+                                char * error, size_t error_cap) {
+    std::vector<float> host(n);
+    cudaError_t e = cudaMemcpy(host.data(), ptr, n * sizeof(float), cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        std::snprintf(error, error_cap, "%s copy: %s", label, cudaGetErrorString(e));
+        return false;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        if (!std::isfinite(host[i])) {
+            std::snprintf(error, error_cap, "%s non-finite at %zu: %f", label, i, host[i]);
+            return false;
+        }
+    }
+    return true;
 }
 
 // ─── decode_step ─────────────────────────────────────────────────────────────
@@ -855,7 +874,7 @@ extern "C" bool mono27b_engine_decode_step(
                     kvl, MONO27B_TARGET_N_HEAD, MONO27B_TARGET_N_KV_HEAD,
                     MONO27B_TARGET_HEAD_DIM, max_ctx, 1.0f / sqrtf(MONO27B_TARGET_HEAD_DIM));
             }
-            // Gate: sigmoid(gate) * attn_output
+            // Gate: sigmoid(gate_q) * attn_output
             k_elem_sigmoid_mul<<<(MONO27B_TARGET_Q_DIM + 255) / 256, 256>>>(
                 qb, qb + MONO27B_TARGET_Q_DIM, qb, MONO27B_TARGET_Q_DIM); TRACE("gt");
 
@@ -869,6 +888,12 @@ extern "C" bool mono27b_engine_decode_step(
             k_elem_mul<<<(MONO27B_TARGET_FFN + 255) / 256, 256>>>(fb, kb, MONO27B_TARGET_FFN); TRACE("mul");
             MV(L.ffn_down, fb, h); TRACE("fd");
             k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h, h2, MONO27B_TARGET_HIDDEN);
+            { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d attn: %s", il, cudaGetErrorString(e)); goto cleanup; } }
+            {
+                char lbl[64];
+                std::snprintf(lbl, sizeof(lbl), "attn layer %d output", il);
+                if (!check_finite_device(lbl, h, MONO27B_TARGET_HIDDEN, error, error_cap)) goto cleanup;
+            }
             fa_i++;
 
         } else {
@@ -887,10 +912,14 @@ extern "C" bool mono27b_engine_decode_step(
                 int dr = MONO27B_SSM_DT_RANK;
                 MV(L.ssm_beta, h2, kb);
                 k_elem_sigmoid<<<(dr + 31) / 32, 32>>>(kb, dr);
+                { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d beta: %s", il, cudaGetErrorString(e)); goto cleanup; } }
+                if (!check_finite_device("ssm beta", kb, dr, error, error_cap)) goto cleanup;
                 MV(L.ssm_alpha, h2, qb);
                 { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d alp: %s", il, cudaGetErrorString(e)); goto cleanup; } }
                 k_elem_softplus<<<(dr + 31) / 32, 32>>>(qb, WV(L.ssm_dt_bias), qb, dr);
                 k_elem_mul<<<(dr + 31) / 32, 32>>>(qb, WV(L.ssm_a_log), dr);
+                { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d dt: %s", il, cudaGetErrorString(e)); goto cleanup; } }
+                if (!check_finite_device("ssm dt", qb, dr, error, error_cap)) goto cleanup;
 
                 // Conv1D
                 if (st->conv_state[ssm_i]) {
@@ -899,6 +928,8 @@ extern "C" bool mono27b_engine_decode_step(
                         MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_KERN);
                 }
                 k_elem_silu<<<(MONO27B_SSM_CONV_CH + 255) / 256, 256>>>(sb, MONO27B_SSM_CONV_CH);
+                { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d conv: %s", il, cudaGetErrorString(e)); goto cleanup; } }
+                if (!check_finite_device("ssm conv", sb, MONO27B_SSM_CONV_CH, error, error_cap)) goto cleanup;
 
                 float * qr = sb;
                 float * kr = sb + MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K;
@@ -906,23 +937,41 @@ extern "C" bool mono27b_engine_decode_step(
 
                 k_l2_norm_g<<<MONO27B_SSM_N_GROUP, 128>>>(qr, MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP);
                 k_l2_norm_g<<<MONO27B_SSM_N_GROUP, 128>>>(kr, MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP);
+                { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d l2: %s", il, cudaGetErrorString(e)); goto cleanup; } }
+                if (!check_finite_device("ssm qk", sb, MONO27B_SSM_CONV_CH, error, error_cap)) goto cleanup;
 
                 // Gated DeltaNet
                 if (st->ssm_state[ssm_i]) {
-                    dim3 dg(MONO27B_SSM_N_GROUP, MONO27B_SSM_DT_RANK, MONO27B_SSM_HEAD_V);
+                    dim3 dg(MONO27B_SSM_DT_RANK, MONO27B_SSM_HEAD_V, 1);
                     k_deltanet<<<dg, 1>>>(qr, kr, vr, qb, kb, st->ssm_state[ssm_i], gb,
                         MONO27B_SSM_N_GROUP, MONO27B_SSM_DT_RANK,
                         MONO27B_SSM_HEAD_V, MONO27B_SSM_HEAD_K);
+                    { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d deltanet: %s", il, cudaGetErrorString(e)); goto cleanup; } }
+                    if (!check_finite_device("ssm deltanet", gb, MONO27B_SSM_D_INNER, error, error_cap)) goto cleanup;
                 }
 
                 // Gate: wqkv_gate @ h2 → siLU → mul with rms_norm(ssm_out)
                 MV(L.wqkv_gate, h2, fb); TRACE("re-g");
                 k_elem_silu<<<(MONO27B_SSM_D_INNER + 255) / 256, 256>>>(fb, MONO27B_SSM_D_INNER); TRACE("g_silu");
-                l_rms(h2, gb, nullptr, MONO27B_SSM_D_INNER); TRACE("grms");
+                for (int r = 0; r < MONO27B_SSM_DT_RANK; ++r) {
+                    k_rms_norm_mulw<256><<<1, 256>>>(
+                        gb + (size_t)r * MONO27B_SSM_HEAD_V,
+                        WV(L.ssm_norm),
+                        h2 + (size_t)r * MONO27B_SSM_HEAD_V,
+                        MONO27B_SSM_HEAD_V,
+                        MONO27B_RMS_EPS);
+                }
+                TRACE("grms");
                 k_elem_mul<<<(MONO27B_SSM_D_INNER + 255) / 256, 256>>>(h2, fb, MONO27B_SSM_D_INNER); TRACE("gmul2");
                 MV(L.ssm_out, h2, sb); TRACE("ssmo");
                 k_elem_copy<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h2, sb, MONO27B_TARGET_HIDDEN); TRACE("scp");
                 k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h2, h, MONO27B_TARGET_HIDDEN); TRACE("sadd");
+                { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d ssm: %s", il, cudaGetErrorString(e)); goto cleanup; } }
+                {
+                    char lbl[64];
+                    std::snprintf(lbl, sizeof(lbl), "ssm layer %d output", il);
+                    if (!check_finite_device(lbl, h2, MONO27B_TARGET_HIDDEN, error, error_cap)) goto cleanup;
+                }
             } else {
                 if (st->conv_state[ssm_i]) {
                     k_ssm_conv1d_u<<<(MONO27B_SSM_CONV_CH + 255) / 256, 256>>>(
@@ -931,6 +980,12 @@ extern "C" bool mono27b_engine_decode_step(
                 }
                 MV(L.ssm_out, sb, h2);
                 k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h2, h, MONO27B_TARGET_HIDDEN);
+                { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d ssm2: %s", il, cudaGetErrorString(e)); goto cleanup; } }
+                {
+                    char lbl[64];
+                    std::snprintf(lbl, sizeof(lbl), "ssm layer %d output", il);
+                    if (!check_finite_device(lbl, h2, MONO27B_TARGET_HIDDEN, error, error_cap)) goto cleanup;
+                }
             }
 
         ssm_ffn:

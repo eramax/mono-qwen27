@@ -12,6 +12,8 @@
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
+#include <fstream>
+#include <random>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -30,6 +32,42 @@ static std::string sanitize_text(const std::string & in) {
         else { char buf[8]; std::snprintf(buf, sizeof(buf), "\\x%02x", ch); out += buf; }
     }
     return out;
+}
+
+static void write_trace_row(std::ostream & os, const char * phase, int step, int pos,
+                            int input_id, int chosen_id, const std::vector<float> & logits) {
+    struct Candidate { int id; float v; };
+    Candidate best[8];
+    int best_n = 0;
+    float best_v = -1e30f;
+    int best_id = -1;
+    for (int i = 0; i < static_cast<int>(logits.size()); ++i) {
+        const float v = logits[i];
+        if (v > best_v) {
+            best_v = v;
+            best_id = i;
+        }
+        int ins = best_n;
+        while (ins > 0 && v > best[ins - 1].v) --ins;
+        if (ins < 8) {
+            if (best_n < 8) ++best_n;
+            for (int j = best_n - 1; j > ins; --j) best[j] = best[j - 1];
+            best[ins] = {i, v};
+        }
+    }
+
+    os << phase << '\t' << step << '\t' << pos << '\t' << input_id << '\t'
+       << chosen_id << '\t' << best_id << '\t' << best_v << '\t';
+    for (int i = 0; i < best_n; ++i) {
+        if (i) os << ',';
+        os << best[i].id;
+    }
+    os << '\t';
+    for (int i = 0; i < best_n; ++i) {
+        if (i) os << ',';
+        os << best[i].v;
+    }
+    os << '\n';
 }
 
 int main(int argc, char ** argv) {
@@ -189,16 +227,27 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[load] GPU weights ready\n");
 
     // Apply chat template and encode
-    std::string chat_prompt = "<|im_start|>user\n" + args.prompt + "\n<|im_end|>\n<|im_start|>assistant\n";
+    std::string chat_prompt = "<|im_start|>system\nYou are a helpful assistant.\n<|im_end|>\n"
+                            "<|im_start|>user\n" + args.prompt + "\n<|im_end|>\n"
+                            "<|im_start|>assistant\n";
     std::vector<int32_t> prompt_ids = tokenizer.encode(chat_prompt);
     std::fprintf(stderr, "[prompt] tokens=%zu ids=", prompt_ids.size());
-    for (size_t i = 0; i < prompt_ids.size() && i < 12; ++i) fprintf(stderr, "%d ", prompt_ids[i]);
+    for (size_t i = 0; i < prompt_ids.size(); ++i) fprintf(stderr, "%d ", prompt_ids[i]);
     fprintf(stderr, "\n");
 
     char errbuf[512] = {};
     int pos = 0;
     int last_tok = 0;
     std::vector<int32_t> generated;
+    std::ofstream trace;
+    if (!args.trace_path.empty()) {
+        trace.open(args.trace_path, std::ios::out | std::ios::trunc);
+        if (!trace) {
+            std::fprintf(stderr, "error: failed to open trace file: %s\n", args.trace_path.c_str());
+            goto cleanup;
+        }
+        trace << "phase\tstep\tpos\tinput_id\tchosen_id\tbest_id\tbest_logit\ttop_ids\ttop_logits\n";
+    }
 
     for (size_t i = 0; i < prompt_ids.size(); ++i) {
         Mono27BLogitsOutput logits{};
@@ -209,6 +258,20 @@ int main(int argc, char ** argv) {
             mono27b_engine_free_logits(&logits);
             goto cleanup;
         }
+        std::vector<float> logits_host(MONO27B_TARGET_VOCAB);
+        cudaMemcpy(logits_host.data(), logits.logits,
+                   MONO27B_TARGET_VOCAB * sizeof(float), cudaMemcpyDeviceToHost);
+        int best = 0;
+        float best_v = logits_host[0];
+        for (int j = 1; j < MONO27B_TARGET_VOCAB; ++j) {
+            if (logits_host[j] > best_v) { best_v = logits_host[j]; best = j; }
+        }
+        if (trace) {
+            write_trace_row(trace, "prompt", static_cast<int>(i), static_cast<int>(i),
+                            prompt_ids[i], prompt_ids[i], logits_host);
+            trace.flush();
+        }
+        std::fprintf(stderr, "[prompt %zu] top1=%d max=%.4f\n", i, best, best_v);
         mono27b_engine_free_logits(&logits);
     }
 
@@ -230,20 +293,25 @@ int main(int argc, char ** argv) {
         std::vector<float> logits_host(MONO27B_TARGET_VOCAB);
         cudaMemcpy(logits_host.data(), logits.logits,
                    MONO27B_TARGET_VOCAB * sizeof(float), cudaMemcpyDeviceToHost);
-        mono27b_engine_free_logits(&logits);
-
         int best = 0;
         float best_v = logits_host[0];
         for (int j = 1; j < MONO27B_TARGET_VOCAB; ++j) {
             if (logits_host[j] > best_v) { best_v = logits_host[j]; best = j; }
         }
+        int chosen = best;
 
-        std::fprintf(stderr, "[step %d] top1=%d max=%.4f\n", step, best, best_v);
+        if (trace) {
+            write_trace_row(trace, "gen", step, pos, last_tok, chosen, logits_host);
+            trace.flush();
+        }
 
-        if (tokenizer.is_terminal(best)) break;
+        std::fprintf(stderr, "[step %d] top1=%d max=%.4f chosen=%d\n", step, best, best_v, chosen);
+        mono27b_engine_free_logits(&logits);
 
-        generated.push_back(best);
-        last_tok = best;
+        if (tokenizer.is_terminal(chosen)) break;
+
+        generated.push_back(chosen);
+        last_tok = chosen;
         pos++;
     }
 

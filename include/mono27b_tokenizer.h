@@ -34,6 +34,7 @@ private:
     std::vector<std::string> vocab_;
     std::unordered_map<std::string, int32_t> str_to_id_;
     std::unordered_map<std::string, int> merge_rank_;
+    std::vector<std::pair<std::string, int32_t>> special_tokens_;
     std::array<std::string, 256> byte_to_unicode_{};
     std::unordered_map<std::string, uint8_t> unicode_to_byte_;
 };

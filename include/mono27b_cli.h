@@ -7,6 +7,7 @@ struct Mono27BChatArgs {
     std::string target_gguf;
     std::string draft_gguf;
     std::string prompt;
+    std::string trace_path;
     int max_ctx = 131072;
     int max_gen = 512;
     bool show_help = false;
