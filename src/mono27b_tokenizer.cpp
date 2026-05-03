@@ -131,17 +131,24 @@ std::vector<int32_t> Mono27BTokenizer::encode(const std::string & text) const {
     std::vector<std::string> chunks;
     size_t i = 0;
     while (i < text.size()) {
-        bool matched_special = false;
-        for (const auto & sp : special_tokens_) {
-            const std::string & token = sp.first;
-            if (i + token.size() <= text.size() && text.compare(i, token.size(), token) == 0) {
-                chunks.push_back(token);
-                i += token.size();
-                matched_special = true;
-                break;
-            }
+        if (text.compare(i, 12, "<|im_start|>") == 0) {
+            chunks.push_back("<");
+            chunks.push_back("|");
+            chunks.push_back("im");
+            chunks.push_back("_start");
+            chunks.push_back("|");
+            chunks.push_back(">");
+            i += 12;
+            continue;
         }
-        if (matched_special) {
+        if (text.compare(i, 10, "<|im_end|>") == 0) {
+            chunks.push_back("<");
+            chunks.push_back("|");
+            chunks.push_back("im");
+            chunks.push_back("_end");
+            chunks.push_back("|");
+            chunks.push_back(">");
+            i += 10;
             continue;
         }
 

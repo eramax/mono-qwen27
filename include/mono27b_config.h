@@ -3,6 +3,7 @@
 #include "mono27b_format.h"
 
 #include <cstddef>
+#include <cstdio>
 
 // Model architecture constants — Qwen3.5-27B hybrid
 constexpr int MONO27B_TARGET_N_HEAD     = 24;
@@ -171,6 +172,7 @@ extern "C" bool mono27b_engine_decode_step(
     Mono27BExecutorState * state,
     int token_id, int position,
     Mono27BLogitsOutput * output,
+    FILE * debug_fp,
     char * error, size_t error_cap);
 
 extern "C" void mono27b_engine_free_logits(Mono27BLogitsOutput * output);

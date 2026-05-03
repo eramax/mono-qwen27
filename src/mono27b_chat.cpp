@@ -240,6 +240,7 @@ int main(int argc, char ** argv) {
     int last_tok = 0;
     std::vector<int32_t> generated;
     std::ofstream trace;
+    std::FILE * debug_fp = nullptr;
     if (!args.trace_path.empty()) {
         trace.open(args.trace_path, std::ios::out | std::ios::trunc);
         if (!trace) {
@@ -248,19 +249,30 @@ int main(int argc, char ** argv) {
         }
         trace << "phase\tstep\tpos\tinput_id\tchosen_id\tbest_id\tbest_logit\ttop_ids\ttop_logits\n";
     }
+    if (!args.debug_path.empty()) {
+        debug_fp = std::fopen(args.debug_path.c_str(), "w");
+        if (!debug_fp) {
+            std::fprintf(stderr, "error: failed to open debug file: %s\n", args.debug_path.c_str());
+            goto cleanup;
+        }
+        std::fprintf(debug_fp, "phase\tstep\tpos\ttok\tlabel\tn\tmin\tmax\tmean\tl2\tvalues\n");
+    }
 
     for (size_t i = 0; i < prompt_ids.size(); ++i) {
         Mono27BLogitsOutput logits{};
         if (!mono27b_engine_decode_step(&gpu_weights, &state,
                                          prompt_ids[i], static_cast<int>(i),
-                                         &logits, errbuf, sizeof(errbuf))) {
+                                         &logits, debug_fp, errbuf, sizeof(errbuf))) {
             std::fprintf(stderr, "step error at prompt %zu: %s\n", i, errbuf);
             mono27b_engine_free_logits(&logits);
             goto cleanup;
         }
         std::vector<float> logits_host(MONO27B_TARGET_VOCAB);
-        cudaMemcpy(logits_host.data(), logits.logits,
-                   MONO27B_TARGET_VOCAB * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaError_t copy_err = cudaMemcpy(logits_host.data(), logits.logits,
+                                          MONO27B_TARGET_VOCAB * sizeof(float), cudaMemcpyDeviceToHost);
+        if (copy_err != cudaSuccess) {
+            std::fprintf(stderr, "step %zu logits copy error: %s\n", i, cudaGetErrorString(copy_err));
+        }
         int best = 0;
         float best_v = logits_host[0];
         for (int j = 1; j < MONO27B_TARGET_VOCAB; ++j) {
@@ -283,7 +295,7 @@ int main(int argc, char ** argv) {
         Mono27BLogitsOutput logits{};
         if (!mono27b_engine_decode_step(&gpu_weights, &state,
                                          last_tok, pos,
-                                         &logits, errbuf, sizeof(errbuf))) {
+                                         &logits, debug_fp, errbuf, sizeof(errbuf))) {
             std::fprintf(stderr, "step error at gen %d: %s\n", step, errbuf);
             mono27b_engine_free_logits(&logits);
             goto cleanup;
@@ -291,8 +303,11 @@ int main(int argc, char ** argv) {
 
         // Download logits and find argmax
         std::vector<float> logits_host(MONO27B_TARGET_VOCAB);
-        cudaMemcpy(logits_host.data(), logits.logits,
-                   MONO27B_TARGET_VOCAB * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaError_t copy_err = cudaMemcpy(logits_host.data(), logits.logits,
+                                          MONO27B_TARGET_VOCAB * sizeof(float), cudaMemcpyDeviceToHost);
+        if (copy_err != cudaSuccess) {
+            std::fprintf(stderr, "step %d logits copy error: %s\n", step, cudaGetErrorString(copy_err));
+        }
         int best = 0;
         float best_v = logits_host[0];
         for (int j = 1; j < MONO27B_TARGET_VOCAB; ++j) {
@@ -325,6 +340,7 @@ int main(int argc, char ** argv) {
     }
 
 cleanup:
+    if (debug_fp) std::fclose(debug_fp);
     mono27b_engine_free_state(&state);
     mono27b_engine_free_weights(&gpu_weights);
     munmap(mmap_data, file_size);

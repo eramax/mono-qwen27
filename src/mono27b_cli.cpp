@@ -6,12 +6,12 @@
 
 void mono27b_print_chat_usage(const char * prog) {
     std::fprintf(stderr,
-        "usage: %s --blob model.m27b --prompt \"...\" [--ctx N] [--gen N] [--trace PATH]\n"
-        "       %s --blob model.m27b -p \"...\" [--ctx N] [--gen N] [--trace PATH]\n",
+        "usage: %s --blob model.m27b --prompt \"...\" [--ctx N] [--gen N] [--trace PATH] [--debug PATH]\n"
+        "       %s --blob model.m27b -p \"...\" [--ctx N] [--gen N] [--trace PATH] [--debug PATH]\n",
         prog,
         prog);
     std::fprintf(stderr,
-        "       %s -m target.gguf -p \"...\" [--ctx N] [--gen N] [--trace PATH]\n",
+        "       %s -m target.gguf -p \"...\" [--ctx N] [--gen N] [--trace PATH] [--debug PATH]\n",
         prog);
 }
 
@@ -56,6 +56,10 @@ bool mono27b_parse_chat_args(int argc, char ** argv, Mono27BChatArgs & out) {
         }
         if (arg == "--trace" && i + 1 < argc) {
             out.trace_path = argv[++i];
+            continue;
+        }
+        if (arg == "--debug" && i + 1 < argc) {
+            out.debug_path = argv[++i];
             continue;
         }
         return false;
