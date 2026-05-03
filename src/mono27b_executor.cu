@@ -456,17 +456,18 @@ __global__ static void k_deltanet(
     const float * kg = k + (size_t)g_idx * hk;
     const float * vr = v + (size_t)r_idx * hv + col;
 
-    float * S = state + ((size_t)g_idx * dr + r_idx) * (size_t)hv * hk + col;
-    // S is [hv][hk] stored row-major: S[col][0..hk-1]
+    // State is stored transposed: M[col][i] = S[i][col], row col is contiguous
+    // Flat layout: state[base + col * hk + i] = S[i][col]
+    float * S = state + ((size_t)g_idx * dr + r_idx) * (size_t)hv * hk + col * (size_t)hk;
 
     float kv = 0.0f;
-    for (int i = 0; i < hk; ++i) kv += S[(size_t)i * hv] * kg[i]; // S[col][i]
+    for (int i = 0; i < hk; ++i) kv += S[i] * kg[i];
     float delta = (*vr - gv * kv) * bv;
 
     float attn = 0.0f;
     for (int i = 0; i < hk; ++i) {
-        float sn = gv * S[(size_t)i * hv] + kg[i] * delta;
-        S[(size_t)i * hv] = sn;
+        float sn = gv * S[i] + kg[i] * delta;
+        S[i] = sn;
         attn += sn * qg[i];
     }
 
@@ -606,11 +607,26 @@ extern "C" bool mono27b_engine_load_weights(
             lw2("ssm_conv1d.weight", &l.ssm.ssm_conv1d, "sc1d");
             lw2("ssm_beta.weight", &l.ssm.ssm_beta, "sb");
             lw2("ssm_alpha.weight", &l.ssm.ssm_alpha, "sa");
-            // Try alternative names for dt bias and ssm_a
-            if (!lw2("ssm_dt_bias", &l.ssm.ssm_dt_bias, "sdt")) 
-                lw2("ssm_dt.bias", &l.ssm.ssm_dt_bias, "sdt");
+            // Try multiple naming conventions for dt bias and ssm_a
+            if (!lw2("ssm_dt_bias", &l.ssm.ssm_dt_bias, "sdt")) {
+                std::snprintf(nm, sizeof(nm), "blk.%d.ssm_dt.bias", il);
+                auto * ti = ft(tensors, tensor_count, nm);
+                if (ti && ti->size_bytes) {
+                    lw(gguf_data, data_offset, *ti, &l.ssm.ssm_dt_bias, error, error_cap, "sdt");
+                    if (il == 0) fprintf(stderr, "DBG: ssm_dt loaded l%d\n", il);
+                }
+            }
             if (!lw2("ssm_a_log", &l.ssm.ssm_a_log, "sal")) {
-                lw2("ssm_a", &l.ssm.ssm_a_log, "sal");
+                std::snprintf(nm, sizeof(nm), "blk.%d.ssm_a", il);
+                auto * ti = ft(tensors, tensor_count, nm);
+                if (ti && ti->size_bytes) {
+                    lw(gguf_data, data_offset, *ti, &l.ssm.ssm_a_log, error, error_cap, "sal");
+                    // Print first value
+                    if (il == 0) {
+                        float v = *(const float*)(gguf_data + data_offset + ti->offset);
+                        fprintf(stderr, "DBG: ssm_a[0] first raw float: %.4f\n", v);
+                    }
+                }
             }
             lw2("ssm_out.weight", &l.ssm.ssm_out, "sso");
             lw2("post_attention_norm.weight", &l.ssm.post_norm, "spn");
@@ -872,6 +888,7 @@ extern "C" bool mono27b_engine_decode_step(
                 MV(L.ssm_beta, h2, kb);
                 k_elem_sigmoid<<<(dr + 31) / 32, 32>>>(kb, dr);
                 MV(L.ssm_alpha, h2, qb);
+                { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d alp: %s", il, cudaGetErrorString(e)); goto cleanup; } }
                 k_elem_softplus<<<(dr + 31) / 32, 32>>>(qb, WV(L.ssm_dt_bias), qb, dr);
                 k_elem_mul<<<(dr + 31) / 32, 32>>>(qb, WV(L.ssm_a_log), dr);
 
@@ -890,8 +907,8 @@ extern "C" bool mono27b_engine_decode_step(
                 k_l2_norm_g<<<MONO27B_SSM_N_GROUP, 128>>>(qr, MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP);
                 k_l2_norm_g<<<MONO27B_SSM_N_GROUP, 128>>>(kr, MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP);
 
-                // Gated DeltaNet - disable to isolate NaN
-                if (0 && st->ssm_state[ssm_i]) {
+                // Gated DeltaNet
+                if (st->ssm_state[ssm_i]) {
                     dim3 dg(MONO27B_SSM_N_GROUP, MONO27B_SSM_DT_RANK, MONO27B_SSM_HEAD_V);
                     k_deltanet<<<dg, 1>>>(qr, kr, vr, qb, kb, st->ssm_state[ssm_i], gb,
                         MONO27B_SSM_N_GROUP, MONO27B_SSM_DT_RANK,
