@@ -39,6 +39,7 @@ enum Mono27BGgmlType : uint32_t {
     MONO27B_GGML_TYPE_Q5_K = 13,
     MONO27B_GGML_TYPE_Q6_K = 14,
     MONO27B_GGML_TYPE_Q8_K = 15,
+    MONO27B_GGML_TYPE_IQ4_XS = 23,
 };
 
 struct Mono27BGgufTensorInfo {

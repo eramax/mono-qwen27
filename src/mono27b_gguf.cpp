@@ -152,21 +152,22 @@ static uint64_t align_u64(uint64_t x, uint64_t align) {
     return (x + mask) & ~mask;
 }
 
-static size_t type_size(uint32_t ggml_type) {
+static size_t quant_type_size(uint32_t ggml_type) {
     switch (ggml_type) {
         case MONO27B_GGML_TYPE_F32:  return 4;
         case MONO27B_GGML_TYPE_F16:  return 2;
         case MONO27B_GGML_TYPE_Q8_0: return 34;
-        case MONO27B_GGML_TYPE_Q2_K: return 80;  // 2 + 16 + 64 = 82... approx
-        case MONO27B_GGML_TYPE_Q3_K: return 110; // 2 + 64 + 32 + 12
-        case MONO27B_GGML_TYPE_Q4_K: return 144; // 4 + 12 + 128
-        case MONO27B_GGML_TYPE_Q5_K: return 176; // 4 + 12 + 128 + 32
-        case MONO27B_GGML_TYPE_Q6_K: return 210; // 2 + 16 + 192
+        case MONO27B_GGML_TYPE_Q2_K: return 80;
+        case MONO27B_GGML_TYPE_Q3_K: return 110;
+        case MONO27B_GGML_TYPE_Q4_K: return 144;
+        case MONO27B_GGML_TYPE_Q5_K: return 176;
+        case MONO27B_GGML_TYPE_Q6_K: return 210;
+        case 23: return 136; // IQ4_XS: d(2) + scales_h(2) + scales_l(4) + qs(128)
         default: return 0;
     }
 }
 
-static size_t block_size(uint32_t ggml_type) {
+static size_t quant_block_size(uint32_t ggml_type) {
     switch (ggml_type) {
         case MONO27B_GGML_TYPE_F32:  return 1;
         case MONO27B_GGML_TYPE_F16:  return 1;
@@ -176,6 +177,7 @@ static size_t block_size(uint32_t ggml_type) {
         case MONO27B_GGML_TYPE_Q4_K: return 256;
         case MONO27B_GGML_TYPE_Q5_K: return 256;
         case MONO27B_GGML_TYPE_Q6_K: return 256;
+        case 23: return 256; // IQ4_XS
         default: return 0;
     }
 }
@@ -297,8 +299,8 @@ bool mono27b_read_gguf(const std::string & path, Mono27BGgufFile & out, std::str
             std::fclose(fp);
             return false;
         }
-        const size_t tsize = type_size(tensor.ggml_type);
-        const size_t bsize = block_size(tensor.ggml_type);
+        const size_t tsize = quant_type_size(tensor.ggml_type);
+        const size_t bsize = quant_block_size(tensor.ggml_type);
         if (tsize == 0 || bsize == 0 || nelements % bsize != 0) {
             tensor.size_bytes = 0;
             tensors.push_back(std::move(tensor));
@@ -324,8 +326,8 @@ bool mono27b_read_gguf(const std::string & path, Mono27BGgufFile & out, std::str
 }
 
 size_t mono27b_ggml_row_size(uint32_t ggml_type, uint32_t ne) {
-    const size_t tsize = type_size(ggml_type);
-    const size_t bsize = block_size(ggml_type);
+    const size_t tsize = quant_type_size(ggml_type);
+    const size_t bsize = quant_block_size(ggml_type);
     if (tsize == 0 || bsize == 0 || ne == 0 || (ne % bsize) != 0U) {
         return 0;
     }
