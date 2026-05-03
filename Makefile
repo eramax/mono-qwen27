@@ -1,7 +1,7 @@
 .PHONY: build test clean
 
 BLOB_PATH ?= test.m27b
-PROMPT ?= "What is"
+PROMPT ?= "give me 2 py example"
 GEN ?= 10
 CTX ?= 4096
 
@@ -10,7 +10,7 @@ build:
 	cmake --build build -j$(shell nproc)
 
 test: build
-	./build/mono27b_chat --blob $(BLOB_PATH) -p "$(PROMPT)" --gen $(GEN) --ctx $(CTX)
+	./build/mono27b_chat --blob $(BLOB_PATH) -p $(PROMPT) --gen $(GEN) --ctx $(CTX)
 
 quick-test: build
 	./build/mono27b_chat --blob $(BLOB_PATH) -p "The quick brown fox" --gen 5 --ctx 2048
