@@ -164,6 +164,21 @@ static int sample_from_logits(std::vector<float> logits, const Mono27BGgufFile &
     return filtered.back().id;
 }
 
+static int argmax_from_logits(const std::vector<float> & logits, int * best_out = nullptr) {
+    const int n_vocab = static_cast<int>(logits.size());
+    if (n_vocab == 0) return 0;
+    int best = 0;
+    float best_v = logits[0];
+    for (int i = 1; i < n_vocab; ++i) {
+        if (logits[i] > best_v) {
+            best_v = logits[i];
+            best = i;
+        }
+    }
+    if (best_out) *best_out = best;
+    return best;
+}
+
 int main(int argc, char ** argv) {
     Mono27BChatArgs args;
     if (!mono27b_parse_chat_args(argc, argv, args) || args.show_help) {
@@ -328,10 +343,32 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[load] GPU weights ready\n");
 
     // Apply chat template and encode
-    std::string chat_prompt = "<|im_start|>system\nYou are a helpful assistant.\n<|im_end|>\n"
-                            "<|im_start|>user\n" + args.prompt + "\n<|im_end|>\n"
-                            "<|im_start|>assistant\n";
-    std::vector<int32_t> prompt_ids = tokenizer.encode(chat_prompt);
+    std::string user_prompt = args.prompt;
+    while (!user_prompt.empty() && (user_prompt.back() == '\n' || user_prompt.back() == '\r' ||
+                                    user_prompt.back() == '\t' || user_prompt.back() == ' ')) {
+        user_prompt.pop_back();
+    }
+    std::vector<int32_t> prompt_ids;
+    const std::vector<int32_t> nl_ids = tokenizer.encode("\n");
+    prompt_ids.push_back(static_cast<int32_t>(gguf.metadata.im_start_id));
+    {
+        auto sys_ids = tokenizer.encode("system\nYou are a helpful assistant.");
+        prompt_ids.insert(prompt_ids.end(), sys_ids.begin(), sys_ids.end());
+    }
+    prompt_ids.push_back(static_cast<int32_t>(gguf.metadata.im_end_id));
+    prompt_ids.insert(prompt_ids.end(), nl_ids.begin(), nl_ids.end());
+    prompt_ids.push_back(static_cast<int32_t>(gguf.metadata.im_start_id));
+    {
+        auto user_ids = tokenizer.encode("user\n" + user_prompt);
+        prompt_ids.insert(prompt_ids.end(), user_ids.begin(), user_ids.end());
+    }
+    prompt_ids.push_back(static_cast<int32_t>(gguf.metadata.im_end_id));
+    prompt_ids.insert(prompt_ids.end(), nl_ids.begin(), nl_ids.end());
+    prompt_ids.push_back(static_cast<int32_t>(gguf.metadata.im_start_id));
+    {
+        auto asst_ids = tokenizer.encode("assistant\n");
+        prompt_ids.insert(prompt_ids.end(), asst_ids.begin(), asst_ids.end());
+    }
     std::fprintf(stderr, "[prompt] tokens=%zu ids=", prompt_ids.size());
     for (size_t i = 0; i < prompt_ids.size(); ++i) fprintf(stderr, "%d ", prompt_ids[i]);
     fprintf(stderr, "\n");
@@ -374,7 +411,8 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "step %zu logits copy error: %s\n", i, cudaGetErrorString(copy_err));
         }
         int best = 0;
-        int chosen = sample_from_logits(logits_host, gguf, rng, top_k, top_p, min_p, &best);
+        int chosen = prompt_ids[i];
+        best = argmax_from_logits(logits_host, &best);
         if (trace) {
             write_trace_row(trace, "prompt", static_cast<int>(i), static_cast<int>(i),
                             prompt_ids[i], chosen, logits_host);
