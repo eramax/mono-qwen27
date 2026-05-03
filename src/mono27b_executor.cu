@@ -190,7 +190,7 @@ __global__ static void k_q5k_mv(const BlockQ5K * W, const float * x, float * y, 
 
 // ─── Q6_K matvec ─────────────────────────────────────────────────────────────
 
-// Q6_K matvec: multi-threaded (256 threads per block, shared mem for reduction)
+// Q6_K matvec: correct strided layout matching ggml reference
 __global__ static void k_q6k_mt(const BlockQ6K * W, const float * x, float * y, int rb, int rc) {
     int row = blockIdx.x;
     if (row >= rc) return;
@@ -200,14 +200,28 @@ __global__ static void k_q6k_mt(const BlockQ6K * W, const float * x, float * y, 
     for (int b = 0; b < rb; ++b) {
         const BlockQ6K & qb = rp[b];
         float d = __half2float(qb.d);
-        int idx = threadIdx.x;
-        int g = idx / 16;
-        int i = idx % 16;
-        int lo = (qb.ql[idx / 2] >> (4 * (idx % 2))) & 0x0F;
-        int hi = (qb.qh[idx / 4] >> (2 * (idx % 4))) & 3;
+        // Each thread handles element at its own index within the block
+        int e = threadIdx.x;  // 0..255
+        // Two 128-element halves
+        int n = e / 128;          // 0 or 1
+        int pos = e % 128;        // position within half
+        int subpos = pos % 32;    // 0..31
+        int group = pos / 32;     // 0,1,2,3
+        // ql offset: each half uses 64 bytes of ql
+        int ql_off = n * 64;
+        // qh offset: each half uses 32 bytes of qh
+        int qh_off = n * 32;
+        // For group 0,1: use ql[subpos + 0/32], low nibble
+        // For group 2,3: use ql[subpos + 0/32], high nibble
+        int use_high = (group >= 2) ? 1 : 0;
+        int ql_idx = ql_off + subpos + (group % 2 == 1 ? 32 : 0);
+        int lo = (qb.ql[ql_idx] >> (4 * use_high)) & 0x0F;
+        int hi = (qb.qh[qh_off + subpos] >> (2 * group)) & 3;
         int qv = (lo | (hi << 4)) - 32;
-        int base = b * 256 + g * 16 + i;
-        sum += d * (float)qb.scales[g] * (float)qv * x[base];
+        // Scale: 8 scales per half
+        int sc_idx = n * 8 + group * 2 + subpos / 16;
+        int base = b * 256 + e;
+        sum += d * (float)qb.scales[sc_idx] * (float)qv * x[base];
     }
     sh[threadIdx.x] = sum;
     __syncthreads();
@@ -327,9 +341,7 @@ __global__ static void k_attn_1t(const float * Q, const float * K, const float *
     const float * qr = Q + (size_t)qh * hd;
     float * or_ = O + (size_t)qh * hd;
 
-    // One thread handles the entire head
     if (threadIdx.x == 0) {
-        // Scores
         extern __shared__ float sc[];
         float maxv = -1e30f;
         for (int p = 0; p < kv_len; ++p) {
@@ -340,8 +352,13 @@ __global__ static void k_attn_1t(const float * Q, const float * K, const float *
             sc[p] = d;
             if (d > maxv) maxv = d;
         }
+        if (maxv > 64.0f) maxv = 64.0f; // clamp to avoid exp overflow
         float sume = 0.0f;
-        for (int p = 0; p < kv_len; ++p) { float v = expf(sc[p] - maxv); sc[p] = v; sume += v; }
+        for (int p = 0; p < kv_len; ++p) {
+            float v = expf(fmaxf(sc[p] - maxv, -64.0f));
+            sc[p] = v;
+            sume += v;
+        }
         float invs = 1.0f / (sume + 1e-10f);
         for (int d = 0; d < hd; ++d) {
             float v = 0.0f;
@@ -380,8 +397,13 @@ __global__ static void k_deltanet(
     int col   = blockIdx.z;  // [0..hv)
     if (g_idx >= ng || r_idx >= dr || col >= hv) return;
 
-    float gv = expf(g[r_idx + (size_t)g_idx * dr]);
+    float g_raw = g[r_idx + (size_t)g_idx * dr];
+    if (g_raw > 10.0f) g_raw = 10.0f;
+    if (g_raw < -10.0f) g_raw = -10.0f;
+    float gv = expf(g_raw);
     float bv = beta[r_idx + (size_t)g_idx * dr];
+    if (bv > 1.0f) bv = 1.0f;
+    if (bv < 0.0f) bv = 0.0f;
 
     const float * qg = q + (size_t)g_idx * hk;
     const float * kg = k + (size_t)g_idx * hk;
@@ -760,7 +782,15 @@ extern "C" bool mono27b_engine_decode_step(
             }
             TRACE("kvc");
 
-            // Gate: sigmoid(gate) * Q (skip attn for now)
+            // Attention + gate
+            {
+                int kvl = pos + 1;
+                k_attn_1t<<<MONO27B_TARGET_N_HEAD, 1, (size_t)max_ctx * sizeof(float)>>>(
+                    qb, st->kv_cache_k[fa_i], st->kv_cache_v[fa_i], qb,
+                    kvl, MONO27B_TARGET_N_HEAD, MONO27B_TARGET_N_KV_HEAD,
+                    MONO27B_TARGET_HEAD_DIM, max_ctx, 1.0f / sqrtf(MONO27B_TARGET_HEAD_DIM));
+            }
+            // Gate: sigmoid(gate) * attn_output
             k_elem_sigmoid_mul<<<(MONO27B_TARGET_Q_DIM + 255) / 256, 256>>>(
                 qb, qb + MONO27B_TARGET_Q_DIM, qb, MONO27B_TARGET_Q_DIM); TRACE("gt");
 
@@ -796,7 +826,7 @@ extern "C" bool mono27b_engine_decode_step(
                 k_elem_softplus<<<(dr + 31) / 32, 32>>>(qb, WV(L.ssm_dt_bias), qb, dr);
                 k_elem_mul<<<(dr + 31) / 32, 32>>>(qb, WV(L.ssm_a_log), dr);
 
-                // Conv1D - skip if conv_state is null (saves memory)
+                // Conv1D
                 if (st->conv_state[ssm_i]) {
                     k_ssm_conv1d_u<<<(MONO27B_SSM_CONV_CH + 255) / 256, 256>>>(
                         sb, (const float *)L.ssm_conv1d.ptr, st->conv_state[ssm_i], sb,
@@ -811,7 +841,7 @@ extern "C" bool mono27b_engine_decode_step(
                 k_l2_norm_g<<<MONO27B_SSM_N_GROUP, 128>>>(qr, MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP);
                 k_l2_norm_g<<<MONO27B_SSM_N_GROUP, 128>>>(kr, MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP);
 
-                // Gated DeltaNet - skip if ssm_state is null
+                // Gated DeltaNet
                 if (st->ssm_state[ssm_i]) {
                     dim3 dg(MONO27B_SSM_N_GROUP, MONO27B_SSM_DT_RANK, MONO27B_SSM_HEAD_V);
                     k_deltanet<<<dg, 1>>>(qr, kr, vr, qb, kb, st->ssm_state[ssm_i], gb,
