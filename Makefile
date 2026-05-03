@@ -1,6 +1,6 @@
 .PHONY: build test clean
 
-BLOB_PATH ?= test.m27b
+MODEL_PATH ?= /mnt/mydata/projects2/specfusion/model/Qwen3.6-27B-UD-Q4_K_XL.gguf
 PROMPT ?= "give me 2 py example"
 GEN ?= 10
 CTX ?= 4096
@@ -10,13 +10,13 @@ build:
 	cmake --build build -j$(shell nproc)
 
 test: build
-	./build/mono27b_chat --blob $(BLOB_PATH) -p $(PROMPT) --gen $(GEN) --ctx $(CTX)
+	./build/mono27b_chat -m $(MODEL_PATH) -p $(PROMPT) --gen $(GEN) --ctx $(CTX)
 
 quick-test: build
-	./build/mono27b_chat --blob $(BLOB_PATH) -p "The quick brown fox" --gen 5 --ctx 2048
+	./build/mono27b_chat -m $(MODEL_PATH) -p "The quick brown fox" --gen 5 --ctx 2048
 
 large-test: build
-	./build/mono27b_chat --blob $(BLOB_PATH) -p "Artificial intelligence is" --gen 20 --ctx 8192
+	./build/mono27b_chat -m $(MODEL_PATH) -p "Artificial intelligence is" --gen 20 --ctx 8192
 
 clean:
 	rm -rf build
@@ -32,8 +32,8 @@ help:
 	@echo "  clean       - Remove build directory"
 	@echo ""
 	@echo "Variables:"
-	@echo "  BLOB_PATH   - Path to .m27b blob file (default: test.m27b)"
-	@echo "  PROMPT      - Input prompt string (default: 'What is')"
+	@echo "  MODEL_PATH  - Path to target GGUF model"
+	@echo "  PROMPT      - Input prompt string (default: 'give me 2 py example')"
 	@echo "  GEN         - Number of tokens to generate (default: 10)"
 	@echo "  CTX         - Context size in tokens (default: 4096)"
 	@echo ""

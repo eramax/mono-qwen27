@@ -46,6 +46,8 @@ struct Mono27BGgufTensorInfo {
     uint32_t ggml_type = 0;
     uint64_t offset = 0;
     uint64_t size_bytes = 0;
+    uint32_t n_dims = 0;
+    uint64_t dims[4] = {};  // ggml stores shape in reverse: dims[0] = innermost = elements per row
 };
 
 struct Mono27BGgufMetadata {

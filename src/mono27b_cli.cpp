@@ -11,7 +11,7 @@ void mono27b_print_chat_usage(const char * prog) {
         prog,
         prog);
     std::fprintf(stderr,
-        "       %s -m target.gguf -md draft.gguf -p \"...\" [--ctx N] [--gen N]\n",
+        "       %s -m target.gguf -p \"...\" [--ctx N] [--gen N]\n",
         prog);
 }
 
@@ -57,7 +57,7 @@ bool mono27b_parse_chat_args(int argc, char ** argv, Mono27BChatArgs & out) {
         return false;
     }
     const bool has_blob = !out.blob_path.empty();
-    const bool has_models = !out.target_gguf.empty() && !out.draft_gguf.empty();
+    const bool has_models = !out.target_gguf.empty();
     return !out.prompt.empty() && (has_blob || has_models);
 }
 
