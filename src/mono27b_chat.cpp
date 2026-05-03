@@ -188,9 +188,12 @@ int main(int argc, char ** argv) {
     cudaGetLastError();
     std::fprintf(stderr, "[load] GPU weights ready\n");
 
-    // Encode prompt
-    std::vector<int32_t> prompt_ids = tokenizer.encode(args.prompt);
-    std::fprintf(stderr, "[prompt] tokens=%zu\n", prompt_ids.size());
+    // Apply chat template and encode
+    std::string chat_prompt = "<|im_start|>user\n" + args.prompt + "\n<|im_end|>\n<|im_start|>assistant\n";
+    std::vector<int32_t> prompt_ids = tokenizer.encode(chat_prompt);
+    std::fprintf(stderr, "[prompt] tokens=%zu ids=", prompt_ids.size());
+    for (size_t i = 0; i < prompt_ids.size() && i < 12; ++i) fprintf(stderr, "%d ", prompt_ids[i]);
+    fprintf(stderr, "\n");
 
     char errbuf[512] = {};
     int pos = 0;

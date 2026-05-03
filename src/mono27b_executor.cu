@@ -343,16 +343,19 @@ __global__ static void k_attn_1t(const float * Q, const float * K, const float *
 
     if (threadIdx.x == 0) {
         extern __shared__ float sc[];
+        // Cache layout: [pos][head][dim] stored as flat: pos * n_kvh * hd + head * hd + dim
+        size_t head_stride = (size_t)hd;
+        size_t pos_stride = (size_t)n_kvh * hd;
         float maxv = -1e30f;
         for (int p = 0; p < kv_len; ++p) {
-            const float * kr = K + ((size_t)kvh * max_ctx + p) * hd;
+            const float * kr = K + (size_t)p * pos_stride + (size_t)kvh * head_stride;
             float d = 0.0f;
             for (int j = 0; j < hd; ++j) d += qr[j] * kr[j];
             d *= scale;
             sc[p] = d;
             if (d > maxv) maxv = d;
         }
-        if (maxv > 64.0f) maxv = 64.0f; // clamp to avoid exp overflow
+        if (maxv > 64.0f) maxv = 64.0f;
         float sume = 0.0f;
         for (int p = 0; p < kv_len; ++p) {
             float v = expf(fmaxf(sc[p] - maxv, -64.0f));
@@ -363,7 +366,7 @@ __global__ static void k_attn_1t(const float * Q, const float * K, const float *
         for (int d = 0; d < hd; ++d) {
             float v = 0.0f;
             for (int p = 0; p < kv_len; ++p)
-                v += sc[p] * V[((size_t)kvh * max_ctx + p) * hd + d];
+                v += sc[p] * V[(size_t)p * pos_stride + (size_t)kvh * head_stride + d];
             or_[d] = v * invs;
         }
     }
