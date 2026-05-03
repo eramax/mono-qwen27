@@ -1,17 +1,18 @@
 #include "mono27b_cli.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 
 void mono27b_print_chat_usage(const char * prog) {
     std::fprintf(stderr,
-        "usage: %s --blob model.m27b --prompt \"...\" [--ctx N] [--gen N] [--trace PATH] [--debug PATH]\n"
-        "       %s --blob model.m27b -p \"...\" [--ctx N] [--gen N] [--trace PATH] [--debug PATH]\n",
+        "usage: %s --blob model.m27b --prompt \"...\" [--ctx N] [--gen N] [--seed N] [--trace PATH] [--debug PATH]\n"
+        "       %s --blob model.m27b -p \"...\" [--ctx N] [--gen N] [--seed N] [--trace PATH] [--debug PATH]\n",
         prog,
         prog);
     std::fprintf(stderr,
-        "       %s -m target.gguf -p \"...\" [--ctx N] [--gen N] [--trace PATH] [--debug PATH]\n",
+        "       %s -m target.gguf -p \"...\" [--ctx N] [--gen N] [--seed N] [--trace PATH] [--debug PATH]\n",
         prog);
 }
 
@@ -52,6 +53,10 @@ bool mono27b_parse_chat_args(int argc, char ** argv, Mono27BChatArgs & out) {
         }
         if (arg == "--gen" && i + 1 < argc) {
             out.max_gen = std::atoi(argv[++i]);
+            continue;
+        }
+        if (arg == "--seed" && i + 1 < argc) {
+            out.seed = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
             continue;
         }
         if (arg == "--trace" && i + 1 < argc) {

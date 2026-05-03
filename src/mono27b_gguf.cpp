@@ -192,6 +192,7 @@ static void fill_metadata(const std::unordered_map<std::string, KvEntry> & kvs,
         const auto it = kvs.find(key);
         return it != kvs.end() && it->second.type == MONO27B_GGUF_TYPE_STRING ? it->second.str : std::string();
     };
+    out.chat_template = get_str("tokenizer.chat_template");
     const auto it_tokens = kvs.find("tokenizer.ggml.tokens");
     if (it_tokens != kvs.end()) {
         out.tokens = it_tokens->second.arr_str;
@@ -214,6 +215,7 @@ static void fill_metadata(const std::unordered_map<std::string, KvEntry> & kvs,
     out.architecture = get_str("general.architecture");
     out.bos_id = get_u32("tokenizer.ggml.bos_token_id");
     out.eos_id = get_u32("tokenizer.ggml.eos_token_id");
+    out.add_bos_token = get_u32("tokenizer.ggml.add_bos_token") != 0;
     const std::string prefix = out.architecture == MONO27B_DRAFT_ARCH ? MONO27B_DRAFT_ARCH : MONO27B_TARGET_ARCH;
     out.embedding_length = get_u32(prefix + ".embedding_length");
     out.block_count = get_u32(prefix + ".block_count");

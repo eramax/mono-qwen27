@@ -53,12 +53,14 @@ struct Mono27BGgufTensorInfo {
 
 struct Mono27BGgufMetadata {
     std::string architecture;
+    std::string chat_template;
     std::vector<std::string> tokens;
     std::vector<std::string> merges;
     uint32_t vocab_size = 0;
     uint32_t merges_count = 0;
     uint32_t bos_id = 0;
     uint32_t eos_id = 0;
+    bool add_bos_token = false;
     uint32_t im_start_id = 0;
     uint32_t im_end_id = 0;
     uint32_t embedding_length = 0;

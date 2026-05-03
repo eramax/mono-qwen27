@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <random>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -70,12 +71,109 @@ static void write_trace_row(std::ostream & os, const char * phase, int step, int
     os << '\n';
 }
 
+static bool is_banned_token(const std::string & token) {
+    return token == "<|endoftext|>" ||
+           token == "<|im_end|>" ||
+           token == "<|fim_pad|>" ||
+           token == "<|repo_name|>" ||
+           token == "<|file_sep|>" ||
+           token == "<|vision_pad|>";
+}
+
+static int sample_from_logits(std::vector<float> logits, const Mono27BGgufFile & gguf,
+                              std::mt19937 & rng, int top_k, float top_p, float min_p,
+                              int * best_out) {
+    const int n_vocab = static_cast<int>(logits.size());
+    if (n_vocab == 0) return 0;
+
+    for (size_t i = 0; i < gguf.metadata.tokens.size() && i < logits.size(); ++i) {
+        if (is_banned_token(gguf.metadata.tokens[i])) {
+            logits[i] = -std::numeric_limits<float>::infinity();
+        }
+    }
+
+    int best = 0;
+    float best_v = logits[0];
+    for (int i = 1; i < n_vocab; ++i) {
+        if (logits[i] > best_v) {
+            best_v = logits[i];
+            best = i;
+        }
+    }
+    if (best_out) *best_out = best;
+
+    top_k = std::clamp(top_k, 1, n_vocab);
+    std::vector<int> order(n_vocab);
+    for (int i = 0; i < n_vocab; ++i) order[i] = i;
+    auto cmp = [&](int a, int b) { return logits[a] > logits[b]; };
+    if (top_k < n_vocab) {
+        std::nth_element(order.begin(), order.begin() + top_k, order.end(), cmp);
+    }
+    order.resize(top_k);
+    std::sort(order.begin(), order.end(), cmp);
+
+    const float temp = 1.0f;
+    float max_logit = -std::numeric_limits<float>::infinity();
+    for (int id : order) max_logit = std::max(max_logit, logits[id]);
+
+    struct Cand { int id; float p; };
+    std::vector<Cand> cands;
+    cands.reserve(order.size());
+    float sum = 0.0f;
+    for (int id : order) {
+        const float z = (logits[id] - max_logit) / temp;
+        const float p = std::exp(z);
+        cands.push_back({id, p});
+        sum += p;
+    }
+    if (sum <= 0.0f || !std::isfinite(sum)) return best;
+    for (auto & c : cands) c.p /= sum;
+
+    const float best_p = cands.front().p;
+    std::vector<Cand> filtered;
+    filtered.reserve(cands.size());
+    for (const auto & c : cands) {
+        if (c.p < best_p * min_p) continue;
+        filtered.push_back(c);
+    }
+    if (filtered.empty()) filtered = cands;
+
+    if (top_p < 1.0f) {
+        std::vector<Cand> nucleus;
+        nucleus.reserve(filtered.size());
+        float nuc_sum = 0.0f;
+        for (const auto & c : filtered) {
+            nucleus.push_back(c);
+            nuc_sum += c.p;
+            if (nuc_sum >= top_p) break;
+        }
+        if (!nucleus.empty()) filtered.swap(nucleus);
+    }
+
+    float total = 0.0f;
+    for (const auto & c : filtered) total += c.p;
+    if (total <= 0.0f || !std::isfinite(total)) return best;
+
+    std::uniform_real_distribution<float> dist(0.0f, total);
+    float pick = dist(rng);
+    float running = 0.0f;
+    for (const auto & c : filtered) {
+        running += c.p;
+        if (pick <= running) return c.id;
+    }
+    return filtered.back().id;
+}
+
 int main(int argc, char ** argv) {
     Mono27BChatArgs args;
     if (!mono27b_parse_chat_args(argc, argv, args) || args.show_help) {
         mono27b_print_chat_usage(argv[0]);
         return args.show_help ? 0 : 1;
     }
+    std::mt19937 rng(args.seed);
+    const int top_k = 20;
+    const float top_p = 0.95f;
+    const float min_p = 0.05f;
 
     // Determine model file path
     std::string target_path = args.target_gguf;
@@ -92,6 +190,9 @@ int main(int argc, char ** argv) {
     if (!mono27b_read_gguf(target_path, gguf, gguf_error)) {
         std::fprintf(stderr, "gguf error: %s\n", gguf_error.c_str());
         return 1;
+    }
+    if (!gguf.metadata.chat_template.empty()) {
+        std::fprintf(stderr, "[template] %s\n", gguf.metadata.chat_template.substr(0, 200).c_str());
     }
 
     // Verify architecture
@@ -257,7 +358,6 @@ int main(int argc, char ** argv) {
         }
         std::fprintf(debug_fp, "phase\tstep\tpos\ttok\tlabel\tn\tmin\tmax\tmean\tl2\tvalues\n");
     }
-
     for (size_t i = 0; i < prompt_ids.size(); ++i) {
         Mono27BLogitsOutput logits{};
         if (!mono27b_engine_decode_step(&gpu_weights, &state,
@@ -274,16 +374,13 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "step %zu logits copy error: %s\n", i, cudaGetErrorString(copy_err));
         }
         int best = 0;
-        float best_v = logits_host[0];
-        for (int j = 1; j < MONO27B_TARGET_VOCAB; ++j) {
-            if (logits_host[j] > best_v) { best_v = logits_host[j]; best = j; }
-        }
+        int chosen = sample_from_logits(logits_host, gguf, rng, top_k, top_p, min_p, &best);
         if (trace) {
             write_trace_row(trace, "prompt", static_cast<int>(i), static_cast<int>(i),
-                            prompt_ids[i], prompt_ids[i], logits_host);
+                            prompt_ids[i], chosen, logits_host);
             trace.flush();
         }
-        std::fprintf(stderr, "[prompt %zu] top1=%d max=%.4f\n", i, best, best_v);
+        std::fprintf(stderr, "[prompt %zu] top1=%d max=%.4f\n", i, best, logits_host[best]);
         mono27b_engine_free_logits(&logits);
     }
 
@@ -309,18 +406,14 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "step %d logits copy error: %s\n", step, cudaGetErrorString(copy_err));
         }
         int best = 0;
-        float best_v = logits_host[0];
-        for (int j = 1; j < MONO27B_TARGET_VOCAB; ++j) {
-            if (logits_host[j] > best_v) { best_v = logits_host[j]; best = j; }
-        }
-        int chosen = best;
+        int chosen = sample_from_logits(logits_host, gguf, rng, top_k, top_p, min_p, &best);
 
         if (trace) {
             write_trace_row(trace, "gen", step, pos, last_tok, chosen, logits_host);
             trace.flush();
         }
 
-        std::fprintf(stderr, "[step %d] top1=%d max=%.4f chosen=%d\n", step, best, best_v, chosen);
+        std::fprintf(stderr, "[step %d] top1=%d max=%.4f chosen=%d\n", step, best, logits_host[best], chosen);
         mono27b_engine_free_logits(&logits);
 
         if (tokenizer.is_terminal(chosen)) break;

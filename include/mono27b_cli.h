@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 struct Mono27BChatArgs {
@@ -9,6 +10,7 @@ struct Mono27BChatArgs {
     std::string prompt;
     std::string trace_path;
     std::string debug_path;
+    uint32_t seed = 944990222U;
     int max_ctx = 131072;
     int max_gen = 512;
     bool show_help = false;
