@@ -14,8 +14,8 @@
 
 - Same GGUF model file loads successfully on both sides.
 - Prompt tokenization matches on the raw-completion probe (`"give"` → token `44883`).
-- Hidden state matches through `output_norm` on the raw-completion probe.
-- Remaining blocker is the `q6_K` LM head path that produces divergent logits/top token.
+- Q6_K LM-head math matches an internal CPU re-evaluation on the raw-completion probe.
+- The end-to-end logits still diverge from `llama.cpp`, so the remaining mismatch is upstream of the head.
 - The current trace set is good enough to keep narrowing; it is not yet a 100% match.
 
 ## Run Contract
@@ -62,9 +62,9 @@ rtk ./ref/llama.cpp/build/bin/llama-completion \
 | Tokenization | match | match | Raw prompt `"give"` maps to token `44883` |
 | Prompt path | match | match | Raw-completion probe is aligned |
 | Embed | match | match | Hidden-state traces line up on the probe |
-| Attention / SSM blocks | match through `output_norm` | match | Current evidence says the drift is after the stack |
-| Final `output_norm` | match | match | Values agree on the raw probe |
-| LM head (`output.weight`) | unresolved | match | Current suspect: `q6_K` matvec or row layout |
+| Attention / SSM blocks | unresolved vs reference | unresolved vs reference | Needs a fresh layer-by-layer trace now that the LM head is cleared |
+| Final `output_norm` | unresolved vs reference | unresolved vs reference | Re-localize the first mismatch before touching the head again |
+| LM head (`output.weight`) | match | match | CPU probe matches GPU within `1.3e-5` on rows 0-7 |
 | Sampler | unresolved | match | Not the leading suspect until LM head is proven |
 
 ## Evidence Log
@@ -79,19 +79,27 @@ rtk ./ref/llama.cpp/build/bin/llama-completion \
   - type: `f32`
   - `n_elts = 5120`
   - `size = 20480`
-- Mono debug on raw-completion probe shows the same `output_norm` vector prefix as the reference dump.
+- Legacy notes suggested `output_norm` agreement on an earlier probe; revalidate that claim on the current single-token run before using it as a blocker gate.
+- `mono27b` Q6_K LM-head probe on raw-completion `give`:
+  - rows 0-7 compare GPU logits against a CPU recomputation from the same loaded blocks
+  - worst row: `2`
+  - `max_abs = 1.33514404e-05`
+  - sample rows:
+    - row 0: gpu `8.7132206`, cpu `8.71322918`, delta `8.58306885e-06`
+    - row 1: gpu `3.55735159`, cpu `3.55735612`, delta `4.529953e-06`
+    - row 2: gpu `5.28695726`, cpu `5.28696012`, delta `2.86102295e-06`
+    - row 3: gpu `4.44023085`, cpu `4.44023085`, delta `0`
 
 ## Open Questions
 
-- Is the `q6_K` LM head math wrong, or is the row/stride selection wrong?
+- Which upstream block first diverges now that the Q6_K LM head has been cleared?
 - Are we comparing identical prompt forms everywhere, or did one side still include extra wrapper tokens?
-- If the LM head matches a CPU re-evaluation of the same weights, the remaining issue is upstream and the tracker must move back one step.
+- Do we need a fresh per-layer trace around the first divergent block before changing any more kernels?
 
 ## Next Verification Steps
 
-- [ ] Add a CPU-side `q6_K` probe for the first few LM-head rows and compare it against the GPU logits.
-- [ ] Record the probe result in this file with exact row numbers and deltas.
-- [ ] If the probe fails, patch the LM head implementation and rerun the same probe.
-- [ ] If the probe passes, move the tracker back to the earliest upstream mismatch and re-run the layer trace.
+- [x] Add a CPU-side `q6_K` probe for the first few LM-head rows and compare it against the GPU logits.
+- [x] Record the probe result in this file with exact row numbers and deltas.
+- [x] If the probe fails, patch the LM head implementation and rerun the same probe.
+- [x] If the probe passes, move the tracker back to the earliest upstream mismatch and re-run the layer trace.
 - [ ] Keep updating this file until the first mismatch is gone and the remaining trace is 100% identical on the chosen probe.
-

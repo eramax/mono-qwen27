@@ -280,6 +280,63 @@ static float q6k_row_dot_cpu(const BlockQ6K * row, int rb, const float * x) {
     return sum;
 }
 
+static void debug_probe_q6k_rows(FILE * fp, const char * phase, int step, int pos, int tok,
+                                 const BlockQ6K * gpu_rows, int rb, int rc,
+                                 const float * hidden_dev, const float * gpu_logits_dev,
+                                 int probe_rows = 8) {
+    if (!fp || !gpu_rows || !hidden_dev || !gpu_logits_dev || rb <= 0 || rc <= 0) return;
+
+    const int rows = std::min(probe_rows, rc);
+    if (rows <= 0) return;
+
+    std::vector<float> hidden(MONO27B_TARGET_HIDDEN);
+    std::vector<float> gpu_logits(rows);
+    std::vector<BlockQ6K> row_buf(static_cast<size_t>(rows) * static_cast<size_t>(rb));
+
+    cudaError_t e = cudaMemcpy(hidden.data(), hidden_dev,
+                               MONO27B_TARGET_HIDDEN * sizeof(float), cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        std::fprintf(fp, "%s\t%d\t%d\t%d\tlm_head_q6k_probe\tcopy_hidden\t%s\n",
+                     phase, step, pos, tok, cudaGetErrorString(e));
+        return;
+    }
+
+    e = cudaMemcpy(gpu_logits.data(), gpu_logits_dev,
+                   static_cast<size_t>(rows) * sizeof(float), cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        std::fprintf(fp, "%s\t%d\t%d\t%d\tlm_head_q6k_probe\tcopy_logits\t%s\n",
+                     phase, step, pos, tok, cudaGetErrorString(e));
+        return;
+    }
+
+    e = cudaMemcpy(row_buf.data(), gpu_rows,
+                   static_cast<size_t>(rows) * static_cast<size_t>(rb) * sizeof(BlockQ6K),
+                   cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        std::fprintf(fp, "%s\t%d\t%d\t%d\tlm_head_q6k_probe\tcopy_rows\t%s\n",
+                     phase, step, pos, tok, cudaGetErrorString(e));
+        return;
+    }
+
+    double max_abs = 0.0;
+    int worst_row = 0;
+    for (int row = 0; row < rows; ++row) {
+        const float cpu = q6k_row_dot_cpu(row_buf.data() + static_cast<size_t>(row) * rb, rb, hidden.data());
+        const float gpu = gpu_logits[row];
+        const float delta = cpu - gpu;
+        const double abs_delta = std::fabs((double)delta);
+        if (abs_delta > max_abs) {
+            max_abs = abs_delta;
+            worst_row = row;
+        }
+        std::fprintf(fp, "%s\t%d\t%d\t%d\tlm_head_q6k_row\t%d\t%.9g\t%.9g\t%.9g\n",
+                     phase, step, pos, tok, row, gpu, cpu, delta);
+    }
+
+    std::fprintf(fp, "%s\t%d\t%d\t%d\tlm_head_q6k_summary\trows=%d\tworst_row=%d\tmax_abs=%.9g\n",
+                 phase, step, pos, tok, rows, worst_row, max_abs);
+}
+
 // Q6_K matvec: direct dequantization matching ggml reference
 __global__ static void k_q6k_mt(const BlockQ6K * W, const float * x, float * y, int rb, int rc) {
     int row = blockIdx.x;
@@ -1161,6 +1218,13 @@ extern "C" bool mono27b_engine_decode_step(
                          -1, pos, tok, "logits",
                          (void *)out->logits, pa == cudaSuccess ? "device" : cudaGetErrorString(pa));
             debug_dump_vec(debug_fp, "out", -1, pos, tok, "logits", out->logits, MONO27B_TARGET_VOCAB);
+        }
+        if (debug_fp && we->lm_head.ggml_type == MONO27B_GGML_TYPE_Q6_K) {
+            debug_probe_q6k_rows(debug_fp, "out", -1, pos, tok,
+                                 static_cast<const BlockQ6K *>(we->lm_head.ptr),
+                                 static_cast<int>(we->lm_head.row_blocks),
+                                 static_cast<int>(we->lm_head.row_count),
+                                 h2, out->logits, 8);
         }
     }
     st->kv_len = pos + 1;
