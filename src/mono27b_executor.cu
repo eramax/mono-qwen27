@@ -1060,20 +1060,6 @@ __global__ static void k_q4k_mv_q8(const BlockQ4K * W, const BlockQ8_1 * q8, flo
 // Type-dispatched matvec: W at ggml_type, rb blocks per row, rc rows, x input, y output
 static void l_mv(void * W, uint32_t ggml_type, int rb, int rc, const float * x, float * y) {
     if (rc == 0 || !W) return;
-    // If Q8_1 scratch is available, use Q8_1-based path for quantized K-quant types
-    if (g_q8_scratch && (ggml_type == MONO27B_GGML_TYPE_Q4_K ||
-                         ggml_type == MONO27B_GGML_TYPE_Q5_K ||
-                         ggml_type == MONO27B_GGML_TYPE_Q6_K)) {
-        int ncols = rb * 256;
-        int nb = ncols / 32;
-        k_quant_q8_1<<<(nb + 255) / 256, 256>>>(x, g_q8_scratch, ncols);
-        cudaDeviceSynchronize();
-        if (ggml_type == MONO27B_GGML_TYPE_Q4_K) {
-            k_q4k_mv_q8<128><<<rc, 128>>>((const BlockQ4K *)W, g_q8_scratch, y, rb, rc, ncols);
-            return;
-        }
-        // Q5_K and Q6_K fall back to original for now
-    }
     // Fallback: original F32-path
     switch (ggml_type) {
         case MONO27B_GGML_TYPE_Q4_K: l_q4k((const BlockQ4K *)W, rb, rc, x, y); break;
@@ -1367,10 +1353,10 @@ extern "C" bool mono27b_engine_decode_step(
                 }
                 std::fprintf(debug_fp, "\n");
                 // Also dump wqkv values that feed into conv
-                std::vector<float> inp_host(8);
-                cudaMemcpy(inp_host.data(), sb, sizeof(float) * 8, cudaMemcpyDeviceToHost);
-                std::fprintf(debug_fp, "dbg\t0\t0\t%d\tconv_inp\t8\t", tok);
-                for (int i = 0; i < 8; i++) {
+                std::vector<float> inp_host(MONO27B_SSM_CONV_CH);
+                cudaMemcpy(inp_host.data(), sb, sizeof(float) * MONO27B_SSM_CONV_CH, cudaMemcpyDeviceToHost);
+                std::fprintf(debug_fp, "dbg\t0\t0\t%d\tconv_inp\t%d\t", tok, MONO27B_SSM_CONV_CH);
+                for (int i = 0; i < MONO27B_SSM_CONV_CH; i++) {
                     std::fprintf(debug_fp, "%s%.9g", i ? "," : "", inp_host[i]);
                 }
                 std::fprintf(debug_fp, "\n");
@@ -1438,7 +1424,7 @@ extern "C" bool mono27b_engine_decode_step(
                 MV(L.ssm_out, h2, sb); TRACE("ssmo");
                 if (debug_fp && pos == 0 && il < 4) {
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "gate", fb, MONO27B_SSM_D_INNER);
-                    debug_dump_vec(debug_fp, "ssm", il, pos, tok, "rms_gated", h2, MONO27B_SSM_D_INNER);
+                    debug_dump_vec(debug_fp, "ssm", il, pos, tok, "rms_gated", h2, MONO27B_SSM_D_INNER, MONO27B_SSM_D_INNER);
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ssm_out", sb, MONO27B_TARGET_HIDDEN);
                 }
                 k_elem_copy<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h2, sb, MONO27B_TARGET_HIDDEN); TRACE("scp");
