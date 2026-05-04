@@ -606,6 +606,9 @@ __global__ static void k_ssm_conv1d_u(const float * inp, const float * w, float 
     if (ch >= cc) return;
     int sl = ck - 1;
     float s = 0.0f;
+    // conv input order in reference: [x[-3], x[-2], x[-1], current]
+    // Our conv state: cs[0]=x[-3], cs[1]=x[-2], cs[2]=x[-1]
+    // w[0..3] are loaded from GGUF in the same order as the reference
     for (int k = 0; k < sl; ++k) s += cs[(size_t)ch * sl + k] * w[(size_t)ch * ck + k];
     s += inp[ch] * w[(size_t)ch * ck + sl];
     for (int k = 0; k < sl - 1; ++k) cs[(size_t)ch * sl + k] = cs[(size_t)ch * sl + k + 1];
@@ -619,6 +622,9 @@ __global__ static void k_ssm_conv1d_u_f16(const float * inp, const __half * w, f
     if (ch >= cc) return;
     int sl = ck - 1;
     float s = 0.0f;
+    // conv input order in reference: [x[-3], x[-2], x[-1], current]
+    // Our conv state: cs[0]=x[-3], cs[1]=x[-2], cs[2]=x[-1]
+    // w[0..3] are loaded from GGUF in the same order as the reference
     for (int k = 0; k < sl; ++k) {
         s += cs[(size_t)ch * sl + k] * __half2float(w[(size_t)ch * ck + k]);
     }
@@ -1207,6 +1213,30 @@ extern "C" bool mono27b_engine_decode_step(
                 }
 
             // Conv1D
+            if (debug_fp && pos == 0 && il == 0) {
+                // Debug dump first 8 conv weights
+                std::vector<float> conv_w_host(MONO27B_SSM_CONV_KERN * 2); // 8 weights for first 2 channels
+                if (L.ssm_conv1d.ggml_type == MONO27B_GGML_TYPE_F16) {
+                    std::vector<__half> host_half(MONO27B_SSM_CONV_KERN * 2);
+                    cudaMemcpy(host_half.data(), L.ssm_conv1d.ptr, sizeof(__half) * MONO27B_SSM_CONV_KERN * 2, cudaMemcpyDeviceToHost);
+                    for (int i = 0; i < MONO27B_SSM_CONV_KERN * 2; i++) conv_w_host[i] = __half2float(host_half[i]);
+                } else {
+                    cudaMemcpy(conv_w_host.data(), L.ssm_conv1d.ptr, sizeof(float) * MONO27B_SSM_CONV_KERN * 2, cudaMemcpyDeviceToHost);
+                }
+                std::fprintf(debug_fp, "dbg\t0\t0\t%d\tconv_w\t%d\t", tok, MONO27B_SSM_CONV_KERN * 2);
+                for (int i = 0; i < MONO27B_SSM_CONV_KERN * 2; i++) {
+                    std::fprintf(debug_fp, "%s%.9g", i ? "," : "", conv_w_host[i]);
+                }
+                std::fprintf(debug_fp, "\n");
+                // Also dump wqkv values that feed into conv
+                std::vector<float> inp_host(8);
+                cudaMemcpy(inp_host.data(), sb, sizeof(float) * 8, cudaMemcpyDeviceToHost);
+                std::fprintf(debug_fp, "dbg\t0\t0\t%d\tconv_inp\t8\t", tok);
+                for (int i = 0; i < 8; i++) {
+                    std::fprintf(debug_fp, "%s%.9g", i ? "," : "", inp_host[i]);
+                }
+                std::fprintf(debug_fp, "\n");
+            }
             if (st->conv_state[ssm_i]) {
                 if (L.ssm_conv1d.ggml_type == MONO27B_GGML_TYPE_F16) {
                     k_ssm_conv1d_u_f16<<<(MONO27B_SSM_CONV_CH + 255) / 256, 256>>>(
@@ -1219,13 +1249,13 @@ extern "C" bool mono27b_engine_decode_step(
                 }
             }
                 if (debug_fp && pos == 0 && il < 4) {
-                    debug_dump_vec(debug_fp, "ssm", il, pos, tok, "conv_raw", sb, MONO27B_SSM_CONV_CH);
+                    debug_dump_vec(debug_fp, "ssm", il, pos, tok, "conv_raw", sb, MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_CH);
                 }
                 k_elem_silu<<<(MONO27B_SSM_CONV_CH + 255) / 256, 256>>>(sb, MONO27B_SSM_CONV_CH);
                 { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d conv: %s", il, cudaGetErrorString(e)); goto cleanup; } }
                 if (!check_finite_device("ssm conv", sb, MONO27B_SSM_CONV_CH, error, error_cap)) goto cleanup;
                 if (debug_fp && pos == 0 && il < 3) {
-                    debug_dump_vec(debug_fp, "ssm", il, pos, tok, "conv", sb, MONO27B_SSM_CONV_CH, 16);
+                    debug_dump_vec(debug_fp, "ssm", il, pos, tok, "conv", sb, MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_CH);
                 }
 
                 float * qr = sb;
@@ -1246,7 +1276,7 @@ extern "C" bool mono27b_engine_decode_step(
                     { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d deltanet: %s", il, cudaGetErrorString(e)); goto cleanup; } }
                     if (!check_finite_device("ssm deltanet", gb, MONO27B_SSM_D_INNER, error, error_cap)) goto cleanup;
                     if (debug_fp && pos == 0 && il < 4) {
-                        debug_dump_vec(debug_fp, "ssm", il, pos, tok, "deltanet", gb, MONO27B_SSM_D_INNER);
+                        debug_dump_vec(debug_fp, "ssm", il, pos, tok, "deltanet", gb, MONO27B_SSM_D_INNER, MONO27B_SSM_D_INNER);
                     }
                 }
 
@@ -1281,8 +1311,8 @@ extern "C" bool mono27b_engine_decode_step(
                     std::snprintf(lbl, sizeof(lbl), "ssm layer %d output", il);
                     if (!check_finite_device(lbl, h2, MONO27B_TARGET_HIDDEN, error, error_cap)) goto cleanup;
                 }
-                if (debug_fp && pos == 0 && il < 4) {
-                    debug_dump_vec(debug_fp, "ssm", il, pos, tok, "layer_out", h2, MONO27B_TARGET_HIDDEN);
+                if (debug_fp && pos == 0 && il < MONO27B_TARGET_LAYERS) {
+                    debug_dump_vec(debug_fp, "ssm", il, pos, tok, "layer_out", h2, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
                 }
             } else {
                 if (st->conv_state[ssm_i]) {

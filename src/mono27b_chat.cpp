@@ -350,8 +350,7 @@ int main(int argc, char ** argv) {
     }
     std::vector<int32_t> prompt_ids;
     prompt_ids = tokenizer.encode(user_prompt);
-    // Always add BOS to match llama-debug behavior (it processes BOS even if add_bos_token=false)
-    if (true || gguf.metadata.add_bos_token) {
+    if (gguf.metadata.add_bos_token) {
         prompt_ids.insert(prompt_ids.begin(), static_cast<int32_t>(tokenizer.bos_id()));
     }
     std::fprintf(stderr, "[prompt] tokens=%zu ids=", prompt_ids.size());
