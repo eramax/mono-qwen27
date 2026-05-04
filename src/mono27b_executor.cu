@@ -1378,7 +1378,7 @@ extern "C" bool mono27b_engine_decode_step(
             std::fprintf(debug_fp, "out\t%d\t%d\t%d\t%s\tptr\tlogits\t%p\t%s\n",
                          -1, pos, tok, "logits",
                          (void *)out->logits, pa == cudaSuccess ? "device" : cudaGetErrorString(pa));
-            debug_dump_vec(debug_fp, "out", -1, pos, tok, "logits", out->logits, MONO27B_TARGET_VOCAB);
+            debug_dump_vec(debug_fp, "out", -1, pos, tok, "logits", out->logits, MONO27B_TARGET_VOCAB, MONO27B_TARGET_VOCAB);
         }
         if (debug_fp && we->lm_head.ggml_type == MONO27B_GGML_TYPE_Q6_K) {
             debug_probe_q6k_rows(debug_fp, "out", -1, pos, tok,
@@ -1386,6 +1386,20 @@ extern "C" bool mono27b_engine_decode_step(
                                  static_cast<int>(we->lm_head.row_blocks),
                                  static_cast<int>(we->lm_head.row_count),
                                  h2, out->logits, 8);
+        }
+        // Save logits as binary for comparison
+        if (pos == 0) {
+            std::vector<float> logits_save(MONO27B_TARGET_VOCAB);
+            cudaError_t ce = cudaMemcpy(logits_save.data(), out->logits,
+                                         MONO27B_TARGET_VOCAB * sizeof(float),
+                                         cudaMemcpyDeviceToHost);
+            if (ce == cudaSuccess) {
+                FILE * lf = fopen("/tmp/mono_logits.bin", "wb");
+                if (lf) {
+                    fwrite(logits_save.data(), sizeof(float), MONO27B_TARGET_VOCAB, lf);
+                    fclose(lf);
+                }
+            }
         }
     }
     st->kv_len = pos + 1;
