@@ -177,6 +177,7 @@ extern "C" bool mono27b_engine_decode_step(
     int token_id, int position,
     Mono27BLogitsOutput * output,
     FILE * debug_fp,
+    int debug_pos,
     char * error, size_t error_cap);
 
 extern "C" void mono27b_engine_free_logits(Mono27BLogitsOutput * output);

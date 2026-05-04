@@ -1,8 +1,8 @@
-# mono27b / llama.cpp Parity Tracking — FINAL
+# mono27b / llama.cpp Parity Tracking — CURRENT
 
-**Status:** All individual components verified numerically correct.
-**Remaining divergence:** Final logit correlation 0.414.
-**Root cause:** Every custom CUDA kernel (Q4_K, Q5_K, Q6_K matvecs, DeltaNet) uses F32 arithmetic that differs from ggml's `__dp4a`-based integer dot product approach at ~1e-6 relative per operation. These accumulate across ~100 operations/layer × 64 layers.
+**Status:** Verification harness is restored and live-reference based again. The app stays independent of llama.cpp at runtime, but verification still compares against `llama-debug`.
+**Current blocker:** Same-token replay shows the stateful SSM path still diverges on generation steps.
+**Latest finding:** The prompt token is close, but the first generated token path blows up in `conv_output_silu` and downstream SSM tensors.
 
 ## What Was Verified
 
@@ -25,6 +25,27 @@
 | **Q4_K matvec (FFN/attention)** | ✓ | Dequant formula matches reference's `dequantize_row_q4_K` |
 | **compute-sanitizer** | ✓ | 0 memory errors across full 64-layer run |
 
+## Recent Work
+
+1. **Fixed a real SwiGLU bug** in `src/mono27b_executor.cu`:
+   - `k_elem_swiglu` was applying `silu` to the wrong operand.
+   - It now computes `silu(gate) * up`, matching the expected FFN gate behavior.
+
+2. **Restored and preserved live verification**:
+   - Verification still generates reference data from `llama-debug`.
+   - The app itself does not depend on llama.cpp.
+
+3. **Added deeper SSM debug taps**:
+   - `q_conv_predelta`
+   - `k_conv_predelta`
+   - `final_output`
+   - `ssm_out`
+   - `post_ffn`
+
+4. **Added replay/debug controls to the app**:
+   - `--replay-trace` forces our run to follow the reference token stream.
+   - `--debug-pos N` dumps tensors for any chosen position, not only the prompt token.
+
 ## Bugs Found and Fixed
 
 1. **Attention gate fix** — Verified Q projection produces both Q and gate (12288 = Q_DIM*2 outputs). Sigmoid gate applied correctly via `k_elem_sigmoid_mul`.
@@ -34,6 +55,8 @@
 3. **Other fixes from earlier sessions** — M-RoPE section 0 (22 dims), L2 norm epsilon `fmaxf(sum, eps²)` → `fmaxf(sum_sq, eps*eps)`, Q8_K type safety.
 
 4. **Conv1d weight ordering** (not a bug) — Confirmed the conv1d kernel was always correct. The reference stores weights as [w_x-3, w_x-2, w_x-1, w_current] per channel. Our kernel uses cs[0..2] = [x[-3], x[-2], x[-1]] and inp = current, with formula `s = cs[0]*w[0] + cs[1]*w[1] + cs[2]*w[2] + inp*w[3]` which matches the reference's `sumf = x[-3]*w[0] + x[-2]*w[1] + x[-1]*w[2] + current*w[3]`.
+
+5. **Replay-token verification gap** — The earlier step-by-step mismatch on generated tokens was partly misleading because the sampled continuation diverged. I added a replay mode so our engine can be forced onto the exact reference continuation and compared on the same token stream.
 
 ## Experiments That Didn't Help
 
@@ -46,6 +69,28 @@ Replaced the Q6_K matvec kernel to quantize the F32 input to Q8_1 in shared memo
 Added a `q8_scratch` global buffer (544 BlockQ8_1 = ~20KB) to the engine state, a `k_quant_q8_1` kernel for F32→Q8_1 quantization, and a `k_q4k_mv_q8` kernel using Q8_1 intermediate. Modified `l_mv` dispatch to use Q8_1 path for Q4_K weights.
 
 **Result:** Correlation 0.413485 — essentially unchanged (-0.19% from 0.414288 baseline). Confirms Q8_1 quantization of the input vector is NOT the source of divergence, even for the most common weight type (Q4_K, 207 of 851 tensors).
+
+### Forced replay investigation
+
+I added a replay mode and a position-selectable debug dump so we can inspect the same continuation token as llama.cpp instead of comparing two different sampled branches.
+
+Observed on the forced generated token stream:
+
+| Tensor | Same-token diff | Notes |
+|--------|-----------------|------|
+| `attn_norm-0` | ~5e-05 | close |
+| `conv_output_silu-0` | ~8.176 | large divergence |
+| `q_conv_predelta-0` | ~0.648 | diverges after conv |
+| `k_conv_predelta-0` | ~0.918 | diverges after conv |
+| `attn_output-0` | ~0.466 | downstream drift |
+| `final_output-0` | ~0.675 | downstream drift |
+| `linear_attn_out-0` | ~10.43 | very large drift |
+| `l_out-0` | ~0.436 | downstream drift |
+
+Interpretation:
+- The earlier prompt-token checks were not sufficient to identify the bug.
+- The first generated token path still diverges in the stateful SSM branch.
+- The first clearly broken stage on same-token replay is the SSM conv / DeltaNet path, not the prompt embedding or RMS norm.
 
 ### Conclusion from both attempts
 
@@ -69,11 +114,11 @@ The reference's approach vs ours:
 
 The key difference: ggml uses `__dp4a` (integer dot product of 4 int8 values) for the core matmul computation, then converts to float for scaling. This is both faster and deterministic. Our F32 approach does all arithmetic in floating point, which rounds differently.
 
-### Key Insight: Batch Mode
+### Key Insight: Step Comparisons Need Replay
 
-`llama-debug` uses `n_batch=2` by default, processing 2 tokens simultaneously during state init. The intermediate tensors in debug output have shape `{..., 2}` (batched). Our single-token comparison against these batched intermediates is approximate.
+Comparing generated steps without forcing the same token stream is not reliable. Once the sampled token diverges, later hidden states are no longer comparable.
 
-The `--save-logits` output is from the **state init** phase, which processes all prompt tokens at once. For a 1-token prompt, this matches our single-token processing.
+The replay path now avoids that trap by feeding the reference `gen` token sequence back into our app and dumping tensors at an arbitrary `--debug-pos`.
 
 ### FFN Residual Formula Verified
 
@@ -98,6 +143,7 @@ This matches our code: `h = FFN(RMS(h2)) + h2` where h2 = residual (un-normed).
 | `verify_rms_norm.py` | RMS norm verification |
 | `verify_deltanet.py` | Python DeltaNet reference |
 | `compare_ref.py` | Compare GPU vs llama-debug output |
+| `replay-trace` mode | Forces our generation stream to match a reference trace |
 | `ref_logits.bin` | Reference logits (from `--save-logits`) |
 | `our_logits.bin` | Our logits binary |
 
@@ -115,11 +161,18 @@ llama-debug -m model.gguf -p "give" -n 1 -c 4096 --seed 944990222 \
 # Our code with debug dump
 mono27b_chat -m model.gguf -p "give" --gen 1 --ctx 4096 --seed 944990222 \
     --trace /dev/null --debug /tmp/debug.tsv
+
+# Force our generation onto the same token stream as the reference trace
+mono27b_chat -m model.gguf -p "give" --gen 1 --ctx 4096 --seed 944990222 \
+    --trace /dev/null --debug /tmp/debug.tsv --debug-pos 1 \
+    --replay-trace debug/ref_give_b1.trace.tsv
 ```
 
-## Only Path to Parity: Use ggml_mul_mat Everywhere
+## Likely Path to Parity
 
-Every experiment confirms the divergence is NOT in any single component or formula. It's the **accumulated effect of F32 arithmetic differences across ALL operations** (matmuls + DeltaNet + element-wise) over 64 layers with stateful feedback loops. The Q8_1 vector quantization approach addresses only the matmul path and has <0.2% impact.
+The replayed same-token run points to the stateful SSM path, especially conv / DeltaNet, as the remaining source of divergence. This is more specific than the earlier “all math is slightly different” hypothesis.
+
+The next likely fix is to port the ggml SSM conv / gated DeltaNet path more literally, then re-run the forced replay compare at `--debug-pos 1`.
 
 ### Required: Replace ALL custom CUDA kernels with ggml's implementations
 
@@ -132,10 +185,10 @@ This is the **only way** to achieve bit-exact parity. It requires:
 
 **Why Q8_1 approach failed:** The matvec is only ~30% of the FLOPs per layer. The DeltaNet, RMS norms, element-wise gates, and FFN account for the rest. Each of these uses F32 arithmetic that rounds differently from ggml. Even perfect matmuls leave ~70% of the computation on non-ggml paths.
 
-**Challenge for no-deps constraint:** Replacing all operations with ggml's means either linking against `libggml-cuda.so` (external dependency) or copying ~5000+ lines of CUDA kernel code from the reference (vecdotq.cuh, gated_delta_net.cu, norm.cu, ssm-conv.cu, unary.cu).
+**Challenge for no-deps constraint:** Replacing all operations with ggml's means either linking against `libggml-cuda.so` (external dependency) or copying the reference CUDA kernels directly (`gated_delta_net.cu`, `ssm-conv.cu`, norm/unary paths, and the relevant matmul kernels).
 
-**Effort with no deps (copying code):** ~1 week
-**Effort with ggml library link:** ~2-3 days
+**Effort with no deps (copying code):** still nontrivial
+**Effort with ggml library link:** still faster, but outside the app dependency constraint
 
 ## Quick Reference: Key Dimensions
 

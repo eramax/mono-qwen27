@@ -1138,6 +1138,7 @@ extern "C" bool mono27b_engine_decode_step(
     int tok, int pos,
     Mono27BLogitsOutput * out,
     FILE * debug_fp,
+    int debug_pos,
     char * error, size_t error_cap)
 {
     // Set Q8_1 scratch pointer for matvec quantization
@@ -1179,9 +1180,10 @@ extern "C" bool mono27b_engine_decode_step(
     out->logits = work_buf + total_work / sizeof(float);
 
     int fa_i = 0, ssm_i = 0, il = 0; cudaError_t sync_err = cudaSuccess;
+    const bool dump_step = debug_fp && (pos == debug_pos);
 
     mono27b_engine_embed(we, tok, h, error, error_cap);
-    if (debug_fp && pos == 0) {
+    if (dump_step) {
         debug_dump_vec(debug_fp, "embed", 0, pos, tok, "h", h, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
     }
     TRACE("emb");
@@ -1197,14 +1199,14 @@ extern "C" bool mono27b_engine_decode_step(
             int max_ctx = st->max_ctx > 0 ? st->max_ctx : 8192;
 
             l_rms(h2, h, WV(L.attn_norm), MONO27B_TARGET_HIDDEN); TRACE("rms");
-            if (debug_fp && pos == 0 && il < 4) {
+            if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "rms", h2, MONO27B_TARGET_HIDDEN);
             }
             MV(L.wq, h2, qb); TRACE("wq");
             MV(L.wk, h2, kb); TRACE("wk");
             MV(L.wv, h2, kb + MONO27B_TARGET_KV_DIM); TRACE("wv");
             // Gate is embedded in Q projection output (second half of 12288)
-            if (debug_fp && pos == 0 && il < 4) {
+            if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "q_proj", qb, MONO27B_TARGET_Q_DIM, 64);
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "gate_src", qb + MONO27B_TARGET_Q_DIM, MONO27B_TARGET_Q_DIM);
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "v_proj", kb + MONO27B_TARGET_KV_DIM, MONO27B_TARGET_KV_DIM);
@@ -1220,7 +1222,7 @@ extern "C" bool mono27b_engine_decode_step(
                     k_rms_norm_mulw<256><<<1, 256>>>(kb + hh * MONO27B_TARGET_HEAD_DIM,
                         WV(L.k_norm), kb + hh * MONO27B_TARGET_HEAD_DIM,
                         MONO27B_TARGET_HEAD_DIM, MONO27B_RMS_EPS);
-            if (debug_fp && pos == 0 && il < 4) {
+            if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "q_norm", qb, MONO27B_TARGET_Q_DIM, 64);
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "k_norm", kb, MONO27B_TARGET_KV_DIM, 64);
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "q_conv_predelta", qb, MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K);
@@ -1240,7 +1242,7 @@ extern "C" bool mono27b_engine_decode_step(
                 pos, pos, pos, 0,
                 11, 11, 10, 0,
                 MONO27B_N_ROT_DIMS); TRACE("mk");
-            if (debug_fp && pos == 0 && il < 4) {
+            if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "q_rope", qb, MONO27B_TARGET_Q_DIM, 64);
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "k_rope", kb, MONO27B_TARGET_KV_DIM, 64);
             }
@@ -1266,18 +1268,18 @@ extern "C" bool mono27b_engine_decode_step(
                     kvl, MONO27B_TARGET_N_HEAD, MONO27B_TARGET_N_KV_HEAD,
                     MONO27B_TARGET_HEAD_DIM, max_ctx, 1.0f / sqrtf(MONO27B_TARGET_HEAD_DIM));
             }
-            if (debug_fp && pos == 0 && il < 4) {
+            if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "attn_raw", qb, MONO27B_TARGET_Q_DIM);
             }
             // Gate: sigmoid(gate_q) * attn_output
             k_elem_sigmoid_mul<<<(MONO27B_TARGET_Q_DIM + 255) / 256, 256>>>(
                 qb, qb + MONO27B_TARGET_Q_DIM, qb, MONO27B_TARGET_Q_DIM); TRACE("gt");
-            if (debug_fp && pos == 0 && il < 4) {
+            if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "attn_gated", qb, MONO27B_TARGET_Q_DIM);
             }
 
             MV(L.wo, qb, h2); TRACE("wo");
-            if (debug_fp && pos == 0 && il < 4) {
+            if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "attn_out", h2, MONO27B_TARGET_HIDDEN);
             }
             k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h2, h, MONO27B_TARGET_HIDDEN); TRACE("res1");
@@ -1295,7 +1297,7 @@ extern "C" bool mono27b_engine_decode_step(
                 std::snprintf(lbl, sizeof(lbl), "attn layer %d output", il);
                 if (!check_finite_device(lbl, h, MONO27B_TARGET_HIDDEN, error, error_cap)) goto cleanup;
             }
-            if (debug_fp && pos == 0 && il < 4) {
+            if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "post_ffn", h, MONO27B_TARGET_HIDDEN);
             }
             fa_i++;
@@ -1311,11 +1313,11 @@ extern "C" bool mono27b_engine_decode_step(
             l_rms(h2, h, WV(L.attn_norm), MONO27B_TARGET_HIDDEN);
             MV(L.wqkv, h2, sb);
             MV(L.wqkv_gate, h2, gb);
-            if (debug_fp && pos == 0 && il == 0) {
+            if (dump_step && il == 0) {
                 // Dump FULL wqkv_gate (6144) for Python comparison
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "wqkv_gate", gb, MONO27B_SSM_D_INNER, MONO27B_SSM_D_INNER);
             }
-            if (debug_fp && pos == 0 && il < 3) {
+            if (dump_step && il < 3) {
                 // Dump FULL attn_norm (h2) for verification (20KB)
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "attn_norm", h2, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "wqkv", sb, MONO27B_SSM_CONV_CH, 16);
@@ -1333,13 +1335,13 @@ extern "C" bool mono27b_engine_decode_step(
                 k_elem_mul<<<(dr + 31) / 32, 32>>>(qb, WV(L.ssm_a_log), dr);
                 { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d dt: %s", il, cudaGetErrorString(e)); goto cleanup; } }
                 if (!check_finite_device("ssm dt", qb, dr, error, error_cap)) goto cleanup;
-                if (debug_fp && pos == 0 && il < 4) {
+                if (dump_step && il < 4) {
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "beta", kb, dr);
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "dt", qb, dr);
                 }
 
             // Conv1D
-            if (debug_fp && pos == 0 && il == 0) {
+            if (dump_step && il == 0) {
                 // Debug dump first 8 conv weights
                 std::vector<float> conv_w_host(MONO27B_SSM_CONV_KERN * 2); // 8 weights for first 2 channels
                 if (L.ssm_conv1d.ggml_type == MONO27B_GGML_TYPE_F16) {
@@ -1374,13 +1376,13 @@ extern "C" bool mono27b_engine_decode_step(
                         MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_KERN);
                 }
             }
-                if (debug_fp && pos == 0 && il < 4) {
+                if (dump_step && il < 4) {
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "conv_raw", sb, MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_CH);
                 }
                 k_elem_silu<<<(MONO27B_SSM_CONV_CH + 255) / 256, 256>>>(sb, MONO27B_SSM_CONV_CH);
                 { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d conv: %s", il, cudaGetErrorString(e)); goto cleanup; } }
                 if (!check_finite_device("ssm conv", sb, MONO27B_SSM_CONV_CH, error, error_cap)) goto cleanup;
-                if (debug_fp && pos == 0 && il < 3) {
+                if (dump_step && il < 3) {
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "conv", sb, MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_CH);
                 }
 
@@ -1401,7 +1403,7 @@ extern "C" bool mono27b_engine_decode_step(
                         MONO27B_SSM_HEAD_V, MONO27B_SSM_HEAD_K);
                     { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d deltanet: %s", il, cudaGetErrorString(e)); goto cleanup; } }
                     if (!check_finite_device("ssm deltanet", gb, MONO27B_SSM_D_INNER, error, error_cap)) goto cleanup;
-                    if (debug_fp && pos == 0 && il < 4) {
+                    if (dump_step && il < 4) {
                         debug_dump_vec(debug_fp, "ssm", il, pos, tok, "deltanet", gb, MONO27B_SSM_D_INNER, MONO27B_SSM_D_INNER);
                     }
                 }
@@ -1423,13 +1425,13 @@ extern "C" bool mono27b_engine_decode_step(
                 }
                 TRACE("grms");
                 k_elem_mul<<<(MONO27B_SSM_D_INNER + 255) / 256, 256>>>(h2, fb, MONO27B_SSM_D_INNER); TRACE("gmul2");
-                if (debug_fp && pos == 0 && il < 4) {
+                if (dump_step && il < 4) {
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "final_output", h2, MONO27B_SSM_D_INNER, MONO27B_SSM_D_INNER);
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "q_conv_predelta", qr, MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K);
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "k_conv_predelta", kr, MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K);
                 }
                 MV(L.ssm_out, h2, sb); TRACE("ssmo");
-                if (debug_fp && pos == 0 && il < 4) {
+                if (dump_step && il < 4) {
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "gate", fb, MONO27B_SSM_D_INNER);
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "rms_gated", h2, MONO27B_SSM_D_INNER, MONO27B_SSM_D_INNER);
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ssm_out", sb, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
@@ -1442,7 +1444,7 @@ extern "C" bool mono27b_engine_decode_step(
                     std::snprintf(lbl, sizeof(lbl), "ssm layer %d output", il);
                     if (!check_finite_device(lbl, h2, MONO27B_TARGET_HIDDEN, error, error_cap)) goto cleanup;
                 }
-                if (debug_fp && pos == 0 && il < MONO27B_TARGET_LAYERS) {
+                if (dump_step && il < MONO27B_TARGET_LAYERS) {
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "layer_out", h2, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
                 }
             } else {
@@ -1469,28 +1471,28 @@ extern "C" bool mono27b_engine_decode_step(
 
         ssm_ffn:
             l_rms(h, h2, WV(L.post_norm), MONO27B_TARGET_HIDDEN);
-            if (debug_fp && pos == 0 && il < 4) {
+            if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "post_norm", h, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
             }
             MV(L.ffn_gate, h, fb);
-            if (debug_fp && pos == 0 && il < 4) {
+            if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ffn_gate", fb, MONO27B_TARGET_FFN, MONO27B_TARGET_FFN);
             }
             MV(L.ffn_up, h, kb);
-            if (debug_fp && pos == 0 && il < 4) {
+            if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ffn_up", kb, MONO27B_TARGET_FFN, MONO27B_TARGET_FFN);
             }
             k_elem_swiglu<<<(MONO27B_TARGET_FFN + 255) / 256, 256>>>(fb, kb, MONO27B_TARGET_FFN);
             { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d ffn: %s", il, cudaGetErrorString(e)); goto cleanup; } }
-            if (debug_fp && pos == 0 && il < 4) {
+            if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ffn_mul", fb, MONO27B_TARGET_FFN, MONO27B_TARGET_FFN);
             }
             MV(L.ffn_down, fb, h);
-            if (debug_fp && pos == 0 && il < 3) {
+            if (dump_step && il < 3) {
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ffn_down", h, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
             }
             k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h, h2, MONO27B_TARGET_HIDDEN);
-            if (debug_fp && pos == 0 && il < 3) {
+            if (dump_step && il < 3) {
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "post_ffn", h, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
             }
             ssm_i++;
@@ -1513,7 +1515,9 @@ extern "C" bool mono27b_engine_decode_step(
         std::fprintf(debug_fp, "out\t%d\t%d\t%d\t%s\tptr\th2\t%p\t%s\n",
                      -1, pos, tok, "output_norm",
                      (void *)h2, pa == cudaSuccess ? "device" : cudaGetErrorString(pa));
-        debug_dump_vec(debug_fp, "out", -1, pos, tok, "output_norm", h2, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
+        if (dump_step) {
+            debug_dump_vec(debug_fp, "out", -1, pos, tok, "output_norm", h2, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
+        }
     }
     // REAL LM head: use the proper Q6_K matvec in chunks
     {
@@ -1534,7 +1538,7 @@ extern "C" bool mono27b_engine_decode_step(
             cudaMemcpy(out->logits, &v, 4, cudaMemcpyHostToDevice);
             sync_err = cudaDeviceSynchronize();
         }
-        if (debug_fp && pos == 0) {
+        if (dump_step) {
             cudaPointerAttributes attrs{};
             cudaError_t pa = cudaPointerGetAttributes(&attrs, out->logits);
             std::fprintf(debug_fp, "out\t%d\t%d\t%d\t%s\tptr\tlogits\t%p\t%s\n",

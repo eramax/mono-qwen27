@@ -80,6 +80,48 @@ static bool is_banned_token(const std::string & token) {
            token == "<|vision_pad|>";
 }
 
+static std::vector<int32_t> load_replay_tokens(const std::string & path) {
+    std::vector<int32_t> tokens;
+    if (path.empty()) return tokens;
+
+    std::ifstream in(path);
+    if (!in) {
+        std::fprintf(stderr, "warn: failed to open replay trace: %s\n", path.c_str());
+        return tokens;
+    }
+
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line.rfind("phase\t", 0) == 0) continue;
+        size_t p0 = 0;
+        size_t p1 = line.find('\t', p0);
+        if (p1 == std::string::npos) continue;
+        const std::string phase = line.substr(p0, p1 - p0);
+        if (phase != "gen") continue;
+        p0 = p1 + 1;
+        p1 = line.find('\t', p0);
+        if (p1 == std::string::npos) continue;
+        p0 = p1 + 1;
+        p1 = line.find('\t', p0);
+        if (p1 == std::string::npos) continue;
+        p0 = p1 + 1;
+        p1 = line.find('\t', p0);
+        if (p1 == std::string::npos) continue;
+        p0 = p1 + 1;
+        p1 = line.find('\t', p0);
+        if (p1 == std::string::npos) continue;
+        try {
+            tokens.push_back(static_cast<int32_t>(std::stol(line.substr(p0, p1 - p0))));
+        } catch (...) {
+            continue;
+        }
+    }
+
+    std::fprintf(stderr, "[replay] loaded %zu generation tokens from %s\n",
+                 tokens.size(), path.c_str());
+    return tokens;
+}
+
 static int sample_from_logits(std::vector<float> logits, const Mono27BGgufFile & gguf,
                               std::mt19937 & rng, int top_k, float top_p, float min_p,
                               int * best_out) {
@@ -363,6 +405,7 @@ int main(int argc, char ** argv) {
     std::vector<int32_t> generated;
     std::ofstream trace;
     std::FILE * debug_fp = nullptr;
+    std::vector<int32_t> replay_tokens = load_replay_tokens(args.replay_trace_path);
     if (!args.trace_path.empty()) {
         trace.open(args.trace_path, std::ios::out | std::ios::trunc);
         if (!trace) {
@@ -383,7 +426,7 @@ int main(int argc, char ** argv) {
         Mono27BLogitsOutput logits{};
         if (!mono27b_engine_decode_step(&gpu_weights, &state,
                                          prompt_ids[i], static_cast<int>(i),
-                                         &logits, debug_fp, errbuf, sizeof(errbuf))) {
+                                         &logits, debug_fp, args.debug_pos, errbuf, sizeof(errbuf))) {
             std::fprintf(stderr, "step error at prompt %zu: %s\n", i, errbuf);
             mono27b_engine_free_logits(&logits);
             goto cleanup;
@@ -423,7 +466,7 @@ int main(int argc, char ** argv) {
         Mono27BLogitsOutput logits{};
         if (!mono27b_engine_decode_step(&gpu_weights, &state,
                                          last_tok, pos,
-                                         &logits, debug_fp, errbuf, sizeof(errbuf))) {
+                                         &logits, debug_fp, args.debug_pos, errbuf, sizeof(errbuf))) {
             std::fprintf(stderr, "step error at gen %d: %s\n", step, errbuf);
             mono27b_engine_free_logits(&logits);
             goto cleanup;
@@ -437,7 +480,14 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "step %d logits copy error: %s\n", step, cudaGetErrorString(copy_err));
         }
         int best = 0;
-        int chosen = sample_from_logits(logits_host, gguf, rng, top_k, top_p, min_p, &best);
+        int chosen = -1;
+        if (step < static_cast<int>(replay_tokens.size())) {
+            chosen = replay_tokens[static_cast<size_t>(step)];
+            best = argmax_from_logits(logits_host, &best);
+            std::fprintf(stderr, "[replay] step %d forcing token %d\n", step, chosen);
+        } else {
+            chosen = sample_from_logits(logits_host, gguf, rng, top_k, top_p, min_p, &best);
+        }
 
         if (trace) {
             write_trace_row(trace, "gen", step, pos, last_tok, chosen, logits_host);

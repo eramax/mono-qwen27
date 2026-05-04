@@ -10,6 +10,8 @@ struct Mono27BChatArgs {
     std::string prompt;
     std::string trace_path;
     std::string debug_path;
+    std::string replay_trace_path;
+    int debug_pos = 0;
     uint32_t seed = 944990222U;
     int max_ctx = 131072;
     int max_gen = 512;
