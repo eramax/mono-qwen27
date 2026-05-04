@@ -9,7 +9,8 @@
 | Component | Diff | Method |
 |-----------|------|--------|
 | **Embedding (Q4_K)** | ✓ exact | Python GGUF dequant matches GPU output |
-| **RMS norm** | ✓ 3e-7 | 5120 elements CPU vs GPU |
+| **RMS norm (isolated)** | ✓ 3e-7 | 5120 elements CPU vs GPU |
+| **RMS norm (attn_norm-0 E2E)** | ✗ | **Massive divergence (Ref: 69.4 vs Mono: 37.0)** — see investigation below |
 | **Q6_K matvec (wqkv)** | ✓ 1.3e-7 | Fixed Python dequant; CPU GGUF data matches GPU |
 | **Q5_K matvec (wqkv_gate)** | ✓ 4e-7 | Python GGUF data vs GPU |
 | **Q6_K matvec (LM head)** | ✓ 1.3e-5 | GPU vs CPU re-dequant on 8 rows |
@@ -24,43 +25,62 @@
 | **Q8_0 matvec (ssm_out)** | ✓ | Formula matches |
 | **Q4_K matvec (FFN/attention)** | ✓ | Dequant formula matches reference's `dequantize_row_q4_K` |
 | **compute-sanitizer** | ✓ | 0 memory errors across full 64-layer run |
+| **Softplus stability** | ✓ | `(z > 20.0f) ? z : logf(1.0f + expf(z))` matching ggml |
+| **GQA indexing (DeltaNet)** | ✓ | `r_idx / (dr / ng)` for repeating heads (fixed from `r_idx % ng`) |
+| **Norm accumulation** | ✓ | `double` precision parallel reduction for both `k_rms_norm_mulw` and `k_l2_norm_g` |
 
 ## Recent Work
 
-1. **Fixed a real SwiGLU bug** in `src/mono27b_executor.cu`:
+1. **Fixed softplus stability branching**: Reverted to the exact `llama.cpp` logic `(z > 20.0f) ? z : logf(1.0f + expf(z))` in [mono27b_executor.cu](file:///mnt/mydata/projects2/mono27b/src/mono27b_executor.cu).
+
+2. **Corrected GQA indexing in DeltaNet**: Changed `r_idx % ng` to `r_idx / (dr / ng)` in [mono27b_executor.cu](file:///mnt/mydata/projects2/mono27b/src/mono27b_executor.cu) to correctly repeat KV heads across delta ranks.
+
+3. **High-precision Norm Kernels**: Re-implemented `k_rms_norm_mulw` and `k_l2_norm_g` using parallel reduction and `double` precision accumulation to match GGML's CPU reference precision.
+
+4. **Investigated Layer 0 Divergence**: Discovered that while embedding matches, the first attention norm (`attn_norm-0`) diverges significantly. This suggests a missing scaling factor or an error in how the input to the first layer is prepared.
+
+5. **Fixed a real SwiGLU bug** in [mono27b_executor.cu](file:///mnt/mydata/projects2/mono27b/src/mono27b_executor.cu):
    - `k_elem_swiglu` was applying `silu` to the wrong operand.
    - It now computes `silu(gate) * up`, matching the expected FFN gate behavior.
 
-2. **Restored and preserved live verification**:
+6. **Restored and preserved live verification**:
    - Verification still generates reference data from `llama-debug`.
    - The app itself does not depend on llama.cpp.
 
-3. **Added deeper SSM debug taps**:
+7. **Added deeper SSM debug taps**:
    - `q_conv_predelta`
    - `k_conv_predelta`
    - `final_output`
    - `ssm_out`
    - `post_ffn`
 
-4. **Added replay/debug controls to the app**:
+8. **Added replay/debug controls to the app**:
    - `--replay-trace` forces our run to follow the reference token stream.
    - `--debug-pos N` dumps tensors for any chosen position, not only the prompt token.
 
-5. **Fixed a verification selection bug** in `debug/verify/compare_ref.py`:
+9. **Fixed a verification selection bug** in [compare_ref.py](file:///mnt/mydata/projects2/mono27b/debug/verify/compare_ref.py):
    - The compare script had been hardcoded to `step=0,pos=0`, which could pair the wrong tensor occurrence when replaying generation.
    - It now selects the latest matching tensor dump for the requested phase/label, which makes replay comparisons inspect the actual generation-step tensors.
 
 ## Bugs Found and Fixed
 
-1. **Attention gate fix** — Verified Q projection produces both Q and gate (12288 = Q_DIM*2 outputs). Sigmoid gate applied correctly via `k_elem_sigmoid_mul`.
+1. **SwiGLU operand swap** — `k_elem_swiglu` was applying `silu` to the wrong operand. Fixed to compute `silu(gate) * up`.
 
-2. **Python Q6_K dequant bug** — Fixed loop order (was `for l: for r: append`, should be `for r: for l: append`). The GPU kernel `k_q6k_mt` was always correct; only standalone Python verification was wrong.
+2. **Attention gate fix** — Verified Q projection produces both Q and gate (12288 = Q_DIM*2 outputs). Sigmoid gate applied correctly via `k_elem_sigmoid_mul`.
 
-3. **Other fixes from earlier sessions** — M-RoPE section 0 (22 dims), L2 norm epsilon `fmaxf(sum, eps²)` → `fmaxf(sum_sq, eps*eps)`, Q8_K type safety.
+3. **Python Q6_K dequant bug** — Fixed loop order (was `for l: for r: append`, should be `for r: for l: append`). The GPU kernel `k_q6k_mt` was always correct; only standalone Python verification was wrong.
 
-4. **Conv1d weight ordering** (not a bug) — Confirmed the conv1d kernel was always correct. The reference stores weights as [w_x-3, w_x-2, w_x-1, w_current] per channel. Our kernel uses cs[0..2] = [x[-3], x[-2], x[-1]] and inp = current, with formula `s = cs[0]*w[0] + cs[1]*w[1] + cs[2]*w[2] + inp*w[3]` which matches the reference's `sumf = x[-3]*w[0] + x[-2]*w[1] + x[-1]*w[2] + current*w[3]`.
+4. **GQA Indexing Mismatch** — The engine was using `r_idx % ng` for repeating heads. Corrected to `r_idx / (dr / ng)` to match GGML's `repeat` operation.
 
-5. **Replay-token verification gap** — The earlier step-by-step mismatch on generated tokens was partly misleading because the sampled continuation diverged. I added a replay mode so our engine can be forced onto the exact reference continuation and compared on the same token stream.
+5. **Softplus Logic** — Replaced mathematical approximation with exact logic from `ggml-impl.h`.
+
+6. **RMS Norm Precision** — Initial implementation lacked sufficient precision; switched to `double` accumulation.
+
+7. **Other fixes from earlier sessions** — M-RoPE section 0 (22 dims), L2 norm epsilon `fmaxf(sum, eps²)` → `fmaxf(sum_sq, eps*eps)`, Q8_K type safety.
+
+8. **Conv1d weight ordering** (not a bug) — Confirmed the conv1d kernel was always correct. The reference stores weights as [w_x-3, w_x-2, w_x-1, w_current] per channel. Our kernel uses cs[0..2] = [x[-3], x[-2], x[-1]] and inp = current, with formula `s = cs[0]*w[0] + cs[1]*w[1] + cs[2]*w[2] + inp*w[3]` which matches the reference's `sumf = x[-3]*w[0] + x[-2]*w[1] + x[-1]*w[2] + current*w[3]`.
+
+9. **Replay-token verification gap** — The earlier step-by-step mismatch on generated tokens was partly misleading because the sampled continuation diverged. I added a replay mode so our engine can be forced onto the exact reference continuation and compared on the same token stream.
 
 ## Experiments That Didn't Help
 
@@ -202,6 +222,94 @@ This is the **only way** to achieve bit-exact parity. It requires:
 
 **Effort with no deps (copying code):** still nontrivial
 **Effort with ggml library link:** still faster, but outside the app dependency constraint
+
+## Current Investigation: attn_norm-0 Divergence (2026-05-04 update)
+
+### Symptom
+
+Isolated RMS norm kernel tests pass perfectly (max diff ~3e-7), but the end-to-end trace shows a **massive divergence** starting at the first `attn_norm` output (Layer 0):
+
+| Metric | Reference (llama.cpp) | Our engine | Ratio |
+|--------|----------------------|------------|-------|
+| `attn_norm-0` L2 norm | 69.43 | 37.00 | 0.53× (~half) |
+| `attn_norm-0` max diff | — | 25.64 | — |
+| Embedding (input to norm) | close | close | ~1× |
+
+The norm of our output is approximately **half** of the reference. This is too large to be a floating-point rounding issue and suggests a systematic error.
+
+### Verified: Not the RMS Norm Kernel Itself
+
+The `k_rms_norm_mulw` kernel with `double` precision accumulation produces correct results in isolation. The formula is:
+```
+y[i] = x[i] / sqrt(mean(x²) + eps) * w[i]
+```
+With `eps = 0.01` (from `MONO27B_RMS_EPS`), the epsilon contributes `0.01 / n ≈ 2e-6` to the mean — negligible for n=5120.
+
+### Verified: Weight and Epsilon Values
+
+- `blk.0.attn_norm.weight`: GGUF type F32, dims [5120], all values ~1.0. First 16 values match expected range. **Not a weight loading issue.**
+- `MONO27B_RMS_EPS = 1e-2` matches `f_norm_rms_eps` from the GGUF metadata (loaded by llama.cpp as `LLM_KV_ATTENTION_LAYERNORM_RMS_EPS`).
+
+### Verified: qwen35.cpp Architecture
+
+The reference `llama.cpp` graph for Qwen3.5 (`LLM_ARCH_QWEN35`) is in [qwen35.cpp](file:///mnt/mydata/projects2/mono27b/ref/llama.cpp/src/models/qwen35.cpp). Key observations:
+
+1. **Architecture uses both SSM (gated delta net) AND full attention layers.** Layers are marked `is_recurrent(il)` based on `(i+1) % 4 != 0`. So layers 0,1,2 are SSM; layer 3 is full attention; etc.
+2. **The first operation on every layer is `build_norm(inpL, model.layers[il].attn_norm, ...)`.** This is identical to our approach.
+3. **The graph has `attn_post_norm`** — a second RMS norm after the attention/SSM output, before the FFN. This is `LLM_TENSOR_ATTN_POST_NORM`. Our engine needs to verify it has this second norm.
+
+### Hypothesis: Missing `attn_post_norm` or Wrong Layer Routing
+
+The qwen35.cpp reference shows:
+```cpp
+cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+// ... attention or SSM ...
+cur = ggml_add(ctx0, cur, inpSA);  // residual
+ggml_tensor * ffn_residual = cur;
+ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
+cur = build_layer_ffn(attn_post_norm, il);
+cur = ggml_add(ctx0, cur, ffn_residual);
+```
+
+Our engine must verify:
+- That `attn_post_norm` weights are being loaded and applied correctly
+- That the layer routing (SSM vs full attention) matches `(i+1) % 4 != 0`
+
+### Hypothesis: Embedding Scaling
+
+The L2 norm ratio (37.0 / 69.4 ≈ 0.53) is suspiciously close to 1/√2 ≈ 0.707 or possibly a factor of 2 somewhere. Possible causes:
+
+1. **The embedding output is being halved** — maybe the Q4_K dequant is reading only half the values, or the embedding gather is off by a factor
+2. **A hidden state is being overwritten** — the `h` buffer might be clobbered between embedding and norm
+3. **The wrong buffer is being normed** — `l_rms` might be reading from the wrong pointer (pre-embedding zeros or an intermediate scratch buffer)
+
+### GGUF Tensor Layout for blk.0 (from the model file)
+
+| Tensor | Type | Dims |
+|--------|------|------|
+| `blk.0.attn_norm.weight` | F32 | [5120] |
+| `blk.0.attn_qkv.weight` | Q6_K (14) | [5120, 10240] |
+| `blk.0.attn_gate.weight` | Q5_K (13) | [5120, 6144] |
+| `blk.0.ffn_down.weight` | Q6_K | [n_ff, 5120] |
+| `blk.0.ffn_gate.weight` | Q4_K | [5120, n_ff] |
+| `blk.0.ffn_up.weight` | Q4_K | [5120, n_ff] |
+| `blk.0.post_attention_norm.weight` | F32 | [5120] |
+| `blk.0.ssm_a` | F32 | [48] |
+| `blk.0.ssm_alpha.weight` | — | [5120, 48] |
+| `blk.0.ssm_beta.weight` | — | [5120, 48] |
+| `blk.0.ssm_conv1d.weight` | F16 | [4, 10240] |
+| `blk.0.ssm_dt.bias` | F32 | [48] |
+| `blk.0.ssm_norm.weight` | F32 | [128] |
+| `blk.0.ssm_out.weight` | — | [6144, 5120] |
+
+Note: `ssm_norm.weight` is dims [128] = HEAD_V_DIM. This is the norm applied per-head inside the gated SSM output, NOT a full-hidden-dimension norm. Our code applies it per-rank in a loop of `DT_RANK` iterations — need to verify this matches the reference's `build_norm_gated` which uses `ggml_norm` with `ssm_norm` as weights.
+
+### Next Steps
+
+1. **Add a debug dump of the raw `h` buffer immediately before `l_rms` in the layer loop** to verify the input to the norm is correct (same as embedding output)
+2. **Verify `attn_post_norm` is loaded and applied** — check the weight loader for `post_attention_norm.weight`
+3. **Trace the exact `h` pointer flow** from embedding → first layer norm to ensure no buffer aliasing
+4. **Compare the `build_layer_attn_linear` in [qwen35.cpp](file:///mnt/mydata/projects2/mono27b/ref/llama.cpp/src/models/qwen35.cpp) with our SSM path** to verify the gate computation (`build_norm_gated`) matches our implementation
 
 ## Quick Reference: Key Dimensions
 

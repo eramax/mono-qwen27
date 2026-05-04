@@ -189,16 +189,22 @@ __global__ static void k_elem_swiglu(float * out, const float * up, int n) {
 // a single-thread sequential sum in double precision.
 template <int BLK>
 __global__ static void k_rms_norm_mulw(const float * x, const float * w, float * y, int n, float eps) {
-    if (threadIdx.x != 0) return;
-
+    __shared__ double sh[BLK];
     double sum = 0.0;
-    for (int i = 0; i < n; ++i) {
-        sum += (double)x[i] * (double)x[i];
+    for (int i = threadIdx.x; i < n; i += BLK) {
+        double val = (double)x[i];
+        sum += val * val;
     }
-
-    const float scale = 1.0f / sqrtf((float)(sum / (double)n) + eps);
-    for (int i = 0; i < n; ++i) {
-        y[i] = (float)((double)x[i] * (double)scale * (double)(w ? w[i] : 1.0f));
+    sh[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = BLK / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) { sh[threadIdx.x] += sh[threadIdx.x + s]; }
+        __syncthreads();
+    }
+    double total_sum = sh[0];
+    const double scale = 1.0 / sqrt(total_sum / (double)n + (double)eps);
+    for (int i = threadIdx.x; i < n; i += BLK) {
+        y[i] = (float)((double)x[i] * scale * (double)(w ? w[i] : 1.0f));
     }
 }
 
@@ -492,18 +498,19 @@ __global__ static void k_f32_mv(const float * W, const float * x, float * y, int
 __global__ static void k_l2_norm_g(float * d, int gs, int ng) {
     int g = blockIdx.x;
     if (g >= ng) return;
-    if (threadIdx.x != 0) return;
-
-    float * gd = d + (size_t)g * gs;
-    double sum_sq = 0.0;
-    for (int i = 0; i < gs; ++i) {
-        sum_sq += (double)gd[i] * (double)gd[i];
+    float * x = d + (size_t)g * gs;
+    __shared__ double sh[128];
+    double s = 0.0;
+    for (int i = threadIdx.x; i < gs; i += 128) s += (double)x[i] * (double)x[i];
+    sh[threadIdx.x] = s;
+    __syncthreads();
+    for (int step = 64; step > 0; step >>= 1) {
+        if (threadIdx.x < step) sh[threadIdx.x] += sh[threadIdx.x + step];
+        __syncthreads();
     }
-
-    const float inv = 1.0f / sqrtf(fmaxf((float)sum_sq, MONO27B_RMS_EPS * MONO27B_RMS_EPS));
-    for (int i = 0; i < gs; ++i) {
-        gd[i] *= inv;
-    }
+    double sum_sq = sh[0];
+    const float inv = 1.0f / sqrtf((float)sum_sq + MONO27B_RMS_EPS);
+    for (int i = threadIdx.x; i < gs; i += 128) x[i] *= inv;
 }
 
 // ─── M-RoPE ──────────────────────────────────────────────────────────────────
@@ -1172,7 +1179,7 @@ extern "C" bool mono27b_engine_decode_step(
     out->logits = work_buf + total_work / sizeof(float);
 
     int fa_i = 0, ssm_i = 0, il = 0; cudaError_t sync_err = cudaSuccess;
-    const bool dump_step = debug_fp && (pos == debug_pos);
+    const bool dump_step = debug_fp && (debug_pos == -1 || pos == debug_pos);
 
     mono27b_engine_embed(we, tok, h, error, error_cap);
     if (dump_step) {
@@ -1310,10 +1317,10 @@ extern "C" bool mono27b_engine_decode_step(
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "wqkv_gate", gb, MONO27B_SSM_D_INNER, MONO27B_SSM_D_INNER);
             }
             if (dump_step && il < 3) {
+                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "attn_norm", h2, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "linear_attn_qkv_mixed", sb, MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_CH);
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "z", gb, MONO27B_SSM_D_INNER, MONO27B_SSM_D_INNER);
                 // Dump FULL attn_norm (h2) for verification (20KB)
-                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "attn_norm", h2, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "wqkv", sb, MONO27B_SSM_CONV_CH, 16);
             }
 
