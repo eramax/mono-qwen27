@@ -509,8 +509,9 @@ __global__ static void k_l2_norm_g(float * d, int gs, int ng) {
         __syncthreads();
     }
     double sum_sq = sh[0];
-    const float inv = 1.0f / sqrtf((float)sum_sq + MONO27B_RMS_EPS);
-    for (int i = threadIdx.x; i < gs; i += 128) x[i] *= inv;
+    // Match PyTorch/ggml reference: scale = 1 / sqrt(max(sum_sq, eps*eps))
+    const float scale = rsqrtf(fmaxf((float)sum_sq, MONO27B_RMS_EPS * MONO27B_RMS_EPS));
+    for (int i = threadIdx.x; i < gs; i += 128) x[i] *= scale;
 }
 
 // ─── M-RoPE ──────────────────────────────────────────────────────────────────
@@ -1412,6 +1413,8 @@ extern "C" bool mono27b_engine_decode_step(
                 // Gate: wqkv_gate @ h2 → siLU → mul with rms_norm(ssm_out)
                 MV(L.wqkv_gate, h2, fb); TRACE("re-g");
                 k_elem_silu<<<(MONO27B_SSM_D_INNER + 255) / 256, 256>>>(fb, MONO27B_SSM_D_INNER); TRACE("g_silu");
+                // Use kb (17408 floats) as intermediate for gated norm output;
+                // h2 is only 5120 floats but the gated norm output is 6144 floats.
                 for (int r = 0; r < MONO27B_SSM_DT_RANK; ++r) {
                     const float * w_norm = nullptr;
                     if (L.ssm_norm.ptr) {
@@ -1420,18 +1423,18 @@ extern "C" bool mono27b_engine_decode_step(
                     k_rms_norm_mulw<256><<<1, 256>>>(
                         gb + (size_t)r * MONO27B_SSM_HEAD_V,
                         w_norm,
-                        h2 + (size_t)r * MONO27B_SSM_HEAD_V,
+                        kb + (size_t)r * MONO27B_SSM_HEAD_V,
                         MONO27B_SSM_HEAD_V,
                         MONO27B_RMS_EPS);
                 }
                 TRACE("grms");
-                k_elem_mul<<<(MONO27B_SSM_D_INNER + 255) / 256, 256>>>(h2, fb, MONO27B_SSM_D_INNER); TRACE("gmul2");
+                k_elem_mul<<<(MONO27B_SSM_D_INNER + 255) / 256, 256>>>(kb, fb, MONO27B_SSM_D_INNER); TRACE("gmul2");
                 if (dump_step && il < 4) {
-                    debug_dump_vec(debug_fp, "ssm", il, pos, tok, "final_output", h2, MONO27B_SSM_D_INNER, MONO27B_SSM_D_INNER);
+                    debug_dump_vec(debug_fp, "ssm", il, pos, tok, "final_output", kb, MONO27B_SSM_D_INNER, MONO27B_SSM_D_INNER);
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "q_conv_predelta", qr, MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K);
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "k_conv_predelta", kr, MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K);
                 }
-                MV(L.ssm_out, h2, sb); TRACE("ssmo");
+                MV(L.ssm_out, kb, sb); TRACE("ssmo");
                 if (dump_step && il < 4) {
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "gate", fb, MONO27B_SSM_D_INNER);
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "rms_gated", h2, MONO27B_SSM_D_INNER, MONO27B_SSM_D_INNER);

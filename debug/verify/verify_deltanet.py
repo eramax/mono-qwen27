@@ -26,7 +26,7 @@ def delta_net_ref(q, k, v, gate, beta, state, hk, ng, dr, hv):
     output = []
     
     for r_idx in range(dr):
-        g_idx = r_idx % ng
+        g_idx = r_idx // (dr // ng)
         
         # gate for this rank
         g_raw = gate[r_idx]

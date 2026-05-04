@@ -1,53 +1,43 @@
 Goal
-- Fix make test in /mnt/mydata/projects2/mono27b so the model generates valid coherent text instead of multilingual garbage.
+- Fix mono27b CUDA kernels and achieve bit-exact parity with llama.cpp for Qwen3.5-27B inference without runtime dependency on llama.cpp.
 Constraints & Preferences
-- Standalone app, no external dependencies (no ggml as dependency)
-- Can borrow functions/code from ggml (exists at /mnt/mydata/projects2/specfusion/deps/ggml/)
-- Mega kernel approach preferred (fused operations per layer)
-- Reference project: /mnt/mydata/projects2/specfusion
+- Do not link or depend on llama.cpp at runtime; copy reference logic/functions directly into mono27b.
+- Add standalone tests to compare kernel outputs against reference formulas.
+- Preserve exact file paths and identifiers from the codebase.
 Progress
 Done
-- GGUF reader: supports all quant types (F32,F16,Q4_K,Q5_K,Q6_K,Q8_0,IQ4_XS=type23) with correct type_size/block_size and tensor dims
-- Weight loading: WeightView struct with type-aware dispatch, no memory leaks
-- Memory management: state allocated before weights, unified work buffer per step
-- CUDA kernels: Q4_K matvec (works), Q5_K matvec (written, untested correctness), Q6_K matvec (strided layout fixed), Q8_0 matvec, IQ4_XS matvec, RMS norm, elementwise ops, M-RoPE
-- Attention kernel: KV cache layout fixed from [head][pos][dim] to [pos][head][dim], overflow-safe softmax
-- Chat template: Qwen3 <|im_start|>user/assistant wrapping added
-- Tensor name lookups: attn_output.weight fallback for attn_o.weight, attn_qkv.weight/attn_gate.weight for SSM, ssm_dt.bias/ssm_a for SSM small weights
-- Zero-layer test proves embedding + output_norm + LM head work correctly (produces "ingles")
-- Attention identity test proves Q path works, V path corrupts output (V projection via Q6_K matvec suspect)
-- DeltaNet state layout bug just fixed: col + i*hv → col*hk + i (transposed storage)
+- Read parity plan: /mnt/mydata/projects2/mono27b/docs/superpowers/plans/2026-05-04-mono27b-llama-parity.md
+- Audited mono27b_executor.cu, qwen35.cpp, gated_delta_net.cu, ssm-conv.cu, norm.cu, verify_deltanet.py
+- Fixed L2 norm formula bug: k_l2_norm_g used 1/sqrt(sum_sq + eps); corrected to rsqrtf(fmaxf(sum_sq, eps*eps)) to match ggml reference (debug/verify/test_kernels.cu verifies)
+- Fixed SSM gated norm buffer overflow: h2 is 5120 floats; gated norm writes 6144 floats. Changed intermediate buffer to kb (17408 floats) in the SSM path
+- Fixed Python GQA indexing bug: verify_deltanet.py used r_idx % ng; corrected to r_idx // (dr // ng)
+- Built project successfully (cmake --build build) and ran new kernel tests (L2 norm PASS 1.49e-08, RMS norm PASS 1.19e-07)
+- Verified model GGUF has n_kv = 0 (no metadata); standard Qwen epsilon is 1e-6f
 In Progress
-- Fixing SSM Conv1D and DeltaNet kernels — remaining sources of garbage
-- DeltaNet state layout fix not yet tested
+- Root-causing remaining generation-step divergence in conv_output_silu (diff ~8.176) despite conv1d math appearing correct
 Blocked
-- SSM pipeline broken: with Conv1D+DeltaNet enabled → NaN; without them → pass-through produces garbage
-- Output quality limited by SSM kernel correctness
+- Cannot run live llama-debug reference to compare exact generation-step intermediates without building/running llama.cpp
 Key Decisions
-- IQ4_XS (type 23) needed because attention layers 15,51,59,63 use it for attn_q/attn_k weights — added block struct (136 bytes), kvalues_iq4nl table, and matvec kernel
-- block_size function renamed to quant_block_size to avoid collision with CUDA header macro
-- DeltaNet g_raw clamped to -80,80 to prevent exp overflow (NaN source)
-- Attention softmax clamped (maxv ≤ 64, exp arg ≥ -64) for numerical stability
-- SSM state allocated eagerly (2.3GB) rather than lazily — survives memory fragmentation
+- Keep MONO27B_RMS_EPS = 1e-6f because Qwen3.5 standard uses 1e-6 and the model has no GGUF metadata override
+- Reuse existing scratch buffer kb for the 6144-element gated-norm intermediate rather than growing the work buffer layout
+- Copy reference formulas (not full ggml tensor system) into standalone C++ tests for validation
 Next Steps
-1. Test the just-fixed DeltaNet state layout (col*hk + i indexing)
-2. Verify if Q6_K and Q5_K matvec kernels produce correct output (compare with specfusion reference for a single layer)
-3. If SSM still broken, study /mnt/mydata/projects2/specfusion/deps/ggml/src/ggml-cuda/ssm-conv.cu and gated_delta_net.cu for reference implementation
-4. Compare full pipeline token-by-token with specfusion to identify exact divergence point
+- Run end-to-end verification (make verify) to measure impact of L2-norm and buffer-overflow fixes on generation parity
+- If divergence persists, instrument k_ssm_conv1d_u and k_deltanet with per-element dumps to isolate the first diverging channel/rank
+- Consider porting gated_delta_net_cuda warp-accumulation order from llama.cpp if tiny rounding differences compound across 64 recurrent layers
+- Add a standalone C++/CUDA test for k_ssm_conv1d_u against a CPU reference that mimics ssm_conv_f32
 Critical Context
-- Model: Qwen3.6-27B-UD-Q4_K_XL (hybrid: 16 attn + 48 SSM layers, hidden=5120, vocab=248320)
-- Model file: /mnt/mydata/projects2/specfusion/model/Qwen3.6-27B-UD-Q4_K_XL.gguf (17GB)
-- Zero-layer output "ingles" proves embedding, output_norm, and LM head (Q6_K) are all correct
-- With attention → garbage; without attention → English-like ("becausebecausealan Karr Coimbra")
-- SSM layer types mixed: wqkv=Q6_K, wqkv_gate=Q5_K, ssm_out=Q8_0, ffn_down=Q6_K(SSM) or Q4_K(attn)
-- Output norm weight: output_norm.weight (F32)
-- LM head: output.weight (Q6_K, 248320×5120)
+- conv_output_silu divergence (8.176) appears on generation step, not prompt step, implying stateful amplification
+- h2 buffer aliasing with qb during gated norm was mathematically self-consistent but dangerous; now fixed
+- Reference l2_norm_f32 uses rsqrtf(fmaxf(tmp, eps*eps)) matching PyTorch F.normalize; our old kernel used 1/sqrt(sum_sq + eps) which is wrong for small-norm vectors
+- k_deltanet state indexing and gate/beta formulas match reference; GQA indexing fixed earlier to r_idx / (dr/ng)
+- Model GGUF at /home/emo/Downloads/test_models/models/Qwen3.6-27B-UD-Q4_K_XL.gguf has zero KV metadata entries
 Relevant Files
-- src/mono27b_executor.cu — all CUDA kernels (matvec, attention, SSM, elementwise) and engine API
-- src/mono27b_chat.cpp — main CLI with chat template, GGUF loading, decode loop
-- include/mono27b_config.h — model constants, WeightView, executor state structs
-- include/mono27b_gguf.h — GGUF reader types and tensor info (added IQ4_XS enum)
-- src/mono27b_gguf.cpp — GGUF reader with quant type size/block functions
-- include/mono27b_tokenizer.h — tokenizer interface
-- /mnt/mydata/projects2/specfusion/deps/ggml/src/ggml-cuda/ssm-conv.cu — reference Conv1D kernel
-- /mnt/mydata/projects2/specfusion/deps/ggml/src/ggml-cuda/gated_delta_net.cu — reference DeltaNet kernel
+- /mnt/mydata/projects2/mono27b/src/mono27b_executor.cu: main inference kernels; fixed k_l2_norm_g and SSM gated-norm buffer usage
+- /mnt/mydata/projects2/mono27b/include/mono27b_config.h: defines MONO27B_RMS_EPS = 1e-6f
+- /mnt/mydata/projects2/mono27b/debug/verify/test_kernels.cu: new standalone CUDA test comparing L2/RMS norm against reference formulas
+- /mnt/mydata/projects2/mono27b/debug/verify/verify_deltanet.py: updated GQA indexing fix
+- /mnt/mydata/projects2/mono27b/ref/llama.cpp/ggml/src/ggml-cuda/norm.cu: reference L2 norm (l2_norm_f32) and RMS norm (rms_norm_f32) implementations
+- /mnt/mydata/projects2/mono27b/ref/llama.cpp/ggml/src/ggml-cuda/ssm-conv.cu: reference ssm_conv_f32 kernel (no F16 path)
+- /mnt/mydata/projects2/mono27b/ref/llama.cpp/src/models/qwen35.cpp: reference graph construction for Qwen3.5
+- /mnt/mydata/projects2/mono27b/docs/superpowers/plans/2026-05-04-mono27b-llama-parity.md: parity tracking plan with replay diff table
