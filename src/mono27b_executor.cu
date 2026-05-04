@@ -505,22 +505,45 @@ __global__ static void k_l2_norm_g(float * d, int gs, int ng) {
 }
 
 // ─── M-RoPE ──────────────────────────────────────────────────────────────────
-// Qwen3.5 uses multi-section RoPE with sections [t, h, w, _] = [11, 11, 10, 0].
-// For text-only inference, only section 0 (text, 11 pairs = 22 dims) is rotated
-// with the token position; sections 1 and 2 use position 0 (no rotation).
-// total n_rot is the sum of all sections: 11+11+10+0 = 32 pairs = 64 dims.
+// Qwen3.5 uses multi-section RoPE with 4 position streams.
+// For text tokens, llama.cpp expands a 1D token position into:
+//   pos[0] = token_pos
+//   pos[1] = token_pos
+//   pos[2] = token_pos
+//   pos[3] = 0
+// and applies RoPE across all 64 rotary dims using sections [11, 11, 10, 0]
+// in pair units.
 
-__global__ static void k_mrope(float * buf, int n_heads, int head_dim, int pos, int n_rot_section0) {
+__global__ static void k_mrope(
+    float * buf, int n_heads, int head_dim,
+    int pos_t, int pos_h, int pos_w, int pos_x,
+    int sec0, int sec1, int sec2, int sec3,
+    int n_rot_dims)
+{
     int h = blockIdx.x;
     if (h >= n_heads) return;
     float * hd = buf + (size_t)h * head_dim;
-    for (int d = threadIdx.x * 2; d < n_rot_section0; d += blockDim.x * 2) {
-        if (d + 1 >= head_dim) break;
-        float theta = powf(MONO27B_TARGET_ROPE_THETA, -2.0f * d / (float)n_rot_section0);
-        float c = cosf(theta * pos), s = sinf(theta * pos);
-        float v0 = hd[d], v1 = hd[d + 1];
-        hd[d] = v0 * c - v1 * s;
-        hd[d + 1] = v0 * s + v1 * c;
+
+    const int sec01 = sec0 + sec1;
+    const int sec012 = sec01 + sec2;
+    const int n_rot_pairs = n_rot_dims / 2;
+    const int half = n_rot_pairs;
+
+    for (int p = threadIdx.x; p < n_rot_pairs; p += blockDim.x) {
+        int d0 = p;
+        int d1 = p + half;
+        if (d1 >= head_dim) break;
+
+        int pos = pos_x;
+        if (p < sec0) pos = pos_t;
+        else if (p < sec01) pos = pos_h;
+        else if (p < sec012) pos = pos_w;
+
+        float theta = powf(MONO27B_TARGET_ROPE_THETA, -2.0f * (float)p / (float)n_rot_dims);
+        float c = cosf(theta * (float)pos), s = sinf(theta * (float)pos);
+        float v0 = hd[d0], v1 = hd[d1];
+        hd[d0] = v0 * c - v1 * s;
+        hd[d1] = v0 * s + v1 * c;
     }
 }
 
@@ -1196,7 +1219,7 @@ extern "C" bool mono27b_engine_decode_step(
             MV(L.wv, h2, kb + MONO27B_TARGET_KV_DIM); TRACE("wv");
             // Gate is embedded in Q projection output (second half of 12288)
             if (debug_fp && pos == 0 && il < 4) {
-                debug_dump_vec(debug_fp, "attn", il, pos, tok, "q_proj", qb, MONO27B_TARGET_Q_DIM);
+                debug_dump_vec(debug_fp, "attn", il, pos, tok, "q_proj", qb, MONO27B_TARGET_Q_DIM, 64);
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "gate_src", qb + MONO27B_TARGET_Q_DIM, MONO27B_TARGET_Q_DIM);
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "v_proj", kb + MONO27B_TARGET_KV_DIM, MONO27B_TARGET_KV_DIM);
             }
@@ -1211,11 +1234,28 @@ extern "C" bool mono27b_engine_decode_step(
                     k_rms_norm_mulw<256><<<1, 256>>>(kb + hh * MONO27B_TARGET_HEAD_DIM,
                         WV(L.k_norm), kb + hh * MONO27B_TARGET_HEAD_DIM,
                         MONO27B_TARGET_HEAD_DIM, MONO27B_RMS_EPS);
+            if (debug_fp && pos == 0 && il < 4) {
+                debug_dump_vec(debug_fp, "attn", il, pos, tok, "q_norm", qb, MONO27B_TARGET_Q_DIM, 64);
+                debug_dump_vec(debug_fp, "attn", il, pos, tok, "k_norm", kb, MONO27B_TARGET_KV_DIM, 64);
+            }
             TRACE("qkn");
 
-            // M-RoPE: only rotate section 0 (text, 11 pairs = 22 dims) with token position
-            k_mrope<<<MONO27B_TARGET_N_HEAD, 64>>>(qb, MONO27B_TARGET_N_HEAD, MONO27B_TARGET_HEAD_DIM, pos, MONO27B_N_ROT_DIMS_S0); TRACE("mq");
-            k_mrope<<<MONO27B_TARGET_N_KV_HEAD, 64>>>(kb, MONO27B_TARGET_N_KV_HEAD, MONO27B_TARGET_HEAD_DIM, pos, MONO27B_N_ROT_DIMS_S0); TRACE("mk");
+            // M-RoPE: text tokens use the same token position for the first
+            // three position streams and 0 for the 4th stream.
+            k_mrope<<<MONO27B_TARGET_N_HEAD, 64>>>(
+                qb, MONO27B_TARGET_N_HEAD, MONO27B_TARGET_HEAD_DIM,
+                pos, pos, pos, 0,
+                11, 11, 10, 0,
+                MONO27B_N_ROT_DIMS); TRACE("mq");
+            k_mrope<<<MONO27B_TARGET_N_KV_HEAD, 64>>>(
+                kb, MONO27B_TARGET_N_KV_HEAD, MONO27B_TARGET_HEAD_DIM,
+                pos, pos, pos, 0,
+                11, 11, 10, 0,
+                MONO27B_N_ROT_DIMS); TRACE("mk");
+            if (debug_fp && pos == 0 && il < 4) {
+                debug_dump_vec(debug_fp, "attn", il, pos, tok, "q_rope", qb, MONO27B_TARGET_Q_DIM, 64);
+                debug_dump_vec(debug_fp, "attn", il, pos, tok, "k_rope", kb, MONO27B_TARGET_KV_DIM, 64);
+            }
 
             for (int hh = 0; hh < MONO27B_TARGET_N_KV_HEAD; ++hh) {
                 size_t off = ((size_t)pos * MONO27B_TARGET_N_KV_HEAD + hh) * MONO27B_TARGET_HEAD_DIM;
@@ -1537,11 +1577,23 @@ extern "C" bool mono27b_engine_embed(
         return true;
     }
     if (we->tok_embd.ggml_type == MONO27B_GGML_TYPE_Q4_K) {
+        k_q4k_embed<<<1, 256>>>(
+            (const BlockQ4K *)we->tok_embd.ptr,
+            token_id,
+            hidden,
+            MONO27B_TARGET_HIDDEN,
+            (int)we->tok_embd.row_blocks);
+        cudaError_t e = cudaDeviceSynchronize();
+        if (e == cudaSuccess) {
+            return true;
+        }
+        // Keep the old host-side path as a fallback so tokenization still works
+        // if the device launch fails on a particular runtime.
         if (q4k_embed_host((const BlockQ4K *)we->tok_embd.ptr, token_id, hidden,
                            MONO27B_TARGET_HIDDEN, (int)we->tok_embd.row_blocks)) {
             return true;
         }
-        std::snprintf(error, error_cap, "q4k embed failed");
+        std::snprintf(error, error_cap, "q4k embed failed: %s", cudaGetErrorString(e));
         return false;
     }
     std::snprintf(error, error_cap, "unsupported token embedding type %u", we->tok_embd.ggml_type);

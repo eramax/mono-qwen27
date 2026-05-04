@@ -96,13 +96,14 @@ results['q6k'] = {
 }
 
 # ================================================================
-# 5. Layer-by-layer trace comparison
+# 5. M-RoPE text rotation
 # ================================================================
-# The checked-in reference trace comes from a different debug path than the
-# completion probe, so it is not a valid source of absolute parity numbers for
-# every tensor. Keep the summary focused on the tensors that are directly
-# comparable and on the final logits.
-results["layer_comp"] = None
+out, err, rc = run_py('verify_mrope.py')
+worst = extract_float(out, r'worst_diff=([\d.]+(?:[eE][+-]?\d+)?)')
+results['mrope'] = {
+    'status': 'PASS' if rc == 0 else 'FAIL',
+    'detail': f'worst_diff={worst:.2e}' if worst is not None else 'N/A',
+}
 
 # ================================================================
 # 6. E2E logit comparison
@@ -144,7 +145,8 @@ print("  " + "-" * 72)
 for name, r in [('Q6_K format sanity', results['q6k_sanity']),
                 ('RMS norm (5120 elem)', results['rms_norm']),
                 ('Q5_K matvec (wqkv_gate)', results['q5k']),
-                ('Q6_K matvec (wqkv)', results['q6k'])]:
+                ('Q6_K matvec (wqkv)', results['q6k']),
+                ('M-RoPE text rotation', results['mrope'])]:
     print(f"  {name:<35} {r['status']:<10} {r['detail']:<30}")
 
 print()
