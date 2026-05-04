@@ -16,6 +16,7 @@
 - Prompt tokenization matches on the raw-completion probe (`"give"` → token `44883`).
 - Q6_K LM-head math matches an internal CPU re-evaluation on the raw-completion probe.
 - The end-to-end logits still diverge from `llama.cpp`, so the remaining mismatch is upstream of the head.
+- The first traced divergence on the current probe is the gated attention block at layer 3, before the LM head.
 - The current trace set is good enough to keep narrowing; it is not yet a 100% match.
 
 ## Run Contract
@@ -62,7 +63,7 @@ rtk ./ref/llama.cpp/build/bin/llama-completion \
 | Tokenization | match | match | Raw prompt `"give"` maps to token `44883` |
 | Prompt path | match | match | Raw-completion probe is aligned |
 | Embed | match | match | Hidden-state traces line up on the probe |
-| Attention / SSM blocks | unresolved vs reference | unresolved vs reference | Needs a fresh layer-by-layer trace now that the LM head is cleared |
+| Attention / SSM blocks | unresolved vs reference | unresolved vs reference | First traced mismatch is layer 3 gated attention on the current `give` probe |
 | Final `output_norm` | unresolved vs reference | unresolved vs reference | Re-localize the first mismatch before touching the head again |
 | LM head (`output.weight`) | match | match | CPU probe matches GPU within `1.3e-5` on rows 0-7 |
 | Sampler | unresolved | match | Not the leading suspect until LM head is proven |
@@ -89,6 +90,7 @@ rtk ./ref/llama.cpp/build/bin/llama-completion \
     - row 1: gpu `3.55735159`, cpu `3.55735612`, delta `4.529953e-06`
     - row 2: gpu `5.28695726`, cpu `5.28696012`, delta `2.86102295e-06`
     - row 3: gpu `4.44023085`, cpu `4.44023085`, delta `0`
+- Current debug trace on the same probe now includes layer 3, and the first divergence is in the gated attention path (`attn_raw` / `attn_out`) rather than the LM head.
 
 ## Open Questions
 

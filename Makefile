@@ -1,4 +1,4 @@
-.PHONY: build test clean
+.PHONY: build test quick-test large-test clean
 
 MODEL_PATH ?= /mnt/mydata/projects2/specfusion/model/Qwen3.6-27B-UD-Q4_K_XL.gguf
 PROMPT ?= "give me 2 py example"
