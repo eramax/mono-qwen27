@@ -70,9 +70,33 @@ __device__ float warp_reduce_max(float v) {
 
 // ─── Helper: get_scale_min_k4 ───────────────────────────────────────────────
 
-static __device__ void get_scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
+static __host__ __device__ void get_scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
     if (j < 4) { d = q[j] & 63; m = q[j + 4] & 63; }
     else { d = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
+}
+
+static __host__ __device__ inline float ggml_fp16_to_fp32(uint16_t h) {
+    union U32F { uint32_t u; float f; };
+    const uint32_t w = (uint32_t) h << 16;
+    const uint32_t sign = w & UINT32_C(0x80000000);
+    const uint32_t two_w = w + w;
+
+    const uint32_t exp_offset = UINT32_C(0xE0) << 23;
+    const float exp_scale = 0x1.0p-112f;
+    U32F normalized_bits{(two_w >> 4) + exp_offset};
+    U32F normalized_value{0};
+    normalized_value.f = normalized_bits.f * exp_scale;
+
+    const uint32_t magic_mask = UINT32_C(126) << 23;
+    const float magic_bias = 0.5f;
+    U32F denormalized_bits{(two_w >> 17) | magic_mask};
+    U32F denormalized_value{0};
+    denormalized_value.f = denormalized_bits.f - magic_bias;
+
+    const uint32_t denormalized_cutoff = UINT32_C(1) << 27;
+    U32F result_bits{sign |
+        (two_w < denormalized_cutoff ? denormalized_value.u : normalized_value.u)};
+    return result_bits.f;
 }
 
 // ─── Elementwise kernels ─────────────────────────────────────────────────────
@@ -170,7 +194,8 @@ __global__ static void k_q4k_mv(const BlockQ4K * W, const float * x, float * y, 
     const BlockQ4K * rp = W + (size_t)row * rb;
     for (int b = threadIdx.x; b < rb; b += BLK) {
         const BlockQ4K & qb = rp[b];
-        float d = __half2float(qb.d), mn = __half2float(qb.dmin);
+        float d = ggml_fp16_to_fp32(__half_as_ushort(qb.d));
+        float mn = ggml_fp16_to_fp32(__half_as_ushort(qb.dmin));
         for (int g = 0; g < 4; ++g) {
             uint8_t s0, m0, s1, m1;
             get_scale_min_k4(g * 2, qb.scales, s0, m0);
@@ -482,6 +507,48 @@ __global__ static void k_q4k_embed(const BlockQ4K * T, int tok, float * out, int
     }
 }
 
+static bool q4k_embed_host(const BlockQ4K * rows_dev, int tok, float * hidden,
+                           int row_elems, int row_blocks) {
+    if (row_blocks <= 0 || row_elems <= 0) return false;
+
+    std::vector<BlockQ4K> rows((size_t)row_blocks);
+    cudaError_t e = cudaMemcpy(
+        rows.data(),
+        rows_dev + (size_t)tok * (size_t)row_blocks,
+        (size_t)row_blocks * sizeof(BlockQ4K),
+        cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) return false;
+
+    std::vector<float> tmp((size_t)row_elems);
+    float * y = tmp.data();
+    for (int i = 0; i < row_blocks; ++i) {
+        const BlockQ4K & qb = rows[(size_t)i];
+        const uint8_t * q = qb.qs;
+        uint16_t d_bits = 0, min_bits = 0;
+        std::memcpy(&d_bits, &qb.d, sizeof(d_bits));
+        std::memcpy(&min_bits, &qb.dmin, sizeof(min_bits));
+        const float d = ggml_fp16_to_fp32(d_bits);
+        const float min = ggml_fp16_to_fp32(min_bits);
+        int is = 0;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc, m;
+            get_scale_min_k4(is + 0, qb.scales, sc, m);
+            const float d1 = d * sc;
+            const float m1 = min * m;
+            get_scale_min_k4(is + 1, qb.scales, sc, m);
+            const float d2 = d * sc;
+            const float m2 = min * m;
+            for (int l = 0; l < 32; ++l) *y++ = d1 * (q[l] & 0x0F) - m1;
+            for (int l = 0; l < 32; ++l) *y++ = d2 * (q[l] >> 4) - m2;
+            q += 32;
+            is += 2;
+        }
+    }
+
+    e = cudaMemcpy(hidden, tmp.data(), (size_t)row_elems * sizeof(float), cudaMemcpyHostToDevice);
+    return e == cudaSuccess;
+}
+
 // ─── Single-token attention (1 thread, sequential) ──────────────────────────
 
 // Attention: proper softmax with KV cache in [pos][head][dim] layout
@@ -699,12 +766,18 @@ extern "C" bool mono27b_engine_load_weights(
             lw2("attn_v.weight", &l.attn.wv, "wv");
             if (!lw2("attn_o.weight", &l.attn.wo, "wo"))
                 lw2("attn_output.weight", &l.attn.wo, "wo");
+            lw2("attn_gate.weight", &l.attn.gate, "ag");
             lw2("attn_q_norm.weight", &l.attn.q_norm, "qn");
             lw2("attn_k_norm.weight", &l.attn.k_norm, "kn");
             lw2("post_attention_norm.weight", &l.attn.post_norm, "pan");
             lw2("ffn_gate.weight", &l.attn.ffn_gate, "fg");
             lw2("ffn_up.weight", &l.attn.ffn_up, "fu");
             lw2("ffn_down.weight", &l.attn.ffn_down, "fd");
+            if (il == 3) {
+                fprintf(stderr, "DBG: attn l3 q_rows=%u gate=%p k_rows=%u v_rows=%u wo_rows=%u\n",
+                        l.attn.wq.row_count, l.attn.gate.ptr,
+                        l.attn.wk.row_count, l.attn.wv.row_count, l.attn.wo.row_count);
+            }
         } else {
             lw2("attn_norm.weight", &l.ssm.attn_norm, "sn");
             // Try multiple naming conventions for SSM qkv weight
@@ -768,7 +841,7 @@ extern "C" void mono27b_engine_free_weights(Mono27BExecutorWeights * w) {
     for (int il = 0; il < MONO27B_TARGET_LAYERS; ++il) {
         if (w->layers[il].is_attention) {
             auto & a = w->layers[il].attn;
-            ff(a.attn_norm); ff(a.wq); ff(a.wk); ff(a.wv); ff(a.wo);
+            ff(a.attn_norm); ff(a.wq); ff(a.wk); ff(a.wv); ff(a.wo); ff(a.gate);
             ff(a.q_norm); ff(a.k_norm); ff(a.post_norm);
             ff(a.ffn_gate); ff(a.ffn_up); ff(a.ffn_down);
         } else {
@@ -1003,6 +1076,9 @@ extern "C" bool mono27b_engine_decode_step(
             MV(L.wq, h2, qb); TRACE("wq");
             MV(L.wk, h2, kb); TRACE("wk");
             MV(L.wv, h2, kb + MONO27B_TARGET_KV_DIM); TRACE("wv");
+            if (L.gate.ptr && L.wq.row_count <= MONO27B_TARGET_Q_DIM) {
+                MV(L.gate, h2, qb + MONO27B_TARGET_Q_DIM); TRACE("ag");
+            }
             if (debug_fp && pos == 0 && il < 4) {
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "q_proj", qb, MONO27B_TARGET_Q_DIM);
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "gate_src", qb + MONO27B_TARGET_Q_DIM, MONO27B_TARGET_Q_DIM);
@@ -1324,10 +1400,16 @@ extern "C" bool mono27b_engine_embed(
         cudaMemset(hidden, 0, MONO27B_TARGET_HIDDEN * sizeof(float));
         return true;
     }
-    int rb = we->tok_embd.row_blocks;
-    k_q4k_embed<<<1, 256>>>((const BlockQ4K *)we->tok_embd.ptr, token_id, hidden,
-                             MONO27B_TARGET_HIDDEN, rb);
-    return true;
+    if (we->tok_embd.ggml_type == MONO27B_GGML_TYPE_Q4_K) {
+        if (q4k_embed_host((const BlockQ4K *)we->tok_embd.ptr, token_id, hidden,
+                           MONO27B_TARGET_HIDDEN, (int)we->tok_embd.row_blocks)) {
+            return true;
+        }
+        std::snprintf(error, error_cap, "q4k embed failed");
+        return false;
+    }
+    std::snprintf(error, error_cap, "unsupported token embedding type %u", we->tok_embd.ggml_type);
+    return false;
 }
 
 // ─── Backward-compat stubs ───────────────────────────────────────────────────

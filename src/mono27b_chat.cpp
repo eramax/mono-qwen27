@@ -350,6 +350,9 @@ int main(int argc, char ** argv) {
     }
     std::vector<int32_t> prompt_ids;
     prompt_ids = tokenizer.encode(user_prompt);
+    if (gguf.metadata.add_bos_token) {
+        prompt_ids.insert(prompt_ids.begin(), static_cast<int32_t>(tokenizer.bos_id()));
+    }
     std::fprintf(stderr, "[prompt] tokens=%zu ids=", prompt_ids.size());
     for (size_t i = 0; i < prompt_ids.size(); ++i) fprintf(stderr, "%d ", prompt_ids[i]);
     fprintf(stderr, "\n");

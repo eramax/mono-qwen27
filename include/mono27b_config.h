@@ -50,6 +50,7 @@ struct Mono27BAttentionLayerWeights {
     WeightView wk;
     WeightView wv;
     WeightView wo;
+    WeightView gate;
     WeightView q_norm;
     WeightView k_norm;
     WeightView post_norm;
