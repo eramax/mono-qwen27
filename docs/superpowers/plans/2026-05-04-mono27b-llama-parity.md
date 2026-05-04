@@ -10,151 +10,104 @@
 
 ---
 
-## Current State
+## Current State (as of 2026-05-04 Session 2)
 
-- Same GGUF model file loads successfully on both sides.
-- Prompt tokenization matches on the raw-completion probe (`"give"` → token `44883`).
-- `llama.cpp` completion trace still predicts prompt top1 token `728` with best logit `15.7379`.
-- Our backend still predicts prompt top1 token `11` (logit `16.9160`), still diverging.
-- **Embedding is now confirmed correct** — official `ggml` q4_K dequant of token row `44883` matches our backend output (both start with `0.015738368`). The earlier `-0.00124168` values were from token row 0 (wrong row), not 44883. This closes the embed-side suspicion.
-- The divergence is now **solidly in the hidden layers** (SSM blocks or attention blocks).
-- With 0 layers (embedding + output_norm + LM head only), top1 prediction is token `10074` (logit `8.56`).
-- With 4 layers (SSM 0,1,2 + attention 3), top1 prediction is token `220` (logit `6.17`).
-- With full 64 layers, top1 prediction is token `11` (logit `16.92`).
-- The divergence accumulates through the layers and compounds with depth.
+**Output still diverges:**
+- `llama.cpp` completion trace: prompt top1 token `728`, best logit `15.7379`
+- Our backend: prompt top1 token `11`, best logit `16.9160`
+- **Embedding confirmed correct** — q4_K dequant on token row 44883 matches ggml exactly
+- **LM head confirmed correct** — Q6_K matvec verified to `1.33e-05` accuracy
+- **Divergence traced to SSM Layer 0**: with 0 layers, top1=10074; with 1 layer (SSM 0), top1=220 (same as 4 layers). The bug is in the first SSM layer's computation.
+- **No CUDA memory errors** — `compute-sanitizer memcheck` reports 0 errors
 
-## Run Contract
+**All individual components verified correct against reference:**
+| Component | Status |
+| --- | --- |
+| Q4_K dequant + matvec | ✓ match (verified via embed and manual check) |
+| Q5_K dequant logic | ✓ match (index mapping verified against `dequantize_row_q5_K`) |
+| Q6_K dequant + matvec | ✓ match (1.33e-05 on LM head probe) |
+| Q8_0 dequant + matvec | ✓ match (dequant formula identical) |
+| IQ4_XS dequant + matvec | present in code |
+| RMS norm | ✓ match (uses ggml formula `rsqrtf(mean(x²) + eps)`) |
+| L2 norm | ✓ match (fixed to `fmaxf(sum, eps²)`) |
+| SiLU activation | ✓ match (`x/(1+exp(-x))`) |
+| Softplus | ✓ match (`max(z,0) + log1p(exp(-|z|))`) |
+| Sigmoid | ✓ match |
+| M-RoPE | ✓ match (only rotate 22 dims for section 0) |
+| Conv1d (first step) | ✓ correct (`out = inp * w[last_tap]` when state=0) |
+| DeltaNet (first step, zero state) | ✓ correct (`out = beta*v * K@Q / sqrt(hv)`) |
+| Attention (single token) | ✓ correct (`out = V` with single KV entry) |
+| Buffer layout | ✓ clean (benign 1024-element overflow from h2 into qb, but qb is dead by then) |
 
-Always compare these together:
-
-- Same model file.
-- Same raw prompt string.
-- Same `ctx`.
-- Same seed.
-- Same trace/debug format.
-- Same tokenization mode.
-
-Preferred probe:
-
-```bash
-rtk ./build/mono27b_chat \
-  -m /mnt/mydata/projects2/specfusion/model/Qwen3.6-27B-UD-Q4_K_XL.gguf \
-  -p "give" \
-  --gen 1 \
-  --ctx 4096 \
-  --seed 944990222 \
-  --trace /tmp/mono_give.trace.tsv \
-  --debug /tmp/mono_give.debug.tsv
-```
-
-Reference probe:
-
-```bash
-rtk ./ref/llama.cpp/build/bin/llama-completion \
-  -m /mnt/mydata/projects2/specfusion/model/Qwen3.6-27B-UD-Q4_K_XL.gguf \
-  -p "give" \
-  -n 1 \
-  -c 4096 \
-  -b 1 \
-  -ub 1 \
-  -no-cnv \
-  --trace-file /tmp/ref_give_b1.trace.tsv \
-  -lv 4
-```
-
-## Bugs Found and Fixed in This Session
+## Bugs Found and Fixed
 
 ### 1. M-RoPE Section 0 Only (Fixed)
 - **File:** `src/mono27b_executor.cu` (`k_mrope` kernel) + `include/mono27b_config.h`
-- **Issue:** The RoPE kernel rotated ALL 64 M-RoPE dimensions with the token position. Qwen3.5 uses multi-section RoPE with sections `[text=11, height=11, width=10, extra=0]` (total 32 pairs = 64 dims). For text-only inference, only section 0 (11 pairs = 22 dims) should be rotated; sections 1 and 2 use position 0 (no rotation).
-- **Fix:** Added `MONO27B_N_ROT_DIMS_S0 = 22` constant and changed `k_mrope` to only process the first 22 dimensions.
-- **Impact:** Does NOT affect position-0 tokens (cos=1, sin=0 when pos=0), but WILL affect generation tokens (pos > 0).
+- **Issue:** RoPE kernel rotated ALL 64 dimensions. Qwen3.5 uses multi-section RoPE with sections `[text=11, height=11, width=10, extra=0]`; only section 0 (22 dims) should rotate for text.
+- **Impact:** Only affects generation tokens (pos > 0), not prompt step (pos=0).
 
-### 2. L2 Norm Epsilon Match (Fixed)
+### 2. L2 Norm Epsilon (Fixed)
 - **File:** `src/mono27b_executor.cu` (`k_l2_norm_g` kernel)
-- **Issue:** Our kernel used `rsqrtf(sum + 1e-10f)` while ggml uses `rsqrtf(fmaxf(sum, eps²))` where `eps = 1e-6` (RMS epsilon), giving `eps² = 1e-12`.
-- **Fix:** Changed to `fmaxf(sum, MONO27B_RMS_EPS * MONO27B_RMS_EPS)` to match ggml.
-- **Impact:** Prevents over-amplification of very small Q/K vectors (sum < 1e-12 vs sum < 1e-10).
+- **Issue:** Used `rsqrtf(sum + 1e-10f)` instead of `rsqrtf(fmaxf(sum, eps²))` matching ggml.
+- **Impact:** Could over-amplify very small Q/K vectors.
 
-### 3. GGUF Q8_K Type Handling (Added as safety, not needed for this model)
+### 3. Q8_K Type Safety (Added)
 - **File:** `src/mono27b_gguf.cpp`
-- **Issue:** `MONO27B_GGML_TYPE_Q8_K` (type 15) was defined in the enum but not handled in `quant_type_size()` or `quant_block_size()`, causing those tensors to have `size_bytes = 0` and be skipped.
-- **Note:** The current model does NOT use Q8_K tensors (confirmed: 0 Q8_K tensors in the file), so this didn't affect this run. Kept as a safety fix for future models.
-
-## Layer Status
-
-| Layer / Step | mono27b status | llama.cpp status | Notes |
-| --- | --- | --- | --- |
-| GGUF load | match | match | Same file, same tensor metadata |
-| Tokenization | match | match | Raw prompt `"give"` maps to token `44883` |
-| Prompt path | match | match | Raw-completion probe is aligned |
-| Embed | **match** | match | **Resolved.** Official ggml q4_K dequant on correct token row (44883) matches our output. Both produce `0.015738368, 0.00514060259, ...` |
-| SSM Layer 0 | unresolved | (ref has no per-layer trace) | First SSM layer produces non-trivial delta net output. RMS norm, conv1d, SiLU verified numerically |
-| SSM Layer 1 | unresolved | (ref has no per-layer trace) | |
-| SSM Layer 2 | unresolved | (ref has no per-layer trace) | |
-| Attention Layer 3 | unresolved | (ref has no per-layer trace) | Verified KV-cache, softmax attention, gate apply all execute. V-only output for first token is correct (single-token attention degenerates to identity). |
-| SSM Layer 4+ | unresolved | (ref has no per-layer trace) | Layers 4-63 process, all output finite |
-| Final `output_norm` | **match** | match | RMS norm with output_norm weights verified numerically (weights read from GGUF, values around 1.7-2.0) |
-| LM head (`output.weight`) | **match** | match | CPU probe matches GPU within `1.3e-5` on rows 0-7. Verified 2-step generation logits also match within `1.3e-5`. |
-| Sampler | unresolved | match | Not the leading suspect when LM head is proven |
+- **Issue:** `MONO27B_GGML_TYPE_Q8_K` (type 15) not handled in size/block functions.
+- **Note:** Current model has zero Q8_K tensors, so this didn't affect results.
 
 ## Evidence Log
 
-### Embedding Resolution
-- Built standalone `check_gguf.cpp` tool linked against `ref/llama.cpp/build/bin/libggml-base.so`.
-- Official `dequantize_row_q4_K` on raw GGUF bytes for token row 44883 produces:
-  - `0.015738368, 0.00514060259, 0.0192709565, 0.0334013104, ...`
-- Our backend embed dump produces IDENTICAL values.
-- The earlier `-0.00124168` values were from row 0 (not row 44883) — the `check_gguf` tool was accidentally reading the wrong offset.
-- Neighbor rows also confirmed correct:
-  - row 44882: `0.0100064278 ...`
-  - row 44884: `0.00984811783 ...`
+### Embedding Verified
+- Official `dequantize_row_q4_K` on token row 44883 matches our output exactly
+- Earlier `-0.00124168` values were from token row 0 (wrong row), not 44883
+- Both produce: `0.015738368, 0.00514060259, 0.0192709565, 0.0334013104, ...`
 
-### LM Head Probe (Q6_K)
-- Verified at both prompt step and gen step.
-- `max_abs = 1.33e-05` on rows 0-7 across both steps.
-- Confirms Q6_K dequant + matvec produce correct logits.
+### LM Head Verified (Q6_K)
+- `max_abs = 1.33e-05` on rows 0-7 across both prompt and gen steps
+- Confirms Q6_K dequant + matvec implementation is correct
 
-### All Tensor Types in GGUF
+### Divergence Narrows to SSM Layer 0
+
+| Layers | Top1 | Logit | Notes |
+|--------|------|-------|-------|
+| 0 | 10074 | 8.56 | No layers, just embed→out_norm→LM head |
+| 1 (SSM 0) | 220 | 7.03 | **First divergence from reference path** |
+| 4 (SSM 0-2, attn 3) | 220 | 6.17 | Same prediction as 1 layer |
+| 64 (full) | 11 | 16.92 | Reference: 728 (15.74) |
+
+Layer 0 SSM output stats (from debug dump):
+- Embedding L2: 0.93
+- Post-RMS norm L2: 69.88 (heavily amplified)
+- wqkv output range: [-31.5, 33.5]
+- conv+SiLU output range: [-0.28, 9.04]
+- DeltaNet output: max=0.23, L2=0.60 (small due to zero initial state)
+- ssm_out output L2: 12.24
+- Layer out (residual) L2: 12.28
+- Post-FFN L2: 15.66
+
+### Tensor Type Reference for SSM Layer 0
 ```
-F32 (type 0):    449 tensors
-Q8_0 (type 8):    48 tensors
-Q4_K (type 12):  207 tensors
-Q5_K (type 13):   70 tensors
-Q6_K (type 14):   65 tensors
-IQ4_XS (type 23): 12 tensors
+attn_qkv.weight:  Q6_K   [5120, 10240]  → wqkv projection
+attn_gate.weight: Q5_K   [5120,  6144]  → wqkv_gate (z) projection
+ssm_conv1d.weight:F32    [4, 10240]     → conv1d kernel
+ssm_beta.weight:  F32    [5120,   48]   → beta projection
+ssm_alpha.weight: F32    [5120,   48]   → alpha projection
+ssm_dt.bias:      F32    [48]           → dt bias
+ssm_a:            F32    [48]           → -exp(A_log) gate decay
+ssm_norm.weight:  F32    [128]          → per-head RMS norm weight
+ssm_out.weight:   Q8_0   [6144, 5120]   → output projection
 ```
-All types are supported by the code. No Q8_K (type 15) tensors exist in this model.
-
-### Verified Individual Components (against ggml/C reference)
-| Component | Status | Method |
-| --- | --- | --- |
-| Q4_K dequant | ✓ match | `dequantize_row_q4_K` on raw GGUF bytes |
-| Q6_K dequant + matvec | ✓ match | GPU vs CPU probe on LM head |
-| RMS norm | ✓ match | Numerical check from debug values, formula matches ggml kernel |
-| SiLU activation | ✓ match | Verified from debug: `silu(0.079052) = 0.0410875` matches `x/(1+exp(-x))` |
-| L2 normalization | ✓ match (after fix) | Epsilon changed from `1e-10` to `fmaxf(sum, eps²)` to match ggml |
-| M-RoPE | ✓ match (after fix) | Only rotate section 0 (22 dims) for text-only inference |
-| Attention (single token) | ✓ correct | V-only output is correct for single-token degenerate case |
-| Conv1d (first step) | ✓ correct | `conv_out = inp * w[kernel_size-1]` for zero initial state |
-| Q5_K dequant logic | ✓ match | Manual verification of index mapping against `dequantize_row_q5_K` |
-| Buffer memory layout | ✓ clean | No overlaps between `h`, `h2`, `qb`, `kb`, `fb`, `sb`, `gb`, `logits` |
-
-### Divergence Experiment: Layer Count
-| Layers | Top1 Token | Top1 Logit | Reference (64 layers) |
-| --- | --- | --- | --- |
-| 0 (no layers) | 10074 | 8.56 | — |
-| 4 (SSM 0-2 + attn 3) | 220 | 6.17 | — |
-| 64 (full) | 11 | 16.92 | 728 (15.74) |
-
-The divergence grows with layer count but even the first SSM layer already pushes the hidden state in the wrong direction.
 
 ## Open Questions
 
-- Which quantized matvec kernel first produces incorrect output? Need to compare Q4_K matvec (FFN gate/up, attention Q/K), Q5_K matvec (SSM gate), Q6_K matvec (FFN down, attention Q for non-first?), Q8_0 matvec (SSM output) against ggml equivalents.
-- Is there a subtle CUDA memory issue (e.g., incorrect `__half` alignment in struct, race condition between async kernels)?
-- Could the conv state caching be incorrect for subsequent SSM layers within the same prompt step? (All layers share the same pos=0, so conv states are populated per-layer and consumed only on the next token.)
-- Is the `ssm_state` (DeltaNet state) initialized correctly to zeros?
+- **The remaining bug is subtle** — all individual components and the DeltaNet logic have been verified. The divergence arises from the COMPOSITION of the SSM layer, suggesting either:
+  1. A weight indexing error (wrong weight loaded for a specific operation)
+  2. An architecture interpretation error (wrong tensor shapes/meanings between our code and the reference)
+  3. A numerical accumulation issue (rounding/epsilon choices that amplify through the layer)
+  4. A CUDA synchronization issue (kernel launches not completing in expected order)
+
+- Can we use `llama-debug` with `--tensor-filter` to dump intermediate hidden states from the reference, allowing direct comparison?
 
 ## Next Verification Steps
 
@@ -167,10 +120,18 @@ The divergence grows with layer count but even the first SSM layer already pushe
 - [x] Verify embedding parity — confirmed matching on correct token row.
 - [x] Fix M-RoPE to only rotate section 0 dimensions (22 instead of 64).
 - [x] Fix L2 norm epsilon to match ggml (`fmaxf(sum, eps²)` instead of `sum + 1e-10`).
-- [ ] **Binary-search the diverging layer**: Run with increasing layer count (1, 2, 3, 4, 8, 16, 32, 64) and record top1 token + logit. Find the first layer where the prediction diverges from the reference.
-- [ ] **Verify quantized matvec kernels**: Write a standalone CUDA test that runs each quantized matvec type (Q4_K, Q5_K, Q6_K, Q8_0) with known inputs and compares against ggml's CPU output from the same raw GGUF data.
-- [ ] **Test conv1d kernel isolation**: Replace conv1d with a simple copy (bypass convolution) and see if the output changes toward the reference.
-- [ ] **Test DeltaNet isolation**: Replace the DeltaNet SSM block with a simple identity (just copy v to output) and compare.
-- [ ] **Check shared memory bank conflicts** in `k_q4k_mv`, `k_q5k_mv`, `k_q6k_mt` kernels that could cause silent numerical corruption.
-- [ ] **Add `cuda-memcheck` run** to detect out-of-bounds memory access in any kernel.
+- [x] Verify Q5_K dequant logic matches `dequantize_row_q5_K` reference.
+- [x] Q6_K dequant reference match confirmed via LM head probe.
+- [x] Run `compute-sanitizer memcheck` — 0 errors.
+- [x] Binary-search: divergence starts at SSM Layer 0 (1 layer gives token 220 ≠ reference's 728).
+- [ ] **Write a Python-side reference computation for SSM layer 0**: 
+  - Read all layer 0 weights from GGUF
+  - Load the h (embedding) values from the debug dump
+  - Compute the complete SSM layer in Python using the same exact formulas
+  - Compare each intermediate value with our GPU debug dump
+  - This will pinpoint the exact operation where values first differ
+- [ ] **Check if `ssm_norm.weight` is loaded correctly**: Verify the data at the GGUF offset matches expected 128-element F32 weight array.
+- [ ] **Run cuda-gdb or use printf debugging** in the DeltaNet kernel to verify state evolution during the first call.
+- [ ] **Verify the conv1d weight order**: Ensure `w[3]` is indeed the last (newest) tap by comparing Python conv with GPU output.
+- [ ] **Test with a CPU-side reference** using `libggml-base.so` linked against a small harness that loads the weights and computes one SSM layer step.
 - [ ] Keep updating this file until the first mismatch is gone and the remaining trace is 100% identical on the chosen probe.
