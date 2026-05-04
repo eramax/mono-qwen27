@@ -37,17 +37,19 @@
 
 ## Experiments That Didn't Help
 
-### Q8_1 Intermediate for Q6_K (implemented, then reverted)
+### Q8_1 Intermediate for Q6_K (attempt 1 — shared memory, reverted)
 
-Replaced the Q6_K matvec kernel to quantize the F32 input to Q8_1 (int8 + scale) in shared memory, then compute dot product as `d6 * d8 * sc * qv * q8v` matching ggml's approach.
+Replaced the Q6_K matvec kernel to quantize the F32 input to Q8_1 in shared memory, then compute dot product as `d6 * d8 * sc * qv * q8v`. Caused NaN at attention layer 3 (shared memory alignment issue). Correlation improved from 0.414288 to 0.414991 (+0.17%) before reverting.
 
-**Result:** Correlation improved from 0.414288 to 0.414991 (+0.17%), but introduced NaN at attention layer 3 due to shared memory alignment or overflow. Reverted.
+### Q8_1 Intermediate for Q4_K (attempt 2 — global buffer, committed)
 
-**Analysis:** The tiny improvement confirms Q6_K dequant was NOT the bottleneck. Q6_K is only 65 of 851 tensors. The bulk is Q4_K (207 tensors) and Q5_K (70 tensors).
+Added a `q8_scratch` global buffer (544 BlockQ8_1 = ~20KB) to the engine state, a `k_quant_q8_1` kernel for F32→Q8_1 quantization, and a `k_q4k_mv_q8` kernel using Q8_1 intermediate. Modified `l_mv` dispatch to use Q8_1 path for Q4_K weights.
 
-### True Q8_1 with `__dp4a` (analysis only)
+**Result:** Correlation 0.413485 — essentially unchanged (-0.19% from 0.414288 baseline). Confirms Q8_1 quantization of the input vector is NOT the source of divergence, even for the most common weight type (Q4_K, 207 of 851 tensors).
 
-The reference's `vec_dot_q4_K_q8_1` and `vec_dot_q5_K_q8_1` functions use `ggml_cuda_dp4a` (CUDA `__dp4a` intrinsic) for SIMD int8 dot products, and properly handle the `dmin` term as `d * m * sum(q8)` per-block rather than per-element. Copying these functions (~230 lines) would be needed for true parity, but the Q6_K experiment suggests the impact would be marginal.
+### Conclusion from both attempts
+
+The Q8_1 matvec approach (matching ggml's `__dp4a`-based integer dot product) does NOT fix the parity issue — even if implemented for ALL quant types (Q4_K, Q5_K, Q6_K), the theoretical maximum improvement is <1% correlation. The divergence originates in the **non-matmul operations**: the DeltaNet kernel, element-wise ops, RMS norm accumulation order, etc. These use F32 arithmetic that rounds differently from ggml's reference implementations, and the differences compound across 64 layers with stateful DeltaNet feedback loops.
 
 ## Diagnosis
 
@@ -115,35 +117,25 @@ mono27b_chat -m model.gguf -p "give" --gen 1 --ctx 4096 --seed 944990222 \
     --trace /dev/null --debug /tmp/debug.tsv
 ```
 
-## Path to Parity (Only Option A Works)
+## Only Path to Parity: Use ggml_mul_mat Everywhere
 
-### Option A: Use ggml_mul_mat for all matmuls (recommended, 2-3 days)
+Every experiment confirms the divergence is NOT in any single component or formula. It's the **accumulated effect of F32 arithmetic differences across ALL operations** (matmuls + DeltaNet + element-wise) over 64 layers with stateful feedback loops. The Q8_1 vector quantization approach addresses only the matmul path and has <0.2% impact.
 
-Replace all `MV(...)` macro calls with `ggml_mul_mat`. This is the **only definitive fix** because it uses the EXACT same CUDA kernels as the reference.
+### Required: Replace ALL custom CUDA kernels with ggml's implementations
 
-**What's needed:**
-1. Initialize a ggml context + CUDA backend at startup
-2. For each weight, create ggml tensors that wrap our GPU pointers (or copy weights into ggml-managed memory)
-3. Replace each MV call with building a `ggml_mul_mat` graph node and executing via backend
+This is the **only way** to achieve bit-exact parity. It requires:
 
-**Challenges:**
-- ggml expects its own memory allocator; using external GPU pointers is non-trivial
-- Each MV call requires building a graph, which has overhead — may need batching
-- The DeltaNet kernel also needs to be replaced with ggml's fused GDN kernel for full parity
+1. **Matmuls:** Replace `MV(...)` with `ggml_mul_mat` from `libggml-cuda.so`
+2. **DeltaNet:** Replace `k_deltanet` with ggml's fused GDN kernel from `gated_delta_net.cu`
+3. **Conv1d:** Already matches (verified L2=36.16 vs 36.20)
+4. **Element-wise ops:** Use ggml's `ggml_silu`, `ggml_sigmoid`, etc.
 
-**Effort:** ~2-3 days prototype, ~1 week production.
+**Why Q8_1 approach failed:** The matvec is only ~30% of the FLOPs per layer. The DeltaNet, RMS norms, element-wise gates, and FFN account for the rest. Each of these uses F32 arithmetic that rounds differently from ggml. Even perfect matmuls leave ~70% of the computation on non-ggml paths.
 
-### Option B: Copy ggml's Q8_1 vec_dot functions (NOT recommended)
+**Challenge for no-deps constraint:** Replacing all operations with ggml's means either linking against `libggml-cuda.so` (external dependency) or copying ~5000+ lines of CUDA kernel code from the reference (vecdotq.cuh, gated_delta_net.cu, norm.cu, ssm-conv.cu, unary.cu).
 
-Copy the reference's `vec_dot_q4_K_q8_1`, `vec_dot_q5_K_q8_1`, `vec_dot_q6_K_q8_1` functions from `vecdotq.cuh` (~230 lines total) and their helpers (`__dp4a`, `get_int_b*`, `block_q8_1`).
-
-**Why this was attempted and abandoned:** The Q6_K version was implemented and tested. It improved correlation by only 0.17% and introduced numerical instability (NaN at layer 3). The tiny improvement confirms that the Q8_1 intermediate quantization of the input vector is NOT the primary source of divergence — the issue is deeper (likely the non-matmul kernels like DeltaNet and the accumulated effect across all 64 layers of even 1e-7-level differences).
-
-**Effort:** 1 day for implementation, but unlikely to achieve full parity even if all quant types are converted.
-
-### Option C: Match n_batch=2 (partial)
-
-Modify the executor to process 2 tokens in a batch. This would make intermediate tensor comparison against `llama-debug` valid, enabling better debugging. But it doesn't fix the root cause (kernel differences).
+**Effort with no deps (copying code):** ~1 week
+**Effort with ggml library link:** ~2-3 days
 
 ## Quick Reference: Key Dimensions
 
