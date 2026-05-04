@@ -58,6 +58,35 @@ struct BlockQ6K {
     __half d;
 };
 
+// Q8_1 block for intermediate matvec quantization (32 elements per block)
+struct BlockQ8_1 {
+    __half d;
+    __half s;
+    int8_t qs[32];
+};
+
+// Quantize F32 vector to Q8_1 blocks in a global buffer
+__global__ static void k_quant_q8_1(const float * x, BlockQ8_1 * y, int n) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int nb = n / 32;
+    if (b >= nb) return;
+    float amax = 0.0f;
+    for (int j = 0; j < 32; j++) {
+        float v = x[(size_t)b * 32 + j];
+        amax = fmaxf(amax, fabsf(v));
+    }
+    float d = amax / 127.0f;
+    float id = d > 0.0f ? 1.0f / d : 0.0f;
+    int sum_ = 0;
+    for (int j = 0; j < 32; j++) {
+        int qi = (int)(rintf(x[(size_t)b * 32 + j] * id));
+        qi = max(-128, min(127, qi));
+        y[b].qs[j] = (int8_t)qi;
+        sum_ += qi;
+    }
+    y[b].d = __float2half(d);
+    y[b].s = __float2half(d * (float)sum_);
+}
 
 
 // ─── Warp-level reductions ───────────────────────────────────────────────────
@@ -920,6 +949,12 @@ extern "C" bool mono27b_engine_init_state(int max_ctx, Mono27BExecutorState * st
     }
     state->work_buf_size = ws;
 
+    // Allocate Q8_1 scratch buffer for matvec quantization
+    { size_t q8_sz = 544 * sizeof(BlockQ8_1);
+      state->q8_scratch = nullptr;
+      cudaError_t eq = cudaMalloc(&state->q8_scratch, q8_sz);
+      if (eq != cudaSuccess) { state->q8_scratch = nullptr; } }
+
     state->kv_len = 0;
     return true;
 fail:
@@ -938,6 +973,7 @@ extern "C" void mono27b_engine_free_state(Mono27BExecutorState * state) {
         cudaFree(state->ssm_state[i]); cudaFree(state->conv_state[i]);
     }
     cudaFree(state->work_buf);
+    if (state->q8_scratch) cudaFree(state->q8_scratch);
     std::memset(state, 0, sizeof(*state));
 }
 
@@ -955,9 +991,67 @@ static void l_q6k(const BlockQ6K * W, int rb, int rc, const float * x, float * y
     k_q6k_mt<<<rc, 256>>>(W, x, y, rb, rc);
 }
 
+// File-scope pointer to Q8_1 scratch buffer (set by engine before decode step)
+static BlockQ8_1 * g_q8_scratch = nullptr;
+
+// Q8_1-based matvec kernels (quantize F32 input → Q8_1, then use ref-style dot)
+// These are called with pre-quantized Q8_1 input from g_q8_scratch
+
+template <int BLK>
+__global__ static void k_q4k_mv_q8(const BlockQ4K * W, const BlockQ8_1 * q8, float * y, int rb, int rc, int ncols) {
+    int row = blockIdx.x;
+    if (row >= rc) return;
+    __shared__ float sh[BLK];
+    float sum = 0.0f;
+    const BlockQ4K * rp = W + (size_t)row * rb;
+    for (int b = threadIdx.x; b < rb; b += BLK) {
+        const BlockQ4K & qb = rp[b];
+        float d = __half2float(qb.d);
+        float mn = __half2float(qb.dmin);
+        for (int g = 0; g < 4; ++g) {
+            uint8_t s0, m0, s1, m1;
+            get_scale_min_k4(g * 2, qb.scales, s0, m0);
+            get_scale_min_k4(g * 2 + 1, qb.scales, s1, m1);
+            float d0 = d * s0, d1 = d * s1, mn0 = mn * m0, mn1 = mn * m1;
+            int base = b * 256 + g * 64;
+            const uint8_t * qg = qb.qs + g * 32;
+            for (int i = 0; i < 32; ++i) {
+                int e = base + i;
+                float val_q8 = __half2float(q8[e / 32].d) * (float)q8[e / 32].qs[e % 32];
+                sum += (d0 * (qg[i] & 0x0F) - mn0) * val_q8;
+                e = base + 32 + i;
+                float val_q8_2 = __half2float(q8[e / 32].d) * (float)q8[e / 32].qs[e % 32];
+                sum += (d1 * (qg[i] >> 4) - mn1) * val_q8_2;
+            }
+        }
+    }
+    sh[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = BLK / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) { sh[threadIdx.x] += sh[threadIdx.x + s]; }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) y[row] = sh[0];
+}
+
 // Type-dispatched matvec: W at ggml_type, rb blocks per row, rc rows, x input, y output
 static void l_mv(void * W, uint32_t ggml_type, int rb, int rc, const float * x, float * y) {
     if (rc == 0 || !W) return;
+    // If Q8_1 scratch is available, use Q8_1-based path for quantized K-quant types
+    if (g_q8_scratch && (ggml_type == MONO27B_GGML_TYPE_Q4_K ||
+                         ggml_type == MONO27B_GGML_TYPE_Q5_K ||
+                         ggml_type == MONO27B_GGML_TYPE_Q6_K)) {
+        int ncols = rb * 256;
+        int nb = ncols / 32;
+        k_quant_q8_1<<<(nb + 255) / 256, 256>>>(x, g_q8_scratch, ncols);
+        cudaDeviceSynchronize();
+        if (ggml_type == MONO27B_GGML_TYPE_Q4_K) {
+            k_q4k_mv_q8<128><<<rc, 128>>>((const BlockQ4K *)W, g_q8_scratch, y, rb, rc, ncols);
+            return;
+        }
+        // Q5_K and Q6_K fall back to original for now
+    }
+    // Fallback: original F32-path
     switch (ggml_type) {
         case MONO27B_GGML_TYPE_Q4_K: l_q4k((const BlockQ4K *)W, rb, rc, x, y); break;
         case MONO27B_GGML_TYPE_Q5_K: l_q5k((const BlockQ5K *)W, rb, rc, x, y); break;
@@ -1037,6 +1131,8 @@ extern "C" bool mono27b_engine_decode_step(
     FILE * debug_fp,
     char * error, size_t error_cap)
 {
+    // Set Q8_1 scratch pointer for matvec quantization
+    g_q8_scratch = (BlockQ8_1 *)st->q8_scratch;
     size_t sh = MONO27B_TARGET_HIDDEN * sizeof(float);
     size_t sq = MONO27B_TARGET_Q_DIM * sizeof(float);
     size_t sv = MONO27B_TARGET_KV_DIM * sizeof(float);

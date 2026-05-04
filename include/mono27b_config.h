@@ -99,6 +99,7 @@ struct Mono27BExecutorState {
     float * conv_state[MONO27B_TARGET_LAYERS - MONO27B_TARGET_FA_LAYERS];
     float * work_buf;
     size_t work_buf_size;
+    void * q8_scratch;  // Q8_1 buffer for matvec (544 blocks × 36 bytes)
     int max_ctx;
     int kv_len;
 };
