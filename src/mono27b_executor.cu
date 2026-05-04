@@ -151,14 +151,16 @@ __global__ static void k_elem_copy(float * d, const float * s, int n) {
 }
 
 __global__ static void k_elem_silu(float * x, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
-        x[i] = x[i] / (1.0f + expf(-x[i]));
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        float v = x[i];
+        x[i] = v / (1.0f + expf(-v));
+    }
 }
 
 __global__ static void k_elem_softplus(const float * x, const float * bias, float * out, int n) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
         float z = x[i] + bias[i];
-        out[i] = fmaxf(z, 0.0f) + log1pf(expf(-fabsf(z)));
+        out[i] = (z > 20.0f) ? z : logf(1.0f + expf(z));
     }
 }
 
@@ -194,9 +196,9 @@ __global__ static void k_rms_norm_mulw(const float * x, const float * w, float *
         sum += (double)x[i] * (double)x[i];
     }
 
-    const float inv = 1.0f / sqrtf((float)(sum / (double)n) + eps);
+    const float scale = 1.0f / sqrtf((float)(sum / (double)n) + eps);
     for (int i = 0; i < n; ++i) {
-        y[i] = x[i] * inv * (w ? w[i] : 1.0f);
+        y[i] = (float)((double)x[i] * (double)scale * (double)(w ? w[i] : 1.0f));
     }
 }
 
@@ -498,7 +500,7 @@ __global__ static void k_l2_norm_g(float * d, int gs, int ng) {
         sum_sq += (double)gd[i] * (double)gd[i];
     }
 
-    const float inv = 1.0f / fmaxf(sqrtf((float)sum_sq), MONO27B_RMS_EPS);
+    const float inv = 1.0f / sqrtf(fmaxf((float)sum_sq, MONO27B_RMS_EPS * MONO27B_RMS_EPS));
     for (int i = 0; i < gs; ++i) {
         gd[i] *= inv;
     }
@@ -699,17 +701,10 @@ __global__ static void k_deltanet(
     int col   = blockIdx.y;  // [0..hv)
     if (r_idx >= dr || col >= hv) return;
 
-    int g_idx = r_idx % ng;
+    int g_idx = r_idx / (dr / ng);
 
-    float g_raw = g[r_idx];
-    if (isnan(g_raw)) g_raw = -1.0f;  // prevent NaN propagation
-    if (g_raw < -80.0f) g_raw = -80.0f;
-    if (g_raw > 80.0f) g_raw = 80.0f;
-    float gv = expf(g_raw);
+    float gv = expf(g[r_idx]);
     float bv = beta[r_idx];
-    if (isnan(bv)) bv = 0.5f;
-    if (bv < 0.0f) bv = 0.0f;
-    if (bv > 1.0f) bv = 1.0f;
 
     const float * qg = q + (size_t)g_idx * hk;
     const float * kg = k + (size_t)g_idx * hk;
@@ -730,7 +725,7 @@ __global__ static void k_deltanet(
         attn += sn * qg[i];
     }
 
-    out[(size_t)r_idx * hv + col] = attn * rsqrtf((float)hv);
+    out[(size_t)r_idx * hv + col] = attn * (1.0f / sqrtf((float)hv));
 }
 
 // ─── Quant info helpers ──────────────────────────────────────────────────────
