@@ -1069,7 +1069,7 @@ extern "C" bool mono27b_engine_decode_step(
 
     mono27b_engine_embed(we, tok, h, error, error_cap);
     if (debug_fp && pos == 0) {
-        debug_dump_vec(debug_fp, "embed", 0, pos, tok, "h", h, MONO27B_TARGET_HIDDEN);
+        debug_dump_vec(debug_fp, "embed", 0, pos, tok, "h", h, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
     }
     TRACE("emb");
 
@@ -1182,9 +1182,10 @@ extern "C" bool mono27b_engine_decode_step(
             MV(L.wqkv, h2, sb);
             MV(L.wqkv_gate, h2, gb);
             if (debug_fp && pos == 0 && il < 3) {
-                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "attn_norm", h2, MONO27B_TARGET_HIDDEN);
-                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "wqkv", sb, MONO27B_SSM_CONV_CH);
-                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "wqkv_gate", gb, MONO27B_SSM_D_INNER);
+                // Dump FULL attn_norm (h2) for verification (20KB)
+                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "attn_norm", h2, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
+                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "wqkv", sb, MONO27B_SSM_CONV_CH, 16);
+                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "wqkv_gate", gb, MONO27B_SSM_D_INNER, 16);
             }
 
             if (L.ssm_beta.ptr && L.ssm_alpha.ptr && L.ssm_dt_bias.ptr && L.ssm_a_log.ptr) {
@@ -1223,7 +1224,7 @@ extern "C" bool mono27b_engine_decode_step(
                 { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d conv: %s", il, cudaGetErrorString(e)); goto cleanup; } }
                 if (!check_finite_device("ssm conv", sb, MONO27B_SSM_CONV_CH, error, error_cap)) goto cleanup;
                 if (debug_fp && pos == 0 && il < 3) {
-                    debug_dump_vec(debug_fp, "ssm", il, pos, tok, "conv", sb, MONO27B_SSM_CONV_CH);
+                    debug_dump_vec(debug_fp, "ssm", il, pos, tok, "conv", sb, MONO27B_SSM_CONV_CH, 16);
                 }
 
                 float * qr = sb;
