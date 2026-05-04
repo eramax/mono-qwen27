@@ -1,3 +1,10 @@
 build/
 *.m27b
 ref/
+*.debug.tsv
+debug/session*/
+debug/verify/embed_full.txt
+debug/verify/attn_norm_full.txt
+debug/verify/ref_logits.bin
+debug/verify/our_logits.bin
+debug/verify/ref_intermediates.txt

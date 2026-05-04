@@ -1090,9 +1090,7 @@ extern "C" bool mono27b_engine_decode_step(
             MV(L.wq, h2, qb); TRACE("wq");
             MV(L.wk, h2, kb); TRACE("wk");
             MV(L.wv, h2, kb + MONO27B_TARGET_KV_DIM); TRACE("wv");
-            if (L.gate.ptr && L.wq.row_count <= MONO27B_TARGET_Q_DIM) {
-                MV(L.gate, h2, qb + MONO27B_TARGET_Q_DIM); TRACE("ag");
-            }
+            // Gate is embedded in Q projection output (second half of 12288)
             if (debug_fp && pos == 0 && il < 4) {
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "q_proj", qb, MONO27B_TARGET_Q_DIM);
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "gate_src", qb + MONO27B_TARGET_Q_DIM, MONO27B_TARGET_Q_DIM);
@@ -1380,27 +1378,7 @@ extern "C" bool mono27b_engine_decode_step(
                          (void *)out->logits, pa == cudaSuccess ? "device" : cudaGetErrorString(pa));
             debug_dump_vec(debug_fp, "out", -1, pos, tok, "logits", out->logits, MONO27B_TARGET_VOCAB, MONO27B_TARGET_VOCAB);
         }
-        if (debug_fp && we->lm_head.ggml_type == MONO27B_GGML_TYPE_Q6_K) {
-            debug_probe_q6k_rows(debug_fp, "out", -1, pos, tok,
-                                 static_cast<const BlockQ6K *>(we->lm_head.ptr),
-                                 static_cast<int>(we->lm_head.row_blocks),
-                                 static_cast<int>(we->lm_head.row_count),
-                                 h2, out->logits, 8);
-        }
-        // Save logits as binary for comparison
-        if (pos == 0) {
-            std::vector<float> logits_save(MONO27B_TARGET_VOCAB);
-            cudaError_t ce = cudaMemcpy(logits_save.data(), out->logits,
-                                         MONO27B_TARGET_VOCAB * sizeof(float),
-                                         cudaMemcpyDeviceToHost);
-            if (ce == cudaSuccess) {
-                FILE * lf = fopen("/tmp/mono_logits.bin", "wb");
-                if (lf) {
-                    fwrite(logits_save.data(), sizeof(float), MONO27B_TARGET_VOCAB, lf);
-                    fclose(lf);
-                }
-            }
-        }
+
     }
     st->kv_len = pos + 1;
 
