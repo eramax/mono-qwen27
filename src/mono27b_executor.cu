@@ -245,7 +245,7 @@ __global__ static void k_iq4xs_mv(const BlockIQ4XS * W, const float * x, float *
 
 // ─── Q6_K matvec ─────────────────────────────────────────────────────────────
 
-static __device__ inline float q6k_val(const BlockQ6K & qb, int e) {
+static __host__ __device__ inline float q6k_val(const BlockQ6K & qb, int e) {
     const int n128 = e / 128;
     const int l    = e % 32;
     const int r    = (e % 128) / 32;
@@ -267,6 +267,17 @@ static __device__ inline float q6k_val(const BlockQ6K & qb, int e) {
 
     const int sc_idx = is + (r * 2);
     return __half2float(qb.d) * (float) sc[sc_idx] * (float) qv;
+}
+
+static float q6k_row_dot_cpu(const BlockQ6K * row, int rb, const float * x) {
+    float sum = 0.0f;
+    for (int b = 0; b < rb; ++b) {
+        const BlockQ6K & qb = row[b];
+        for (int e = 0; e < 256; ++e) {
+            sum += q6k_val(qb, e) * x[b * 256 + e];
+        }
+    }
+    return sum;
 }
 
 // Q6_K matvec: direct dequantization matching ggml reference
@@ -1122,7 +1133,7 @@ extern "C" bool mono27b_engine_decode_step(
         std::fprintf(debug_fp, "out\t%d\t%d\t%d\t%s\tptr\th2\t%p\t%s\n",
                      -1, pos, tok, "output_norm",
                      (void *)h2, pa == cudaSuccess ? "device" : cudaGetErrorString(pa));
-        debug_dump_vec(debug_fp, "out", -1, pos, tok, "output_norm", h2, MONO27B_TARGET_HIDDEN);
+        debug_dump_vec(debug_fp, "out", -1, pos, tok, "output_norm", h2, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
     }
     // REAL LM head: use the proper Q6_K matvec in chunks
     {
@@ -1143,14 +1154,14 @@ extern "C" bool mono27b_engine_decode_step(
             cudaMemcpy(out->logits, &v, 4, cudaMemcpyHostToDevice);
             sync_err = cudaDeviceSynchronize();
         }
-    }
-    if (debug_fp && pos == 0) {
-        cudaPointerAttributes attrs{};
-        cudaError_t pa = cudaPointerGetAttributes(&attrs, out->logits);
-        std::fprintf(debug_fp, "out\t%d\t%d\t%d\t%s\tptr\tlogits\t%p\t%s\n",
-                     -1, pos, tok, "logits",
-                     (void *)out->logits, pa == cudaSuccess ? "device" : cudaGetErrorString(pa));
-        debug_dump_vec(debug_fp, "out", -1, pos, tok, "logits", out->logits, MONO27B_TARGET_VOCAB);
+        if (debug_fp && pos == 0) {
+            cudaPointerAttributes attrs{};
+            cudaError_t pa = cudaPointerGetAttributes(&attrs, out->logits);
+            std::fprintf(debug_fp, "out\t%d\t%d\t%d\t%s\tptr\tlogits\t%p\t%s\n",
+                         -1, pos, tok, "logits",
+                         (void *)out->logits, pa == cudaSuccess ? "device" : cudaGetErrorString(pa));
+            debug_dump_vec(debug_fp, "out", -1, pos, tok, "logits", out->logits, MONO27B_TARGET_VOCAB);
+        }
     }
     st->kv_len = pos + 1;
 

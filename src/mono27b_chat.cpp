@@ -342,33 +342,14 @@ int main(int argc, char ** argv) {
     cudaGetLastError();
     std::fprintf(stderr, "[load] GPU weights ready\n");
 
-    // Apply chat template and encode
+    // Raw completion mode: match llama.cpp --no-cnv behavior for plain prompts.
     std::string user_prompt = args.prompt;
     while (!user_prompt.empty() && (user_prompt.back() == '\n' || user_prompt.back() == '\r' ||
                                     user_prompt.back() == '\t' || user_prompt.back() == ' ')) {
         user_prompt.pop_back();
     }
     std::vector<int32_t> prompt_ids;
-    const std::vector<int32_t> nl_ids = tokenizer.encode("\n");
-    prompt_ids.push_back(static_cast<int32_t>(gguf.metadata.im_start_id));
-    {
-        auto sys_ids = tokenizer.encode("system\nYou are a helpful assistant.");
-        prompt_ids.insert(prompt_ids.end(), sys_ids.begin(), sys_ids.end());
-    }
-    prompt_ids.push_back(static_cast<int32_t>(gguf.metadata.im_end_id));
-    prompt_ids.insert(prompt_ids.end(), nl_ids.begin(), nl_ids.end());
-    prompt_ids.push_back(static_cast<int32_t>(gguf.metadata.im_start_id));
-    {
-        auto user_ids = tokenizer.encode("user\n" + user_prompt);
-        prompt_ids.insert(prompt_ids.end(), user_ids.begin(), user_ids.end());
-    }
-    prompt_ids.push_back(static_cast<int32_t>(gguf.metadata.im_end_id));
-    prompt_ids.insert(prompt_ids.end(), nl_ids.begin(), nl_ids.end());
-    prompt_ids.push_back(static_cast<int32_t>(gguf.metadata.im_start_id));
-    {
-        auto asst_ids = tokenizer.encode("assistant\n");
-        prompt_ids.insert(prompt_ids.end(), asst_ids.begin(), asst_ids.end());
-    }
+    prompt_ids = tokenizer.encode(user_prompt);
     std::fprintf(stderr, "[prompt] tokens=%zu ids=", prompt_ids.size());
     for (size_t i = 0; i < prompt_ids.size(); ++i) fprintf(stderr, "%d ", prompt_ids[i]);
     fprintf(stderr, "\n");
