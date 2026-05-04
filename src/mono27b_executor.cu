@@ -183,20 +183,21 @@ __global__ static void k_elem_swiglu(float * out, const float * up, int n) {
 
 
 
-// Use proper shared memory reduction
+// Match ggml's reference RMS/L2 accumulation order more closely by using
+// a single-thread sequential sum in double precision.
 template <int BLK>
 __global__ static void k_rms_norm_mulw(const float * x, const float * w, float * y, int n, float eps) {
-    __shared__ float sh[BLK];
-    float sum = 0.0f;
-    for (int i = threadIdx.x; i < n; i += BLK) sum += x[i] * x[i];
-    sh[threadIdx.x] = sum;
-    __syncthreads();
-    for (int s = BLK / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) { sh[threadIdx.x] += sh[threadIdx.x + s]; }
-        __syncthreads();
+    if (threadIdx.x != 0) return;
+
+    double sum = 0.0;
+    for (int i = 0; i < n; ++i) {
+        sum += (double)x[i] * (double)x[i];
     }
-    float inv = rsqrtf(sh[0] / n + eps);
-    for (int i = threadIdx.x; i < n; i += BLK) y[i] = x[i] * inv * (w ? w[i] : 1.0f);
+
+    const float inv = 1.0f / sqrtf((float)(sum / (double)n) + eps);
+    for (int i = 0; i < n; ++i) {
+        y[i] = x[i] * inv * (w ? w[i] : 1.0f);
+    }
 }
 
 // ─── F16 matvec ─────────────────────────────────────────────────────────────
@@ -489,19 +490,18 @@ __global__ static void k_f32_mv(const float * W, const float * x, float * y, int
 __global__ static void k_l2_norm_g(float * d, int gs, int ng) {
     int g = blockIdx.x;
     if (g >= ng) return;
+    if (threadIdx.x != 0) return;
+
     float * gd = d + (size_t)g * gs;
-    __shared__ float sh[128];
-    float sq = 0.0f;
-    for (int i = threadIdx.x; i < gs; i += blockDim.x) sq += gd[i] * gd[i];
-    sh[threadIdx.x] = sq;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
-        __syncthreads();
+    double sum_sq = 0.0;
+    for (int i = 0; i < gs; ++i) {
+        sum_sq += (double)gd[i] * (double)gd[i];
     }
-    float sum_sq = sh[0];
-    float inv = rsqrtf(fmaxf(sum_sq, MONO27B_RMS_EPS * MONO27B_RMS_EPS));
-    for (int i = threadIdx.x; i < gs; i += blockDim.x) gd[i] *= inv;
+
+    const float inv = 1.0f / fmaxf(sqrtf((float)sum_sq), MONO27B_RMS_EPS);
+    for (int i = 0; i < gs; ++i) {
+        gd[i] *= inv;
+    }
 }
 
 // ─── M-RoPE ──────────────────────────────────────────────────────────────────
@@ -660,9 +660,8 @@ __global__ static void k_ssm_conv1d_u(const float * inp, const float * w, float 
     if (ch >= cc) return;
     int sl = ck - 1;
     float s = 0.0f;
-    // conv input order in reference: [x[-3], x[-2], x[-1], current]
-    // Our conv state: cs[0]=x[-3], cs[1]=x[-2], cs[2]=x[-1]
-    // w[0..3] are loaded from GGUF in the same order as the reference
+    // Store history oldest-first to match ggml's streaming conv layout.
+    // cs[0] is the oldest previous token, cs[sl-1] the most recent previous token.
     for (int k = 0; k < sl; ++k) s += cs[(size_t)ch * sl + k] * w[(size_t)ch * ck + k];
     s += inp[ch] * w[(size_t)ch * ck + sl];
     for (int k = 0; k < sl - 1; ++k) cs[(size_t)ch * sl + k] = cs[(size_t)ch * sl + k + 1];
@@ -676,9 +675,7 @@ __global__ static void k_ssm_conv1d_u_f16(const float * inp, const __half * w, f
     if (ch >= cc) return;
     int sl = ck - 1;
     float s = 0.0f;
-    // conv input order in reference: [x[-3], x[-2], x[-1], current]
-    // Our conv state: cs[0]=x[-3], cs[1]=x[-2], cs[2]=x[-1]
-    // w[0..3] are loaded from GGUF in the same order as the reference
+    // Store history oldest-first to match ggml's streaming conv layout.
     for (int k = 0; k < sl; ++k) {
         s += cs[(size_t)ch * sl + k] * __half2float(w[(size_t)ch * ck + k]);
     }
@@ -1318,6 +1315,8 @@ extern "C" bool mono27b_engine_decode_step(
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "wqkv_gate", gb, MONO27B_SSM_D_INNER, MONO27B_SSM_D_INNER);
             }
             if (dump_step && il < 3) {
+                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "linear_attn_qkv_mixed", sb, MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_CH);
+                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "z", gb, MONO27B_SSM_D_INNER, MONO27B_SSM_D_INNER);
                 // Dump FULL attn_norm (h2) for verification (20KB)
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "attn_norm", h2, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "wqkv", sb, MONO27B_SSM_CONV_CH, 16);
@@ -1351,7 +1350,7 @@ extern "C" bool mono27b_engine_decode_step(
                 } else {
                     cudaMemcpy(conv_w_host.data(), L.ssm_conv1d.ptr, sizeof(float) * MONO27B_SSM_CONV_KERN * 2, cudaMemcpyDeviceToHost);
                 }
-                std::fprintf(debug_fp, "dbg\t0\t0\t%d\tconv_w\t%d\t", tok, MONO27B_SSM_CONV_KERN * 2);
+                std::fprintf(debug_fp, "dbg\t0\t%d\t%d\tconv_w\t%d\t", pos, tok, MONO27B_SSM_CONV_KERN * 2);
                 for (int i = 0; i < MONO27B_SSM_CONV_KERN * 2; i++) {
                     std::fprintf(debug_fp, "%s%.9g", i ? "," : "", conv_w_host[i]);
                 }
@@ -1359,7 +1358,7 @@ extern "C" bool mono27b_engine_decode_step(
                 // Also dump wqkv values that feed into conv
                 std::vector<float> inp_host(MONO27B_SSM_CONV_CH);
                 cudaMemcpy(inp_host.data(), sb, sizeof(float) * MONO27B_SSM_CONV_CH, cudaMemcpyDeviceToHost);
-                std::fprintf(debug_fp, "dbg\t0\t0\t%d\tconv_inp\t%d\t", tok, MONO27B_SSM_CONV_CH);
+                std::fprintf(debug_fp, "dbg\t0\t%d\t%d\tconv_inp\t%d\t", pos, tok, MONO27B_SSM_CONV_CH);
                 for (int i = 0; i < MONO27B_SSM_CONV_CH; i++) {
                     std::fprintf(debug_fp, "%s%.9g", i ? "," : "", inp_host[i]);
                 }

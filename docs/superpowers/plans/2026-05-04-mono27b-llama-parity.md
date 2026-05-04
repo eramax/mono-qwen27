@@ -46,6 +46,10 @@
    - `--replay-trace` forces our run to follow the reference token stream.
    - `--debug-pos N` dumps tensors for any chosen position, not only the prompt token.
 
+5. **Fixed a verification selection bug** in `debug/verify/compare_ref.py`:
+   - The compare script had been hardcoded to `step=0,pos=0`, which could pair the wrong tensor occurrence when replaying generation.
+   - It now selects the latest matching tensor dump for the requested phase/label, which makes replay comparisons inspect the actual generation-step tensors.
+
 ## Bugs Found and Fixed
 
 1. **Attention gate fix** — Verified Q projection produces both Q and gate (12288 = Q_DIM*2 outputs). Sigmoid gate applied correctly via `k_elem_sigmoid_mul`.
@@ -91,6 +95,15 @@ Interpretation:
 - The earlier prompt-token checks were not sufficient to identify the bug.
 - The first generated token path still diverges in the stateful SSM branch.
 - The first clearly broken stage on same-token replay is the SSM conv / DeltaNet path, not the prompt embedding or RMS norm.
+
+### Follow-up replay evidence
+
+After fixing the compare selection bug and dumping both prompt and generation positions:
+
+- Prompt-step row-0 `wqkv` and `wqkv_gate` projections match CPU dequant/dot to about `1e-7`.
+- Prompt-step `conv_output_raw`, `q_conv_predelta`, `k_conv_predelta`, and `ssm_out` are close but not bit-identical.
+- Generation-step tensors still diverge materially after the prompt state is carried forward.
+- That means the remaining problem is not the local projection kernels on row 0; it is the recurrent generation path, where tiny prompt-step differences are being amplified.
 
 ### Conclusion from both attempts
 

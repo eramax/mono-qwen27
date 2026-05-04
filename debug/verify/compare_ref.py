@@ -39,6 +39,9 @@ if __name__ == "__main__":
     comparisons = [
         ("model.input_embed", ("embed", "h"), "Embedding"),
         ("attn_norm-0", ("ssm", "attn_norm"), "RMS norm"),
+        ("linear_attn_qkv_mixed-0", ("ssm", "linear_attn_qkv_mixed"), "SSM qkv mixed"),
+        ("z-0", ("ssm", "z"), "SSM gate z"),
+        ("conv_output_raw-0", ("ssm", "conv_raw"), "SSM conv raw"),
         ("q_conv_predelta-0", ("ssm", "q_conv_predelta"), "Q conv pre-delta"),
         ("k_conv_predelta-0", ("ssm", "k_conv_predelta"), "K conv pre-delta"),
         ("conv_output_silu-0", ("ssm", "conv"), "SSM conv+SiLU"),
@@ -54,10 +57,13 @@ if __name__ == "__main__":
 
     for ref_name, (phase, gpu_name), desc in comparisons:
         gpu_vals = None
-        for key, vals in gpu_data.items():
-            if key[0] == phase and key[4] == gpu_name and key[1] == 0 and key[2] == 0 and key[3] == 44883:
-                gpu_vals = vals
-                break
+        matching = [
+            (key, vals)
+            for key, vals in gpu_data.items()
+            if key[0] == phase and key[4] == gpu_name and key[3] == 44883
+        ]
+        if matching:
+            key, gpu_vals = max(matching, key=lambda kv: (kv[0][1], kv[0][2], kv[0][3]))
         ref_candidates = extract_ref_tensor_occurrences(ref_text, ref_name)
         ref_vals = None
         if ref_candidates:
