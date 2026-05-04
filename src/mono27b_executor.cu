@@ -58,6 +58,97 @@ struct BlockQ6K {
     __half d;
 };
 
+// Q8_1 block for intermediate quantization (matches ref block_q8_1)
+struct BlockQ8_1 {
+    __half d;
+    __half s;
+    int8_t qs[32];
+};
+static_assert(sizeof(BlockQ8_1) == 36, "BlockQ8_1 size");
+
+// Quantize F32 → Q8_1 (32 elements per block)
+__global__ static void k_quant_q8_1(const float * x, BlockQ8_1 * y, int n) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int nb = n / 32;
+    if (b >= nb) return;
+    float amax = 0.0f;
+    for (int j = 0; j < 32; j++) {
+        float v = x[b * 32 + j];
+        amax = fmaxf(amax, fabsf(v));
+    }
+    float d = amax / 127.0f;
+    float id = d > 0.0f ? 1.0f / d : 0.0f;
+    int sum = 0;
+    for (int j = 0; j < 32; j++) {
+        int qi = (int)(rintf(x[b * 32 + j] * id));
+        qi = max(-128, min(127, qi));
+        y[b].qs[j] = (int8_t)qi;
+        sum += qi;
+    }
+    y[b].d = __float2half(d);
+    y[b].s = __float2half(d * sum);
+}
+
+// ─── Q8_1 dot product helpers (matching ref vecdotq.cuh) ─────────────────────
+
+// dp4a: dot product of 4 bytes packed in int32
+__device__ inline int dp4a(int a, int b, int c) {
+    return __dp4a(a, b, c);
+}
+
+// vec_dot_q6_K_q8_1 for one Q6_K block (256 elts) vs corresponding Q8_1 blocks
+__device__ inline float vec_dot_q6k_q8(const BlockQ6K & q6, int q6_idx,
+                                        const BlockQ8_1 * q8, int q8_offset) {
+    // Each Q6_K block = 256 elements = 8 x Q8_1 blocks (32 elts each)
+    // q8_offset = starting Q8_1 block index for this Q6_K block
+    constexpr int QR6_K = 2;
+    constexpr int QI6_K = 32;  // QK_K / (4*QR6_K) = 256/(4*2)
+    
+    // iqs=0 variant: single-thread, process all 8 Q8_1 blocks
+    float sumf = 0.0f;
+    for (int i = 0; i < 8; i++) {
+        const BlockQ8_1 & bq8 = q8[q8_offset + i];
+        float d8 = __half2float(bq8.d);
+        
+        // Load Q6_K data for this chunk of 32 elements
+        int chunk_idx = i / 4;  // 0 or 1 (first or second 128-element half)
+        int sub_idx = i % 4;    // 0..3 within the 128-element half
+        
+        const uint8_t * ql = q6.ql + chunk_idx * 64;
+        const uint8_t * qh = q6.qh + chunk_idx * 32;
+        const int8_t * sc = q6.scales + chunk_idx * 8;
+        
+        // Decode Q6_K values for 32 elements and compute dot with Q8_1
+        float block_sum = 0.0f;
+        for (int j = 0; j < 32; j++) {
+            int l = j % 32;
+            int r = sub_idx;  // 0,1,2,3
+            int qv;
+            if (r == 0)
+                qv = (int)((ql[l +  0] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
+            else if (r == 1)
+                qv = (int)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+            else if (r == 2)
+                qv = (int)((ql[l +  0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+            else
+                qv = (int)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+            
+            int is = l / 16;
+            int sc_idx = is + r * 2;
+            block_sum += (float)(sc[sc_idx] * qv) * (float)bq8.qs[j];
+        }
+        sumf += d8 * block_sum;
+    }
+    return __half2float(q6.d) * sumf;
+}
+
+// vec_dot_q5_K_q8_1 for one Q5_K block vs corresponding Q8_1 blocks
+__device__ inline float vec_dot_q5k_q8(const void * vq5, int q5_idx,
+                                        const BlockQ8_1 * q8, int q8_offset) {
+    // TODO: implement Q5_K version if needed
+    return 0.0f;
+}
+
 // ─── Warp-level reductions ───────────────────────────────────────────────────
 
 template <int W>
@@ -391,24 +482,74 @@ static void debug_probe_q6k_rows(FILE * fp, const char * phase, int step, int po
 
 // Q6_K matvec: direct dequantization matching ggml reference
 __global__ static void k_q6k_mt(const BlockQ6K * W, const float * x, float * y, int rb, int rc) {
+    __shared__ union {
+        float sh[256];
+        BlockQ8_1 q8[544];  // max 17408/32 = 544 blocks (~19.6KB)
+    } s;
     int row = blockIdx.x;
     if (row >= rc) return;
-    __shared__ float sh[256];
-    float sum = 0.0f;
-    const BlockQ6K * rp = W + (size_t)row * rb;
-    for (int b = 0; b < rb; ++b) {
-        const BlockQ6K & qb = rp[b];
-        for (int e = threadIdx.x; e < 256; e += 256) {
-            sum += q6k_val(qb, e) * x[b * 256 + e];
+    int tid = threadIdx.x;
+    int ncols = rb * 256;
+    int nb = ncols / 32;
+    
+    // Step 1: cooperatively quantize x to Q8_1 in shared memory
+    for (int b = tid; b < nb; b += blockDim.x) {
+        float amax = 0.0f;
+        for (int j = 0; j < 32; j++) {
+            float v = x[(size_t)b * 32 + j];
+            amax = fmaxf(amax, fabsf(v));
         }
+        float d = amax / 127.0f;
+        float id = d > 0.0f ? 1.0f / d : 0.0f;
+        int sum_ = 0;
+        for (int j = 0; j < 32; j++) {
+            int qi = (int)(rintf(x[(size_t)b * 32 + j] * id));
+            qi = max(-128, min(127, qi));
+            s.q8[b].qs[j] = (int8_t)qi;
+            sum_ += qi;
+        }
+        s.q8[b].d = __float2half(d);
+        s.q8[b].s = __float2half(d * (float)sum_);
     }
-    sh[threadIdx.x] = sum;
     __syncthreads();
-    for (int s = 128; s > 0; s >>= 1) {
-        if (threadIdx.x < s) { sh[threadIdx.x] += sh[threadIdx.x + s]; }
+    
+    // Step 2: each thread computes dot product with Q8_1 intermediate
+    float sumf = 0.0f;
+    for (int e = tid; e < ncols; e += blockDim.x) {
+        int wb = e / 256;
+        int we = e % 256;
+        int qb_idx = e / 32;
+        
+        float d6 = __half2float(W[(size_t)row * rb + wb].d);
+        float d8 = __half2float(s.q8[qb_idx].d);
+        int q8v = s.q8[qb_idx].qs[e % 32];
+        
+        const BlockQ6K & q6 = W[(size_t)row * rb + wb];
+        int n128 = we / 128;
+        int l    = we % 32;
+        int r    = (we % 128) / 32;
+        const uint8_t * ql = q6.ql + n128 * 64;
+        const uint8_t * qh = q6.qh + n128 * 32;
+        const int8_t  * sc = q6.scales + n128 * 8;
+        int qv;
+        if (r == 0) qv = (int)((ql[l +  0] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
+        else if (r == 1) qv = (int)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+        else if (r == 2) qv = (int)((ql[l +  0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+        else qv = (int)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+        int sc_idx = (l / 16) + r * 2;
+        int sc_val = sc[sc_idx];
+        sumf += d6 * d8 * (float)(sc_val * qv) * (float)q8v;
+    }
+    
+    // Reduction
+    __syncthreads();
+    s.sh[tid] = sumf;
+    __syncthreads();
+    for (int s_ = 128; s_ > 0; s_ >>= 1) {
+        if (tid < s_) { s.sh[tid] += s.sh[tid + s_]; }
         __syncthreads();
     }
-    if (threadIdx.x == 0) y[row] = sh[0];
+    if (tid == 0) y[row] = s.sh[0];
 }
 
 // ─── Q8_0 matvec ─────────────────────────────────────────────────────────────
