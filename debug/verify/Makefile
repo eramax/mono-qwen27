@@ -49,7 +49,7 @@ gen-ref:
 	   debug/verify/ref_logits.bin 2>/dev/null || true
 	@# Save reference intermediate tensors (SSM layer 0)
 	$(REF_DEBUG) -m $(GGUF) -p "give" -c 4096 -b 1 -ub 1 \
-		--tensor-filter "attn_norm-0|conv_output_silu-0|q_conv_predelta-0|attn_output-0|final_output-0|linear_attn_out-0|l_out-0|model.input_embed" \
+	--tensor-filter "attn_norm-0|conv_output_silu-0|q_conv_predelta-0|k_conv_predelta-0|attn_output-0|final_output-0|linear_attn_out-0|post_attention_norm-0|ffn_gate-0|ffn_up-0|ffn_mul-0|ffn_down-0|l_out-0|model.input_embed" \
 		> /tmp/ref_stdout.txt 2>/tmp/ref_stderr.txt
 	@cp /tmp/ref_stdout.txt debug/verify/ref_intermediates.txt 2>/dev/null || true
 	@echo "  Reference data ready."

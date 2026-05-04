@@ -11,7 +11,7 @@ import math
 import sys
 from pathlib import Path
 
-from trace_utils import extract_ref_tensor, get_debug_tensor, parse_debug_tsv
+from trace_utils import extract_ref_tensor_occurrences, get_debug_tensor, parse_debug_tsv
 
 
 def _summarize(label: str, values: list[float] | None) -> str:
@@ -39,20 +39,39 @@ if __name__ == "__main__":
     comparisons = [
         ("model.input_embed", ("embed", "h"), "Embedding"),
         ("attn_norm-0", ("ssm", "attn_norm"), "RMS norm"),
+        ("q_conv_predelta-0", ("ssm", "q_conv_predelta"), "Q conv pre-delta"),
+        ("k_conv_predelta-0", ("ssm", "k_conv_predelta"), "K conv pre-delta"),
         ("conv_output_silu-0", ("ssm", "conv"), "SSM conv+SiLU"),
         ("attn_output-0", ("ssm", "deltanet"), "DeltaNet output"),
-        ("final_output-0", ("ssm", "layer_out"), "Final reshape/output"),
+        ("final_output-0", ("ssm", "final_output"), "Final reshape/output"),
         ("linear_attn_out-0", ("ssm", "ssm_out"), "SSM output projection"),
+        ("post_attention_norm-0", ("ssm", "post_norm"), "FFN pre-norm"),
+        ("ffn_gate-0", ("ssm", "ffn_gate"), "FFN gate"),
+        ("ffn_up-0", ("ssm", "ffn_up"), "FFN up"),
+        ("ffn_out-0", ("ssm", "ffn_down"), "FFN down"),
         ("l_out-0", ("ssm", "post_ffn"), "Layer output"),
     ]
 
     for ref_name, (phase, gpu_name), desc in comparisons:
-        ref_vals = extract_ref_tensor(ref_text, ref_name)
         gpu_vals = None
         for key, vals in gpu_data.items():
             if key[0] == phase and key[4] == gpu_name and key[1] == 0 and key[2] == 0 and key[3] == 44883:
                 gpu_vals = vals
                 break
+        ref_candidates = extract_ref_tensor_occurrences(ref_text, ref_name)
+        ref_vals = None
+        if ref_candidates:
+            if gpu_vals and len(gpu_vals) > 0:
+                same_len = [vals for vals in ref_candidates if len(vals) == len(gpu_vals)]
+                if same_len:
+                    ref_vals = min(
+                        same_len,
+                        key=lambda vals: max(abs(vals[i] - gpu_vals[i]) for i in range(len(vals))),
+                    )
+                else:
+                    ref_vals = ref_candidates[0]
+            else:
+                ref_vals = ref_candidates[0]
 
         print(f"\n=== {desc} ===")
         print(f"Ref tensor: {ref_name}")

@@ -175,7 +175,7 @@ __global__ static void k_elem_sigmoid_mul(float * out, const float * sig, const 
 __global__ static void k_elem_swiglu(float * out, const float * up, int n) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
         float x = up[i];
-        out[i] = out[i] * (x / (1.0f + expf(-x)));
+        out[i] = (out[i] / (1.0f + expf(-out[i]))) * x;
     }
 }
 
@@ -1223,6 +1223,8 @@ extern "C" bool mono27b_engine_decode_step(
             if (debug_fp && pos == 0 && il < 4) {
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "q_norm", qb, MONO27B_TARGET_Q_DIM, 64);
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "k_norm", kb, MONO27B_TARGET_KV_DIM, 64);
+                debug_dump_vec(debug_fp, "attn", il, pos, tok, "q_conv_predelta", qb, MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K);
+                debug_dump_vec(debug_fp, "attn", il, pos, tok, "k_conv_predelta", kb, MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K);
             }
             TRACE("qkn");
 
@@ -1421,11 +1423,16 @@ extern "C" bool mono27b_engine_decode_step(
                 }
                 TRACE("grms");
                 k_elem_mul<<<(MONO27B_SSM_D_INNER + 255) / 256, 256>>>(h2, fb, MONO27B_SSM_D_INNER); TRACE("gmul2");
+                if (debug_fp && pos == 0 && il < 4) {
+                    debug_dump_vec(debug_fp, "ssm", il, pos, tok, "final_output", h2, MONO27B_SSM_D_INNER, MONO27B_SSM_D_INNER);
+                    debug_dump_vec(debug_fp, "ssm", il, pos, tok, "q_conv_predelta", qr, MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K);
+                    debug_dump_vec(debug_fp, "ssm", il, pos, tok, "k_conv_predelta", kr, MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K);
+                }
                 MV(L.ssm_out, h2, sb); TRACE("ssmo");
                 if (debug_fp && pos == 0 && il < 4) {
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "gate", fb, MONO27B_SSM_D_INNER);
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "rms_gated", h2, MONO27B_SSM_D_INNER, MONO27B_SSM_D_INNER);
-                    debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ssm_out", sb, MONO27B_TARGET_HIDDEN);
+                    debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ssm_out", sb, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
                 }
                 k_elem_copy<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h2, sb, MONO27B_TARGET_HIDDEN); TRACE("scp");
                 k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h2, h, MONO27B_TARGET_HIDDEN); TRACE("sadd");
@@ -1463,28 +1470,28 @@ extern "C" bool mono27b_engine_decode_step(
         ssm_ffn:
             l_rms(h, h2, WV(L.post_norm), MONO27B_TARGET_HIDDEN);
             if (debug_fp && pos == 0 && il < 4) {
-                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "post_norm", h, MONO27B_TARGET_HIDDEN);
+                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "post_norm", h, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
             }
             MV(L.ffn_gate, h, fb);
             if (debug_fp && pos == 0 && il < 4) {
-                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ffn_gate", fb, MONO27B_TARGET_FFN);
+                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ffn_gate", fb, MONO27B_TARGET_FFN, MONO27B_TARGET_FFN);
             }
             MV(L.ffn_up, h, kb);
             if (debug_fp && pos == 0 && il < 4) {
-                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ffn_up", kb, MONO27B_TARGET_FFN);
+                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ffn_up", kb, MONO27B_TARGET_FFN, MONO27B_TARGET_FFN);
             }
             k_elem_swiglu<<<(MONO27B_TARGET_FFN + 255) / 256, 256>>>(fb, kb, MONO27B_TARGET_FFN);
             { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d ffn: %s", il, cudaGetErrorString(e)); goto cleanup; } }
             if (debug_fp && pos == 0 && il < 4) {
-                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ffn_mul", fb, MONO27B_TARGET_FFN);
+                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ffn_mul", fb, MONO27B_TARGET_FFN, MONO27B_TARGET_FFN);
             }
             MV(L.ffn_down, fb, h);
             if (debug_fp && pos == 0 && il < 3) {
-                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ffn_down", h, MONO27B_TARGET_HIDDEN);
+                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ffn_down", h, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
             }
             k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h, h2, MONO27B_TARGET_HIDDEN);
             if (debug_fp && pos == 0 && il < 3) {
-                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "post_ffn", h, MONO27B_TARGET_HIDDEN);
+                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "post_ffn", h, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
             }
             ssm_i++;
         }

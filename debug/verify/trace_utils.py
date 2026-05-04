@@ -82,9 +82,33 @@ def extract_ref_tensor(text: str, tensor_name: str, occurrence: int = 0) -> Opti
     return [float(n) for n in nums] if nums else None
 
 
+def extract_ref_tensor_occurrences(text: str, tensor_name: str) -> List[List[float]]:
+    """Return all matching tensor dumps for a llama-style debug name."""
+
+    pattern = re.compile(r"^common_debug_cb_eval:\s+" + re.escape(tensor_name) + r"\b.*$", re.M)
+    matches = list(pattern.finditer(text))
+    out: List[List[float]] = []
+    for match in matches:
+        start = match.end()
+        end_match = re.search(r"^common_debug_cb_eval:\s+", text[start:], re.M)
+        end = start + end_match.start() if end_match else len(text)
+        block = text[start:end]
+        lines = []
+        for line in block.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("sum ="):
+                break
+            lines.append(line)
+        nums = _FLOAT_RE.findall("\n".join(lines))
+        if nums:
+            out.append([float(n) for n in nums])
+    return out
+
+
 def max_abs_diff(a: List[float], b: List[float]) -> float:
     n = min(len(a), len(b))
     if n == 0:
         return float("inf")
     return max(abs(a[i] - b[i]) for i in range(n))
-
