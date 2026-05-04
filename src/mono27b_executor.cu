@@ -1179,11 +1179,14 @@ extern "C" bool mono27b_engine_decode_step(
             l_rms(h2, h, WV(L.attn_norm), MONO27B_TARGET_HIDDEN);
             MV(L.wqkv, h2, sb);
             MV(L.wqkv_gate, h2, gb);
+            if (debug_fp && pos == 0 && il == 0) {
+                // Dump FULL wqkv_gate (6144) for Python comparison
+                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "wqkv_gate", gb, MONO27B_SSM_D_INNER, MONO27B_SSM_D_INNER);
+            }
             if (debug_fp && pos == 0 && il < 3) {
                 // Dump FULL attn_norm (h2) for verification (20KB)
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "attn_norm", h2, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "wqkv", sb, MONO27B_SSM_CONV_CH, 16);
-                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "wqkv_gate", gb, MONO27B_SSM_D_INNER, 16);
             }
 
             if (L.ssm_beta.ptr && L.ssm_alpha.ptr && L.ssm_dt_bias.ptr && L.ssm_a_log.ptr) {
