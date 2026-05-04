@@ -1346,7 +1346,7 @@ extern "C" bool mono27b_engine_decode_step(
 
     // Output norm + LM head
     l_rms(h2, h, WV(we->output_norm), MONO27B_TARGET_HIDDEN);
-    if (debug_fp && pos == 0) {
+    if (debug_fp) {
         cudaPointerAttributes attrs{};
         cudaError_t pa = cudaPointerGetAttributes(&attrs, h2);
         std::fprintf(debug_fp, "out\t%d\t%d\t%d\t%s\tptr\th2\t%p\t%s\n",
