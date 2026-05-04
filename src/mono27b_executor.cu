@@ -32,6 +32,12 @@ struct BlockQ5K {
     uint8_t qs[128];
 };
 
+struct BlockQ8K {
+    float d;
+    int8_t qs[256];
+    int16_t bsums[16];
+};
+
 struct BlockIQ4XS {
     __half d;
     uint16_t scales_h;
@@ -462,19 +468,24 @@ __global__ static void k_l2_norm_g(float * d, int gs, int ng) {
         if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
         __syncthreads();
     }
-    float inv = rsqrtf(sh[0] + 1e-10f);
+    float sum_sq = sh[0];
+    float inv = rsqrtf(fmaxf(sum_sq, MONO27B_RMS_EPS * MONO27B_RMS_EPS));
     for (int i = threadIdx.x; i < gs; i += blockDim.x) gd[i] *= inv;
 }
 
 // ─── M-RoPE ──────────────────────────────────────────────────────────────────
+// Qwen3.5 uses multi-section RoPE with sections [t, h, w, _] = [11, 11, 10, 0].
+// For text-only inference, only section 0 (text, 11 pairs = 22 dims) is rotated
+// with the token position; sections 1 and 2 use position 0 (no rotation).
+// total n_rot is the sum of all sections: 11+11+10+0 = 32 pairs = 64 dims.
 
-__global__ static void k_mrope(float * buf, int n_heads, int head_dim, int pos, int n_rot) {
+__global__ static void k_mrope(float * buf, int n_heads, int head_dim, int pos, int n_rot_section0) {
     int h = blockIdx.x;
     if (h >= n_heads) return;
     float * hd = buf + (size_t)h * head_dim;
-    for (int d = threadIdx.x * 2; d < n_rot; d += blockDim.x * 2) {
+    for (int d = threadIdx.x * 2; d < n_rot_section0; d += blockDim.x * 2) {
         if (d + 1 >= head_dim) break;
-        float theta = powf(MONO27B_TARGET_ROPE_THETA, -2.0f * d / (float)n_rot);
+        float theta = powf(MONO27B_TARGET_ROPE_THETA, -2.0f * d / (float)n_rot_section0);
         float c = cosf(theta * pos), s = sinf(theta * pos);
         float v0 = hd[d], v1 = hd[d + 1];
         hd[d] = v0 * c - v1 * s;
@@ -800,6 +811,9 @@ extern "C" bool mono27b_engine_load_weights(
             }
             if (t2 && t2->size_bytes) {
                 lw(gguf_data, data_offset, *t2, &l.ssm.wqkv_gate, error, error_cap, "wqkvg");
+                if (il == 0) fprintf(stderr, "DBG: wqkv_gate loaded for layer 0, type=%u, blocks=%u, rows=%u\n", t2->ggml_type, l.ssm.wqkv_gate.row_blocks, l.ssm.wqkv_gate.row_count);
+            } else {
+                if (il == 0) fprintf(stderr, "DBG: wqkv_gate NOT found for layer 0\n");
             }
             lw2("ssm_conv1d.weight", &l.ssm.ssm_conv1d, "sc1d");
             lw2("ssm_beta.weight", &l.ssm.ssm_beta, "sb");
@@ -1097,8 +1111,9 @@ extern "C" bool mono27b_engine_decode_step(
                         MONO27B_TARGET_HEAD_DIM, MONO27B_RMS_EPS);
             TRACE("qkn");
 
-            k_mrope<<<MONO27B_TARGET_N_HEAD, 64>>>(qb, MONO27B_TARGET_N_HEAD, MONO27B_TARGET_HEAD_DIM, pos, MONO27B_N_ROT_DIMS); TRACE("mq");
-            k_mrope<<<MONO27B_TARGET_N_KV_HEAD, 64>>>(kb, MONO27B_TARGET_N_KV_HEAD, MONO27B_TARGET_HEAD_DIM, pos, MONO27B_N_ROT_DIMS); TRACE("mk");
+            // M-RoPE: only rotate section 0 (text, 11 pairs = 22 dims) with token position
+            k_mrope<<<MONO27B_TARGET_N_HEAD, 64>>>(qb, MONO27B_TARGET_N_HEAD, MONO27B_TARGET_HEAD_DIM, pos, MONO27B_N_ROT_DIMS_S0); TRACE("mq");
+            k_mrope<<<MONO27B_TARGET_N_KV_HEAD, 64>>>(kb, MONO27B_TARGET_N_KV_HEAD, MONO27B_TARGET_HEAD_DIM, pos, MONO27B_N_ROT_DIMS_S0); TRACE("mk");
 
             for (int hh = 0; hh < MONO27B_TARGET_N_KV_HEAD; ++hh) {
                 size_t off = ((size_t)pos * MONO27B_TARGET_N_KV_HEAD + hh) * MONO27B_TARGET_HEAD_DIM;
@@ -1240,9 +1255,6 @@ extern "C" bool mono27b_engine_decode_step(
                     const float * w_norm = nullptr;
                     if (L.ssm_norm.ptr) {
                         w_norm = WV(L.ssm_norm);
-                        if (L.ssm_norm.row_blocks >= MONO27B_SSM_D_INNER) {
-                            w_norm += (size_t)r * MONO27B_SSM_HEAD_V;
-                        }
                     }
                     k_rms_norm_mulw<256><<<1, 256>>>(
                         gb + (size_t)r * MONO27B_SSM_HEAD_V,

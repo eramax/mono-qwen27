@@ -27,8 +27,10 @@ constexpr int MONO27B_SSM_HEAD_V    = MONO27B_SSM_D_INNER / MONO27B_SSM_DT_RANK;
 constexpr int MONO27B_SSM_HEAD_K    = MONO27B_SSM_D_STATE;
 constexpr int MONO27B_SSM_CONV_CH   = MONO27B_SSM_D_INNER + 2 * MONO27B_SSM_N_GROUP * MONO27B_SSM_D_STATE;
 
-// M-RoPE
+// M-RoPE: Qwen3.5 uses sections [text=11, height=11, width=10, extra=0] pairs = 64 total dims.
+// For text-only input, only the text section uses the token position.
 constexpr int MONO27B_N_ROT_DIMS = 64;
+constexpr int MONO27B_N_ROT_DIMS_S0 = 22; // section 0: 11 pairs * 2 = 22 dims
 
 struct Mono27BRuntimeLayout {
     size_t kv_bytes = 0;
