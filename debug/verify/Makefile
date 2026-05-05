@@ -6,6 +6,7 @@
 
 GGUF ?= /mnt/mydata/projects2/specfusion/model/Qwen3.6-27B-UD-Q4_K_XL.gguf
 PROMPT ?= give
+TEXT_PROMPT := give me 2 py example
 DEBUG ?= /tmp/mono_verify.debug.tsv
 
 # Auto-detect invocation: -f from project root vs cd'd into debug/verify
@@ -133,25 +134,23 @@ e2e: clean-data build gen-our gen-ref
 # =========================================================================
 gen-our-text:
 	@echo ""
-	@echo "=== Generating OUR text output (50 tokens) ==="
+	@echo "=== Generating OUR text output (500 tokens) ==="
 	@rm -f $(OUR_TEXT)
-	$(BUILD_BIN) -m $(GGUF) -p "$(PROMPT)" --gen 50 --ctx 4096 --seed 944990222 \
+	$(BUILD_BIN) -m $(GGUF) -p "$(TEXT_PROMPT)" --gen 500 --ctx 4096 --seed 944990222 \
 		--quiet --chat > $(OUR_TEXT) 2>/dev/null
 	@wc -c < $(OUR_TEXT) | xargs -I{} echo "  Our text saved to $(OUR_TEXT) ({} bytes)"
 
 gen-ref-text:
 	@echo ""
-	@echo "=== Generating REFERENCE text output (50 tokens, llama-completion) ==="
+	@echo "=== Generating REFERENCE text output (500 tokens, llama-completion) ==="
 	@rm -f $(REF_TEXT)
-	@echo "" | $(REF_COMPLETION) -m $(GGUF) -p "$(PROMPT)" -n 50 -c 4096 \
+	@echo "" | $(REF_COMPLETION) -m $(GGUF) -p "$(TEXT_PROMPT)" -n 500 -c 4096 \
 		--seed 944990222 -cnv --no-display-prompt \
 		-b 1 -ub 1 > $(REF_TEXT) 2>/dev/null
 	@wc -c < $(REF_TEXT) | xargs -I{} echo "  Ref text saved to $(REF_TEXT) ({} bytes)"
 
 compare-text:
-	@python3 $(SCRIPT_DIR)/compare_text.py $(OUR_TEXT) $(REF_TEXT); exit_code=$$?; \
-	if [ $$exit_code -eq 1 ]; then echo "  (differences are expected until model execution matches)"; exit 0; fi; \
-	exit $$exit_code
+	@python3 $(SCRIPT_DIR)/compare_text.py $(OUR_TEXT) $(REF_TEXT)
 
 e2e-text: clean-data build gen-our-text gen-ref-text compare-text
 

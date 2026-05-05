@@ -56,6 +56,12 @@ struct Mono27BGgufMetadata {
     std::string chat_template;
     std::vector<std::string> tokens;
     std::vector<std::string> merges;
+    uint32_t sampling_top_k = 0;
+    float sampling_top_p = 0.0f;
+    float sampling_temp = 0.0f;
+    bool has_sampling_top_k = false;
+    bool has_sampling_top_p = false;
+    bool has_sampling_temp = false;
     uint32_t vocab_size = 0;
     uint32_t merges_count = 0;
     uint32_t bos_id = 0;
@@ -63,6 +69,8 @@ struct Mono27BGgufMetadata {
     bool add_bos_token = false;
     uint32_t im_start_id = 0;
     uint32_t im_end_id = 0;
+    uint32_t think_id = 0;
+    uint32_t end_think_id = 0;
     uint32_t embedding_length = 0;
     uint32_t block_count = 0;
     uint32_t feed_forward_length = 0;

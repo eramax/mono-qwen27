@@ -125,7 +125,7 @@ static std::vector<int32_t> load_replay_tokens(const std::string & path) {
 
 static int sample_from_logits(std::vector<float> logits, const Mono27BGgufFile & gguf,
                               std::mt19937 & rng, int top_k, float top_p, float min_p,
-                              int * best_out) {
+                              float temperature, int * best_out) {
     const int n_vocab = static_cast<int>(logits.size());
     if (n_vocab == 0) return 0;
 
@@ -155,7 +155,11 @@ static int sample_from_logits(std::vector<float> logits, const Mono27BGgufFile &
     order.resize(top_k);
     std::sort(order.begin(), order.end(), cmp);
 
-    const float temp = 1.0f;
+    if (temperature <= 0.0f) {
+        return best;
+    }
+
+    const float temp = temperature;
     float max_logit = -std::numeric_limits<float>::infinity();
     for (int id : order) max_logit = std::max(max_logit, logits[id]);
 
@@ -230,9 +234,6 @@ int main(int argc, char ** argv) {
     }
     const bool quiet = args.quiet;
     std::mt19937 rng(args.seed);
-    const int top_k = 20;
-    const float top_p = 0.95f;
-    const float min_p = 0.05f;
 
     // Determine model file path
     std::string target_path = args.target_gguf;
@@ -266,6 +267,16 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "hparams mismatch\n");
         return 1;
     }
+    const int top_k = gguf.metadata.has_sampling_top_k
+        ? static_cast<int>(gguf.metadata.sampling_top_k)
+        : 40;
+    const float top_p = gguf.metadata.has_sampling_top_p
+        ? gguf.metadata.sampling_top_p
+        : 0.95f;
+    const float min_p = 0.05f;
+    const float temperature = gguf.metadata.has_sampling_temp
+        ? gguf.metadata.sampling_temp
+        : 0.8f;
 
     // mmap the GGUF file
     int fd = ::open(target_path.c_str(), O_RDONLY);
@@ -395,30 +406,9 @@ int main(int argc, char ** argv) {
         user_prompt.pop_back();
     }
 
-    // --chat: render prompt using GGUF chat_template to match llama.cpp behavior.
-    // Qwen3.6 template (from tokenizer.chat_template) renders:
-    //   per-user-message: <|im_start|>user\n{content}<|im_end|>\n
-    //   generation prompt: <|im_start|>assistant\n<think>\n
+    // --chat: render the same ChatML framing used by llama.cpp conversation mode.
     if (args.chat) {
-        const std::string & tmpl = gguf.metadata.chat_template;
-        // Extract generation-prompt suffix from template (after add_generation_prompt)
-        std::string gen_prompt = "<|im_start|>assistant\n<think>\n";
-        if (!tmpl.empty()) {
-            auto pos_gen = tmpl.find("add_generation_prompt");
-            if (pos_gen != std::string::npos) {
-                auto pos_start = tmpl.find("<|im_start|>", pos_gen);
-                if (pos_start != std::string::npos) {
-                    auto pos_think = tmpl.find("<think>", pos_start);
-                    auto pos_end = tmpl.find("{%- endif %}", pos_start);
-                    if (pos_think != std::string::npos && pos_think < pos_end) {
-                        gen_prompt = "<|im_start|>assistant\n<think>\n";
-                    } else {
-                        gen_prompt = "<|im_start|>assistant\n";
-                    }
-                }
-            }
-        }
-        user_prompt = "<|im_start|>user\n" + user_prompt + "\n<|im_end|>\n" + gen_prompt;
+        user_prompt = "<|im_start|>user\n" + user_prompt + "<|im_end|>\n<|im_start|>assistant\n";
     }
 
     std::vector<int32_t> prompt_ids;
@@ -542,7 +532,7 @@ int main(int argc, char ** argv) {
         } else if (args.greedy) {
             chosen = argmax_from_logits(logits_host, &best);
         } else {
-            chosen = sample_from_logits(logits_host, gguf, rng, top_k, top_p, min_p, &best);
+            chosen = sample_from_logits(logits_host, gguf, rng, top_k, top_p, min_p, temperature, &best);
         }
 
         if (trace) {

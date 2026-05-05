@@ -75,7 +75,7 @@ bool Mono27BTokenizer::load_from_blob(const std::string & blob_path,
     std::fclose(fp);
     for (int32_t i = 0; i < static_cast<int32_t>(vocab_.size()); ++i) {
         const std::string & token = vocab_[static_cast<size_t>(i)];
-        if (token.size() >= 4 && token.rfind("<|", 0) == 0) {
+        if (token.size() >= 4 && token.front() == '<' && token.back() == '>') {
             special_tokens_.emplace_back(token, i);
         }
     }

@@ -14,6 +14,9 @@ struct KvEntry {
     uint32_t arr_type = 0;
     uint64_t arr_n = 0;
     uint32_t u32 = 0;
+    int32_t i32 = 0;
+    float f32 = 0.0f;
+    double f64 = 0.0;
     std::string str;
     std::vector<std::string> arr_str;
 };
@@ -114,6 +117,15 @@ static bool read_kv_value(std::FILE * fp, KvEntry & kv, std::string & error) {
     if (kv.type == MONO27B_GGUF_TYPE_UINT32) {
         return read_scalar(fp, kv.u32, error, "gguf u32");
     }
+    if (kv.type == MONO27B_GGUF_TYPE_INT32) {
+        return read_scalar(fp, kv.i32, error, "gguf i32");
+    }
+    if (kv.type == MONO27B_GGUF_TYPE_FLOAT32) {
+        return read_scalar(fp, kv.f32, error, "gguf f32");
+    }
+    if (kv.type == MONO27B_GGUF_TYPE_FLOAT64) {
+        return read_scalar(fp, kv.f64, error, "gguf f64");
+    }
     if (kv.type == MONO27B_GGUF_TYPE_STRING) {
         return read_string(fp, kv.str, error, "gguf string");
     }
@@ -186,13 +198,40 @@ static void fill_metadata(const std::unordered_map<std::string, KvEntry> & kvs,
                           Mono27BGgufMetadata & out) {
     auto get_u32 = [&](const std::string & key, uint32_t def = 0) -> uint32_t {
         const auto it = kvs.find(key);
-        return it != kvs.end() && it->second.type == MONO27B_GGUF_TYPE_UINT32 ? it->second.u32 : def;
+        if (it == kvs.end()) return def;
+        if (it->second.type == MONO27B_GGUF_TYPE_UINT32) return it->second.u32;
+        if (it->second.type == MONO27B_GGUF_TYPE_INT32 && it->second.i32 >= 0) {
+            return static_cast<uint32_t>(it->second.i32);
+        }
+        return def;
+    };
+    auto get_f32 = [&](const std::string & key, float def = 0.0f) -> float {
+        const auto it = kvs.find(key);
+        if (it == kvs.end()) return def;
+        if (it->second.type == MONO27B_GGUF_TYPE_FLOAT32) return it->second.f32;
+        if (it->second.type == MONO27B_GGUF_TYPE_FLOAT64) return static_cast<float>(it->second.f64);
+        return def;
     };
     auto get_str = [&](const std::string & key) -> std::string {
         const auto it = kvs.find(key);
         return it != kvs.end() && it->second.type == MONO27B_GGUF_TYPE_STRING ? it->second.str : std::string();
     };
     out.chat_template = get_str("tokenizer.chat_template");
+    if (const auto it = kvs.find("general.sampling.top_k"); it != kvs.end() &&
+        (it->second.type == MONO27B_GGUF_TYPE_UINT32 || it->second.type == MONO27B_GGUF_TYPE_INT32)) {
+        out.sampling_top_k = it->second.type == MONO27B_GGUF_TYPE_UINT32
+            ? it->second.u32
+            : static_cast<uint32_t>(std::max<int32_t>(0, it->second.i32));
+        out.has_sampling_top_k = true;
+    }
+    if (const auto it = kvs.find("general.sampling.top_p"); it != kvs.end()) {
+        out.sampling_top_p = get_f32("general.sampling.top_p");
+        out.has_sampling_top_p = true;
+    }
+    if (const auto it = kvs.find("general.sampling.temp"); it != kvs.end()) {
+        out.sampling_temp = get_f32("general.sampling.temp");
+        out.has_sampling_temp = true;
+    }
     const auto it_tokens = kvs.find("tokenizer.ggml.tokens");
     if (it_tokens != kvs.end()) {
         out.tokens = it_tokens->second.arr_str;
@@ -203,6 +242,12 @@ static void fill_metadata(const std::unordered_map<std::string, KvEntry> & kvs,
             }
             if (it_tokens->second.arr_str[i] == "<|im_end|>") {
                 out.im_end_id = static_cast<uint32_t>(i);
+            }
+            if (it_tokens->second.arr_str[i] == "<think>") {
+                out.think_id = static_cast<uint32_t>(i);
+            }
+            if (it_tokens->second.arr_str[i] == "</think>") {
+                out.end_think_id = static_cast<uint32_t>(i);
             }
         }
     }

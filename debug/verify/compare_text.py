@@ -115,9 +115,6 @@ def main():
     if exact:
         print("  Status: MATCH")
         ret = 0
-    elif similarity > 0.95:
-        print("  Status: PARTIAL (high similarity, possible minor numeric drift)")
-        ret = 0
     else:
         print("  Status: DIFFERS")
         ret = 1
