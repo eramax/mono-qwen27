@@ -114,10 +114,13 @@ Adapter functions will convert our `WeightView` + `float*` input vector → `Ggm
 
 ### Implementation Order
 
-1. **Step 1: DeltaNet kernel** (smallest, highest impact per line)
-   - Copy `gated_delta_net_cuda` from `gated_delta_net.cu`
-   - Replace `ggml_tensor` stride logic with our flat array indexing
-   - Verify correlation improvement
+1. **~~Step 1: DeltaNet kernel~~ ✅ DONE** (smallest, highest impact per line)
+   - Copied `gated_delta_net_cuda` from `gated_delta_net.cu`
+   - Replaced `ggml_tensor` stride logic with our flat array indexing + grouped q/k indexing (`g_idx = h_idx / (dr / ng)`)
+   - Added `k_deltanet_ggml` kernel with warp-level `warp_reduce_sum<32>` primitives
+   - Added `k_deltanet_ggml_launch` wrapper dispatching `S_v=128, KDA=false`
+   - Standalone test passes: max_diff = 1.1e-08 against CPU reference
+   - Removed old `k_deltanet` element-wise kernel
 
 2. **Step 2: Q8_1 quantizer + Q5_K matmul**
    - Add `k_quant_q8_1` kernel (already have a version; replace with ggml's exact implementation)

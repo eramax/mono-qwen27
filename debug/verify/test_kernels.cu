@@ -168,6 +168,149 @@ __global__ static void k_deltanet(
     out[(size_t)r_idx * hv + col] = attn * (1.0f / sqrtf((float)hv));
 }
 
+// ─── ggml-style warp-level DeltaNet (matches gated_delta_net.cu) ────────────
+
+template <int W>
+__device__ float warp_reduce_sum(float v) {
+    #pragma unroll
+    for (int s = W / 2; s > 0; s >>= 1) v += __shfl_xor_sync(0xFFFFFFFF, v, s);
+    return v;
+}
+
+template <int S_v, bool KDA>
+__global__ void __launch_bounds__(128, 2)
+k_deltanet_ggml(
+    const float * q, const float * k, const float * v,
+    const float * g, const float * beta,
+    const float * curr_state,
+    float * out, float * state,
+    int ng, int dr, int hv, int hk)
+{
+    const uint32_t h_idx = blockIdx.x;
+    const int      lane  = threadIdx.x;
+    const int      col   = blockIdx.z * blockDim.y + threadIdx.y;
+
+    if (h_idx >= dr || col >= hv) return;
+
+    const int g_idx = h_idx / (dr / ng);
+
+    const size_t state_offset = (size_t)h_idx * hv * hk;
+    const float * cs = curr_state + state_offset + col * hk;
+    float *       ws = state + state_offset;
+
+    const float * qg = q + (size_t)g_idx * hk;
+    const float * kg = k + (size_t)g_idx * hk;
+    const float * vr = v + (size_t)h_idx * hv + col;
+
+    const float beta_val = beta[h_idx];
+    const float * g_ptr  = g + h_idx;
+
+    constexpr int warp_size = 32;
+    static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
+    constexpr int rows_per_lane = S_v / warp_size;
+    float s_shard[rows_per_lane];
+
+#pragma unroll
+    for (int r = 0; r < rows_per_lane; r++) {
+        const int i = r * warp_size + lane;
+        s_shard[r] = cs[i];
+    }
+
+    if constexpr (!KDA) {
+        const float g_val = expf(*g_ptr);
+
+        float k_reg[rows_per_lane];
+        float q_reg[rows_per_lane];
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i = r * warp_size + lane;
+            k_reg[r] = kg[i];
+            q_reg[r] = qg[i];
+        }
+
+        float kv_shard = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            kv_shard += s_shard[r] * k_reg[r];
+        }
+        float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+
+        float delta_col = (*vr - g_val * kv_col) * beta_val;
+
+        float attn_partial = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            s_shard[r] = g_val * s_shard[r] + k_reg[r] * delta_col;
+            attn_partial += s_shard[r] * q_reg[r];
+        }
+
+        float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+
+        if (lane == 0) {
+            out[(size_t)h_idx * hv + col] = attn_col * (1.0f / sqrtf((float)hk));
+        }
+    } else {
+        float k_reg[rows_per_lane];
+        float q_reg[rows_per_lane];
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i = r * warp_size + lane;
+            k_reg[r] = kg[i];
+            q_reg[r] = qg[i];
+        }
+
+        float kv_shard = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i = r * warp_size + lane;
+            kv_shard += expf(g_ptr[i]) * s_shard[r] * k_reg[r];
+        }
+
+        float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+
+        float delta_col = (*vr - kv_col) * beta_val;
+
+        float attn_partial = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i = r * warp_size + lane;
+            s_shard[r] = expf(g_ptr[i]) * s_shard[r] + k_reg[r] * delta_col;
+            attn_partial += s_shard[r] * q_reg[r];
+        }
+
+        float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+
+        if (lane == 0) {
+            out[(size_t)h_idx * hv + col] = attn_col * (1.0f / sqrtf((float)hk));
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < rows_per_lane; r++) {
+        const int i = r * warp_size + lane;
+        ws[col * hk + i] = s_shard[r];
+    }
+}
+
+static void k_deltanet_ggml_launch(
+    const float * q, const float * k, const float * v,
+    const float * g, const float * beta,
+    const float * curr_state,
+    float * out, float * state,
+    int ng, int dr, int hv, int hk)
+{
+    constexpr int warp_size = 32;
+    constexpr int num_warps = 4;
+    constexpr int S_v = 128;
+
+    dim3 grid_dims(dr, 1, (S_v + num_warps - 1) / num_warps);
+    dim3 block_dims(warp_size, num_warps, 1);
+
+    k_deltanet_ggml<S_v, false><<<grid_dims, block_dims>>>(
+        q, k, v, g, beta, curr_state, out, state,
+        ng, dr, hv, hk);
+}
+
 // ─── Test harness ───────────────────────────────────────────────────────────
 static bool test_l2_norm() {
     const int n_groups = 16;
@@ -291,12 +434,57 @@ static bool test_deltanet() {
     return max_diff < 1e-4;
 }
 
+static bool test_deltanet_ggml() {
+    const int ng = 16, dr = 48, hv = 128, hk = 128;
+    const int n_qk = ng * hk;
+    const int n_v = dr * hv;
+    const int state_sz = dr * hv * hk;
+    std::vector<float> h_q(n_qk), h_k(n_qk), h_v(n_v), h_g(dr), h_b(dr);
+    std::vector<float> h_state(state_sz), h_ref(n_v), h_gpu(n_v);
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    for (auto & x : h_q) x = dist(rng);
+    for (auto & x : h_k) x = dist(rng);
+    for (auto & x : h_v) x = dist(rng);
+    for (auto & x : h_g) x = dist(rng) * 0.1f;
+    for (auto & x : h_b) x = dist(rng);
+    for (auto & x : h_state) x = 0.0f;
+
+    std::vector<float> state_ref = h_state;
+    deltanet_ref(h_q.data(), h_k.data(), h_v.data(), h_g.data(), h_b.data(),
+                 state_ref.data(), h_ref.data(), ng, dr, hv, hk);
+
+    float *d_q, *d_k, *d_v, *d_g, *d_b, *d_state, *d_out;
+    cudaMalloc(&d_q, n_qk * sizeof(float));
+    cudaMalloc(&d_k, n_qk * sizeof(float));
+    cudaMalloc(&d_v, n_v * sizeof(float));
+    cudaMalloc(&d_g, dr * sizeof(float));
+    cudaMalloc(&d_b, dr * sizeof(float));
+    cudaMalloc(&d_state, state_sz * sizeof(float));
+    cudaMalloc(&d_out, n_v * sizeof(float));
+    cudaMemcpy(d_q, h_q.data(), n_qk * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, h_k.data(), n_qk * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, h_v.data(), n_v * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_g, h_g.data(), dr * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_b, h_b.data(), dr * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_state, h_state.data(), state_sz * sizeof(float), cudaMemcpyHostToDevice);
+    k_deltanet_ggml_launch(d_q, d_k, d_v, d_g, d_b, d_state, d_out, d_state, ng, dr, hv, hk);
+    cudaMemcpy(h_gpu.data(), d_out, n_v * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_g); cudaFree(d_b); cudaFree(d_state); cudaFree(d_out);
+
+    double max_diff = 0.0;
+    for (int i = 0; i < n_v; ++i) max_diff = std::max(max_diff, (double)std::fabs(h_ref[i] - h_gpu[i]));
+    printf("DeltaNet ggml:    max_diff = %.9g %s\n", max_diff, max_diff < 1e-4 ? "PASS" : "FAIL");
+    return max_diff < 1e-4;
+}
+
 int main() {
     bool ok = true;
     ok &= test_l2_norm();
     ok &= test_rms_norm();
     ok &= test_conv1d_silu();
     ok &= test_deltanet();
+    ok &= test_deltanet_ggml();
     printf("\n%s\n", ok ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return ok ? 0 : 1;
 }

@@ -697,43 +697,155 @@ __global__ static void k_ssm_conv1d_u_f16(const float * inp, const __half * w, f
     out[ch] = s;
 }
 
-// ─── Gated DeltaNet (1 thread per rank, column) ─────────────────────────────
+// ─── Gated DeltaNet (ggml-style warp-level parallelism) ──────────────────────
+// Ported from llama.cpp/ggml/src/ggml-cuda/gated_delta_net.cu
+// Uses warp-level primitives for exact numerical parity.
 
-__global__ static void k_deltanet(
+template <int S_v, bool KDA>
+__global__ void __launch_bounds__(128, 2)
+k_deltanet_ggml(
     const float * q, const float * k, const float * v,
     const float * g, const float * beta,
-    float * state, float * out,
+    const float * curr_state,
+    float * out, float * state,
     int ng, int dr, int hv, int hk)
 {
-    int r_idx = blockIdx.x;  // [0..dr)
-    int col   = blockIdx.y;  // [0..hv)
-    if (r_idx >= dr || col >= hv) return;
+    const uint32_t h_idx = blockIdx.x;   // rank index [0, dr)
+    const int      lane  = threadIdx.x;  // [0, 31)
+    const int      col   = blockIdx.z * blockDim.y + threadIdx.y;  // [0, hv)
 
-    int g_idx = r_idx / (dr / ng);
+    if (h_idx >= dr || col >= hv) return;
 
-    float gv = expf(g[r_idx]);
-    float bv = beta[r_idx];
+    const int g_idx = h_idx / (dr / ng);  // group index for shared q/k
+
+    const size_t state_offset = (size_t)h_idx * hv * hk;
+    const float * cs = curr_state + state_offset + col * hk;
+    float *       ws = state + state_offset;
 
     const float * qg = q + (size_t)g_idx * hk;
     const float * kg = k + (size_t)g_idx * hk;
-    const float * vr = v + (size_t)r_idx * hv + col;
+    const float * vr = v + (size_t)h_idx * hv + col;
 
-    // State is stored transposed: M[col][i] = S[i][col], row col is contiguous
-    // Flat layout: state[base + col * hk + i] = S[i][col]
-    float * S = state + (size_t)r_idx * hv * hk + col * (size_t)hk;
+    const float beta_val = beta[h_idx];
+    const float * g_ptr  = g + h_idx;
 
-    float kv = 0.0f;
-    for (int i = 0; i < hk; ++i) kv += S[i] * kg[i];
-    float delta = (*vr - gv * kv) * bv;
+    constexpr int warp_size = 32;
+    static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
+    constexpr int rows_per_lane = S_v / warp_size;
+    float s_shard[rows_per_lane];
 
-    float attn = 0.0f;
-    for (int i = 0; i < hk; ++i) {
-        float sn = gv * S[i] + kg[i] * delta;
-        S[i] = sn;
-        attn += sn * qg[i];
+    // Load state (transposed: S[i][col] is contiguous in col)
+#pragma unroll
+    for (int r = 0; r < rows_per_lane; r++) {
+        const int i = r * warp_size + lane;
+        s_shard[r] = cs[i];
     }
 
-    out[(size_t)r_idx * hv + col] = attn * (1.0f / sqrtf((float)hv));
+    if constexpr (!KDA) {
+        const float g_val = expf(*g_ptr);
+
+        // Cache k and q in registers
+        float k_reg[rows_per_lane];
+        float q_reg[rows_per_lane];
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i = r * warp_size + lane;
+            k_reg[r] = kg[i];
+            q_reg[r] = qg[i];
+        }
+
+        // kv[col] = sum_i S[i][col] * k[i]
+        float kv_shard = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            kv_shard += s_shard[r] * k_reg[r];
+        }
+        float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+
+        // delta[col] = (v[col] - g * kv[col]) * beta
+        float delta_col = (*vr - g_val * kv_col) * beta_val;
+
+        // fused: S[i][col] = g * S[i][col] + k[i] * delta[col]
+        // attn[col] = sum_i S[i][col] * q[i]
+        float attn_partial = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            s_shard[r] = g_val * s_shard[r] + k_reg[r] * delta_col;
+            attn_partial += s_shard[r] * q_reg[r];
+        }
+
+        float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+
+        if (lane == 0) {
+            out[(size_t)h_idx * hv + col] = attn_col * (1.0f / sqrtf((float)hk));
+        }
+    } else {
+        // KDA path (g is per-element vector, not used in Mono27B)
+        float k_reg[rows_per_lane];
+        float q_reg[rows_per_lane];
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i = r * warp_size + lane;
+            k_reg[r] = kg[i];
+            q_reg[r] = qg[i];
+        }
+
+        // kv[col] = sum_i exp(g[i]) * S[i][col] * k[i]
+        float kv_shard = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i = r * warp_size + lane;
+            kv_shard += expf(g_ptr[i]) * s_shard[r] * k_reg[r];
+        }
+
+        float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+
+        // delta[col] = (v[col] - kv[col]) * beta
+        float delta_col = (*vr - kv_col) * beta_val;
+
+        // fused: S[i][col] = exp(g[i]) * S[i][col] + k[i] * delta[col]
+        // attn[col] = sum_i S[i][col] * q[i]
+        float attn_partial = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i = r * warp_size + lane;
+            s_shard[r] = expf(g_ptr[i]) * s_shard[r] + k_reg[r] * delta_col;
+            attn_partial += s_shard[r] * q_reg[r];
+        }
+
+        float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+
+        if (lane == 0) {
+            out[(size_t)h_idx * hv + col] = attn_col * (1.0f / sqrtf((float)hk));
+        }
+    }
+
+    // Write state back to global memory (transposed layout)
+#pragma unroll
+    for (int r = 0; r < rows_per_lane; r++) {
+        const int i = r * warp_size + lane;
+        ws[col * hk + i] = s_shard[r];
+    }
+}
+
+static void k_deltanet_ggml_launch(
+    const float * q, const float * k, const float * v,
+    const float * g, const float * beta,
+    const float * curr_state,
+    float * out, float * state,
+    int ng, int dr, int hv, int hk)
+{
+    constexpr int warp_size = 32;
+    constexpr int num_warps = 4;
+    constexpr int S_v = 128;  // MONO27B_SSM_HEAD_V / HEAD_K
+
+    dim3 grid_dims(dr, 1, (S_v + num_warps - 1) / num_warps);
+    dim3 block_dims(warp_size, num_warps, 1);
+
+    // Our model uses scalar g (KDA=false)
+    k_deltanet_ggml<S_v, false><<<grid_dims, block_dims>>>(
+        q, k, v, g, beta, curr_state, out, state,
+        ng, dr, hv, hk);
 }
 
 // ─── Quant info helpers ──────────────────────────────────────────────────────
@@ -1399,8 +1511,8 @@ extern "C" bool mono27b_engine_decode_step(
 
                 // Gated DeltaNet
                 if (st->ssm_state[ssm_i]) {
-                    dim3 dg(MONO27B_SSM_DT_RANK, MONO27B_SSM_HEAD_V, 1);
-                    k_deltanet<<<dg, 1>>>(qr, kr, vr, qb, kb, st->ssm_state[ssm_i], gb,
+                    k_deltanet_ggml_launch(qr, kr, vr, qb, kb,
+                        st->ssm_state[ssm_i], gb, st->ssm_state[ssm_i],
                         MONO27B_SSM_N_GROUP, MONO27B_SSM_DT_RANK,
                         MONO27B_SSM_HEAD_V, MONO27B_SSM_HEAD_K);
                     { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d deltanet: %s", il, cudaGetErrorString(e)); goto cleanup; } }
