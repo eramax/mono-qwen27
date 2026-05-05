@@ -875,15 +875,6 @@ __global__ static void k_l2_norm_g(float * d, int gs, int ng) {
 // and applies RoPE across all 64 rotary dims using sections [11, 11, 10, 0]
 // in pair units.
 
-// Device-side parameter pointers for CUDA graph replay.
-// Initialize once, update device memory between replays.
-__device__ int g_mrope_pos_t = 0;
-__device__ int g_mrope_pos_h = 0;
-__device__ int g_mrope_pos_w = 0;
-__device__ int g_mrope_pos_x = 0;
-__device__ int g_attn_kv_len = 0;
-__device__ int g_embed_token_id = 0;
-
 __global__ static void k_mrope(
     float * buf, int n_heads, int head_dim,
     int pos_t, int pos_h, int pos_w, int pos_x,
@@ -1503,8 +1494,6 @@ extern "C" bool mono27b_engine_init_state(int max_ctx, Mono27BExecutorState * st
     { cudaStream_t _s = nullptr; if (cudaStreamCreate(&_s) == cudaSuccess) state->stream1 = (void*)_s; }
     { cudaEvent_t _e = nullptr; if (cudaEventCreate(&_e) == cudaSuccess) state->sync_event = (void*)_e; }
 
-    // Graph fields removed; reserved for future use
-
     state->kv_len = 0;
     return true;
 fail:
@@ -1546,6 +1535,8 @@ static void l_q6k(const BlockQ6K * W, int rb, int rc, const float * x, float * y
 // File-scope pointer to Q8_1 scratch buffer (set by engine before decode step)
 static BlockQ8_1 * g_q8_scratch = nullptr;
 
+// Device-side parameters for CUDA graph replay. Updated via cudaMemcpyToSymbol
+// before each decode_step. Kernels read these to override scalar parameters.
 // Forward declarations
 static void l_mv_q8(void * W, uint32_t ggml_type, int rb, int rc, float * y);
 static void l_mv_fallback(void * W, uint32_t ggml_type, int rb, int rc, const float * x, float * y);
@@ -1779,10 +1770,7 @@ extern "C" bool mono27b_engine_decode_step(
     }
     TRACE("emb");
 
-    // CUDA graph replay is FUTURE WORK.
-    // The KV cache write position changes each step, making graph capture
-    // impractical without kernel modifications. Disabled for now.
-    bool capture_started = false;
+
 
     // Only run first 4 layers to debug
     // Skip all layers to isolate LM head issue
