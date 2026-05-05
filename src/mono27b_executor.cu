@@ -1053,7 +1053,7 @@ k_deltanet_ggml(
 
     if (h_idx >= dr || col >= hv) return;
 
-    const int g_idx = h_idx / (dr / ng);  // group index for shared q/k
+    const int g_idx = h_idx % ng;  // group index for shared q/k
 
     const size_t state_offset = (size_t)h_idx * hv * hk;
     const float * cs = curr_state + state_offset + col * hk;
