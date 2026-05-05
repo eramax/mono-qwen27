@@ -413,6 +413,7 @@ int main(int argc, char ** argv) {
     int pos = 0;
     int last_tok = 0;
     std::vector<int32_t> generated;
+    std::vector<float> last_prompt_logits;
     std::ofstream trace;
     std::FILE * debug_fp = nullptr;
     std::vector<int32_t> replay_tokens = load_replay_tokens(args.replay_trace_path);
@@ -465,30 +466,40 @@ int main(int argc, char ** argv) {
             trace.flush();
         }
         std::fprintf(stderr, "[prompt %zu] top1=%d max=%.4f\n", i, best, logits_host[best]);
+        if (i == prompt_ids.size() - 1) {
+            last_prompt_logits = std::move(logits_host);
+        }
         mono27b_engine_free_logits(&logits);
     }
 
-    // Generate tokens
+    // Generate tokens — step 0 reuses logits from last prompt token (matching llama.cpp).
     pos = static_cast<int>(prompt_ids.size());
     last_tok = prompt_ids.empty() ? 0 : prompt_ids.back();
 
     for (int step = 0; step < std::max(1, args.max_gen); ++step) {
-        Mono27BLogitsOutput logits{};
-        if (!mono27b_engine_decode_step(&gpu_weights, &state,
-                                         last_tok, pos,
-                                         &logits, debug_fp, args.debug_pos, errbuf, sizeof(errbuf))) {
-            std::fprintf(stderr, "step error at gen %d: %s\n", step, errbuf);
+        std::vector<float> logits_host;
+
+        if (step == 0 && !last_prompt_logits.empty()) {
+            logits_host = std::move(last_prompt_logits);
+        } else {
+            Mono27BLogitsOutput logits{};
+            if (!mono27b_engine_decode_step(&gpu_weights, &state,
+                                             last_tok, pos,
+                                             &logits, debug_fp, args.debug_pos, errbuf, sizeof(errbuf))) {
+                std::fprintf(stderr, "step error at gen %d: %s\n", step, errbuf);
+                mono27b_engine_free_logits(&logits);
+                goto cleanup;
+            }
+            logits_host.resize(MONO27B_TARGET_VOCAB);
+            cudaError_t copy_err = cudaMemcpy(logits_host.data(), logits.logits,
+                                              MONO27B_TARGET_VOCAB * sizeof(float), cudaMemcpyDeviceToHost);
+            if (copy_err != cudaSuccess) {
+                std::fprintf(stderr, "step %d logits copy error: %s\n", step, cudaGetErrorString(copy_err));
+            }
             mono27b_engine_free_logits(&logits);
-            goto cleanup;
+            pos++;
         }
 
-        // Download logits and find argmax
-        std::vector<float> logits_host(MONO27B_TARGET_VOCAB);
-        cudaError_t copy_err = cudaMemcpy(logits_host.data(), logits.logits,
-                                          MONO27B_TARGET_VOCAB * sizeof(float), cudaMemcpyDeviceToHost);
-        if (copy_err != cudaSuccess) {
-            std::fprintf(stderr, "step %d logits copy error: %s\n", step, cudaGetErrorString(copy_err));
-        }
         int best = 0;
         int chosen = -1;
         if (step < static_cast<int>(replay_tokens.size())) {
@@ -507,13 +518,11 @@ int main(int argc, char ** argv) {
         }
 
         std::fprintf(stderr, "[step %d] top1=%d max=%.4f chosen=%d\n", step, best, logits_host[best], chosen);
-        mono27b_engine_free_logits(&logits);
 
         if (tokenizer.is_terminal(chosen)) break;
 
         generated.push_back(chosen);
         last_tok = chosen;
-        pos++;
     }
 
     // Decode and output
