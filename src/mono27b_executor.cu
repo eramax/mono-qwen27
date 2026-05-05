@@ -502,6 +502,28 @@ static __host__ __device__ inline float ggml_fp16_to_fp32(uint16_t h) {
     return result_bits.f;
 }
 
+// ─── Batched RMS norm (fuses N independent row norms into one launch) ─────────
+// Each block handles one row. Grid = N blocks.
+__global__ static void k_rms_norm_mulw_batched(
+    const float * __restrict__ x, const float * __restrict__ w, float * __restrict__ y,
+    int row_len, int n_rows, float eps)
+{
+    int row = blockIdx.x;
+    if (row >= n_rows) return;
+    const float * xr = x + (size_t)row * row_len;
+    float * yr = y + (size_t)row * row_len;
+    __shared__ double sh[256];
+    double sum = 0.0;
+    for (int i = threadIdx.x; i < row_len; i += 256) sum += (double)xr[i] * (double)xr[i];
+    sh[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) { if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s]; __syncthreads(); }
+    double total = sh[0];
+    double scale = 1.0 / sqrt(total / (double)row_len + (double)eps);
+    for (int i = threadIdx.x; i < row_len; i += 256)
+        yr[i] = (float)((double)xr[i] * scale * (double)(w ? w[i] : 1.0f));
+}
+
 // ─── Elementwise kernels ─────────────────────────────────────────────────────
 
 __global__ static void k_elem_add(float * a, const float * b, int n) {
@@ -1836,15 +1858,11 @@ extern "C" bool mono27b_engine_decode_step(
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "v_proj", kb + MONO27B_TARGET_KV_DIM, MONO27B_TARGET_KV_DIM);
             }
             if (L.q_norm.ptr)
-                for (int hh = 0; hh < MONO27B_TARGET_N_HEAD; ++hh)
-                    k_rms_norm_mulw<256><<<1, 256>>>(qb + hh * MONO27B_TARGET_HEAD_DIM,
-                        WV(L.q_norm), qb + hh * MONO27B_TARGET_HEAD_DIM,
-                        MONO27B_TARGET_HEAD_DIM, MONO27B_RMS_EPS);
+                k_rms_norm_mulw_batched<<<MONO27B_TARGET_N_HEAD, 256>>>(
+                    qb, WV(L.q_norm), qb, MONO27B_TARGET_HEAD_DIM, MONO27B_TARGET_N_HEAD, MONO27B_RMS_EPS);
             if (L.k_norm.ptr)
-                for (int hh = 0; hh < MONO27B_TARGET_N_KV_HEAD; ++hh)
-                    k_rms_norm_mulw<256><<<1, 256>>>(kb + hh * MONO27B_TARGET_HEAD_DIM,
-                        WV(L.k_norm), kb + hh * MONO27B_TARGET_HEAD_DIM,
-                        MONO27B_TARGET_HEAD_DIM, MONO27B_RMS_EPS);
+                k_rms_norm_mulw_batched<<<MONO27B_TARGET_N_KV_HEAD, 256>>>(
+                    kb, WV(L.k_norm), kb, MONO27B_TARGET_HEAD_DIM, MONO27B_TARGET_N_KV_HEAD, MONO27B_RMS_EPS);
             if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "q_norm", qb, MONO27B_TARGET_Q_DIM, 64);
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "k_norm", kb, MONO27B_TARGET_KV_DIM, 64);
@@ -2034,19 +2052,12 @@ extern "C" bool mono27b_engine_decode_step(
                 // Gate: wqkv_gate @ h2 → siLU → mul with rms_norm(ssm_out)
                 MV(L.wqkv_gate, h2, fb); TRACE("re-g");
                 k_elem_silu<<<(MONO27B_SSM_D_INNER + 255) / 256, 256>>>(fb, MONO27B_SSM_D_INNER); TRACE("g_silu");
-                // Use kb (17408 floats) as intermediate for gated norm output;
-                // h2 is only 5120 floats but the gated norm output is 6144 floats.
-                for (int r = 0; r < MONO27B_SSM_DT_RANK; ++r) {
-                    const float * w_norm = nullptr;
-                    if (L.ssm_norm.ptr) {
-                        w_norm = WV(L.ssm_norm);
-                    }
-                    k_rms_norm_mulw<256><<<1, 256>>>(
-                        gb + (size_t)r * MONO27B_SSM_HEAD_V,
-                        w_norm,
-                        kb + (size_t)r * MONO27B_SSM_HEAD_V,
-                        MONO27B_SSM_HEAD_V,
-                        MONO27B_RMS_EPS);
+                // Fused batched RMS norm for all 48 SSM heads in one kernel launch
+                // (was 48 individual launches — massive launch overhead)
+                {
+                    const float * w_norm = WV(L.ssm_norm);
+                    k_rms_norm_mulw_batched<<<MONO27B_SSM_DT_RANK, 256>>>(
+                        gb, w_norm, kb, MONO27B_SSM_HEAD_V, MONO27B_SSM_DT_RANK, MONO27B_RMS_EPS);
                 }
                 TRACE("grms");
                 k_elem_mul<<<(MONO27B_SSM_D_INNER + 255) / 256, 256>>>(kb, fb, MONO27B_SSM_D_INNER); TRACE("gmul2");
