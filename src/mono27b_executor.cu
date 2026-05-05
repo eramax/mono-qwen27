@@ -1633,17 +1633,12 @@ static void l_mv_pair(void * w1, uint32_t t1, int rb1, int rc1, float * y1,
                       const float * x, int rb, cudaStream_t stream1, cudaEvent_t sync_ev) {
     if (rc1 == 0 || !w1) { l_mv_quant(w2, t2, rb2, rc2, x, y2); return; }
     if (rc2 == 0 || !w2) { l_mv_quant(w1, t1, rb1, rc1, x, y1); return; }
-    // Both need Q8_1 path — quantize once
-    if (g_q8_scratch && rb * 8 <= 544 && stream1 && sync_ev) {
+    // Both need Q8_1 path — quantize once, then run both matvecs on same stream.
+    // No cudaStreamSynchronize needed since both are on stream 0.
+    if (g_q8_scratch && rb * 8 <= 544) {
         l_quant_q8(x, rb);
-        cudaEventRecord(sync_ev, 0);  // quantize done on stream 0
-        // Launch w1 on stream 0 (ordered after quantize)
         l_mv_q8_on(w1, t1, rb1, rc1, y1, 0);
-        // Launch w2 on stream 1 (waits for quantize via event)
-        cudaStreamWaitEvent(stream1, sync_ev, 0);
-        l_mv_q8_on(w2, t2, rb2, rc2, y2, stream1);
-        // Sync stream 1 so caller sees results
-        cudaStreamSynchronize(stream1);
+        l_mv_q8_on(w2, t2, rb2, rc2, y2, 0);
         return;
     }
     // Fallback: sequential
