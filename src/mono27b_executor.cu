@@ -875,6 +875,15 @@ __global__ static void k_l2_norm_g(float * d, int gs, int ng) {
 // and applies RoPE across all 64 rotary dims using sections [11, 11, 10, 0]
 // in pair units.
 
+// Device-side parameter pointers for CUDA graph replay.
+// Initialize once, update device memory between replays.
+__device__ int g_mrope_pos_t = 0;
+__device__ int g_mrope_pos_h = 0;
+__device__ int g_mrope_pos_w = 0;
+__device__ int g_mrope_pos_x = 0;
+__device__ int g_attn_kv_len = 0;
+__device__ int g_embed_token_id = 0;
+
 __global__ static void k_mrope(
     float * buf, int n_heads, int head_dim,
     int pos_t, int pos_h, int pos_w, int pos_x,
@@ -993,7 +1002,6 @@ __global__ static void k_attn_parallel(
     float * or_ = O + (size_t)qh * hd;
     size_t pos_stride = (size_t)n_kvh * hd;
     int t = threadIdx.x;
-
     // Shared memory: scores[kv_len] + max_val[1] + sum_exp[1] + scratch[256]
     extern __shared__ float smem[];
     float * scores  = smem;
@@ -1488,6 +1496,11 @@ extern "C" bool mono27b_engine_init_state(int max_ctx, Mono27BExecutorState * st
       cudaError_t eq = cudaMalloc(&state->q8_scratch, q8_sz);
       if (eq != cudaSuccess) { state->q8_scratch = nullptr; } }
 
+    // CUDA graph state: initially empty
+    state->graph = nullptr;
+    state->graphExec = nullptr;
+    state->graph_captured = false;
+
     state->kv_len = 0;
     return true;
 fail:
@@ -1507,6 +1520,8 @@ extern "C" void mono27b_engine_free_state(Mono27BExecutorState * state) {
     }
     cudaFree(state->work_buf);
     if (state->q8_scratch) cudaFree(state->q8_scratch);
+    if (state->graphExec) { cudaGraphExecDestroy((cudaGraphExec_t)state->graphExec); state->graphExec = nullptr; }
+    if (state->graph) { cudaGraphDestroy((cudaGraph_t)state->graph); state->graph = nullptr; }
     std::memset(state, 0, sizeof(*state));
 }
 
@@ -1726,6 +1741,11 @@ extern "C" bool mono27b_engine_decode_step(
     }
     TRACE("emb");
 
+    // CUDA graph replay is FUTURE WORK.
+    // The KV cache write position changes each step, making graph capture
+    // impractical without kernel modifications. Disabled for now.
+    bool capture_started = false;
+
     // Only run first 4 layers to debug
     // Skip all layers to isolate LM head issue
     for (il = 0; il < MONO27B_TARGET_LAYERS; ++il) {
@@ -1810,7 +1830,9 @@ extern "C" bool mono27b_engine_decode_step(
             // Attention: parallel cooperative kernel
             {
                 int kvl = pos + 1;
-                size_t smem_sz = ((size_t)kvl + 2 + MONO27B_TARGET_HEAD_DIM) * sizeof(float);
+                // Use max_ctx shared memory always for graph capture compatibility
+                int smem_kvl = max_ctx > 0 ? max_ctx : kvl;
+                size_t smem_sz = ((size_t)smem_kvl + 2 + MONO27B_TARGET_HEAD_DIM) * sizeof(float);
                 k_attn_parallel<<<MONO27B_TARGET_N_HEAD, MONO27B_TARGET_HEAD_DIM, smem_sz>>>(
                     qb, st->kv_cache_k[fa_i], st->kv_cache_v[fa_i], qb,
                     kvl, MONO27B_TARGET_N_HEAD, MONO27B_TARGET_N_KV_HEAD,
@@ -2106,6 +2128,7 @@ extern "C" bool mono27b_engine_decode_step(
         }
 
     }
+
     st->kv_len = pos + 1;
 
 cleanup:

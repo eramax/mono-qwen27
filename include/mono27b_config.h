@@ -105,6 +105,7 @@ struct Mono27BExecutorState {
     void * q8_scratch;  // Q8_1 buffer for matvec (544 blocks × 36 bytes)
     int max_ctx;
     int kv_len;
+    // CUDA graph replay (reserved for future, requires kernel changes for KV cache pos)
 };
 
 struct Mono27BLogitsOutput {
