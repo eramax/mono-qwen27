@@ -2,21 +2,25 @@
 # make verify        -> runs BOTH llama.cpp ref AND our tool, compares side-by-side
 # make verify-only   -> only runs checks on existing data
 # make e2e           -> end-to-end logit comparison only
+# make compare-all   -> comprehensive tensor comparison (all layers, all tensors)
 
 GGUF ?= /mnt/mydata/projects2/specfusion/model/Qwen3.6-27B-UD-Q4_K_XL.gguf
 DEBUG ?= /tmp/mono_verify.debug.tsv
 BUILD_BIN = build/mono27b_chat
 REF_DEBUG = /mnt/mydata/projects2/mono27b/ref/llama.cpp/build/bin/llama-debug
 
-.PHONY: verify verify-only e2e generate-data clean
+.PHONY: verify verify-only compare-all e2e build gen-our gen-ref run-checks clean
 
 # =========================================================================
-# FULL VERIFY: build + generate BOTH ref + our data + compare + summary
+# FULL VERIFY: build + generate BOTH ref + our data + all comparisons
 # =========================================================================
-verify: build gen-our gen-ref run-checks
+verify: build gen-our gen-ref run-checks compare-all
 
-verify-only: run-checks
+verify-only: run-checks compare-all
 
+# =========================================================================
+# BUILD
+# =========================================================================
 build:
 	@echo ""
 	@echo "=== Building mono27b_chat ==="
@@ -25,7 +29,9 @@ build:
 	   -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release && \
 	   cmake --build build -j$$(nproc))
 
-# --- Generate our data ---
+# =========================================================================
+# GENERATE OUR DATA
+# =========================================================================
 gen-our:
 	@echo ""
 	@echo "=== Generating OUR debug data ==="
@@ -38,7 +44,9 @@ gen-our:
 	@cp /tmp/mono_logits.bin debug/verify/our_logits.bin 2>/dev/null || true
 	@echo "  Our data ready."
 
-# --- Generate reference data ---
+# =========================================================================
+# GENERATE REFERENCE DATA (llama.cpp)
+# =========================================================================
 gen-ref:
 	@echo ""
 	@echo "=== Generating REFERENCE data (llama-debug) ==="
@@ -47,21 +55,33 @@ gen-ref:
 		--save-logits --logits-output-dir /tmp/ref_logits 2>/dev/null
 	@cp /tmp/ref_logits/llamacpp-Qwen3.6-27B-UD-Q4_K_XL.bin \
 	   debug/verify/ref_logits.bin 2>/dev/null || true
-	@# Save reference intermediate tensors (SSM layer 0)
+	@# Save reference intermediate tensors (SSM + attention layer 0)
 	$(REF_DEBUG) -m $(GGUF) -p "give" -c 4096 -b 1 -ub 1 \
-	--tensor-filter "attn_norm-0|linear_attn_qkv_mixed-0|z-0|conv_output_raw-0|conv_output_silu-0|q_conv_predelta-0|k_conv_predelta-0|attn_output-0|final_output-0|linear_attn_out-0|post_attention_norm-0|ffn_gate-0|ffn_up-0|ffn_mul-0|ffn_down-0|l_out-0|model.input_embed" \
+	--tensor-filter "model.input_embed|attn_norm-0|linear_attn_qkv_mixed-0|z-0|conv_output_raw-0|conv_output_silu-0|q_conv_predelta-0|k_conv_predelta-0|attn_output-0|final_output-0|linear_attn_out-0|post_attention_norm-0|ffn_gate-0|ffn_up-0|ffn_mul-0|ffn_down-0|l_out-0" \
 		> /tmp/ref_stdout.txt 2>/tmp/ref_stderr.txt
 	@cp /tmp/ref_stdout.txt debug/verify/ref_intermediates.txt 2>/dev/null || true
 	@echo "  Reference data ready."
 
 # =========================================================================
-# RUN ALL CHECKS (uses both ref and our data)
+# COMPONENT CHECKS (unit tests: Q5_K, Q6_K, RMS norm, M-RoPE, etc.)
 # =========================================================================
 run-checks:
 	@echo ""
-	@echo "=== Running All Verifications ==="
+	@echo "=== Running Component Checks ==="
 	@cd debug/verify && python3 run_all_checks.py \
 		--gguf $(GGUF) --debug $(DEBUG) --ref-intermediates ref_intermediates.txt
+
+# =========================================================================
+# COMPREHENSIVE TENSOR COMPARISON (all comparable tensors, all layers)
+# =========================================================================
+compare-all:
+	@echo ""
+	@echo "=== Running Comprehensive Tensor Comparison ==="
+	@cd debug/verify && python3 compare_all.py \
+		--our-debug $(DEBUG) \
+		--ref ref_intermediates.txt \
+		--ref-logits ref_logits.bin \
+		--our-logits our_logits.bin
 
 # =========================================================================
 # END-TO-END LOGIT COMPARISON (standalone)
@@ -74,4 +94,4 @@ e2e: build gen-our gen-ref
 # =========================================================================
 clean:
 	rm -f debug/verify/embed_full.txt debug/verify/attn_norm_full.txt
-	rm -f debug/verify/ref_intermediates.txt
+	rm -f debug/verify/ref_intermediates.txt debug/verify/ref_logits.bin debug/verify/our_logits.bin
