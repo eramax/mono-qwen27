@@ -105,7 +105,9 @@ struct Mono27BExecutorState {
     void * q8_scratch;  // Q8_1 buffer for matvec (544 blocks × 36 bytes)
     int max_ctx;
     int kv_len;
-    // CUDA graph replay (reserved for future, requires kernel changes for KV cache pos)
+    // Concurrent streams for paired matvec execution
+    void * stream1;  // cudaStream_t, for concurrent matvec
+    void * sync_event;  // cudaEvent_t, for cross-stream sync
 };
 
 struct Mono27BLogitsOutput {

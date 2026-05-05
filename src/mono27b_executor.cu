@@ -1496,10 +1496,14 @@ extern "C" bool mono27b_engine_init_state(int max_ctx, Mono27BExecutorState * st
       cudaError_t eq = cudaMalloc(&state->q8_scratch, q8_sz);
       if (eq != cudaSuccess) { state->q8_scratch = nullptr; } }
 
-    // CUDA graph state: initially empty
-    state->graph = nullptr;
-    state->graphExec = nullptr;
-    state->graph_captured = false;
+    // Create concurrent stream + event for paired matvec execution
+    // (at top, before any goto fail, so cleanup paths can reference them)
+    state->stream1 = nullptr;
+    state->sync_event = nullptr;
+    { cudaStream_t _s = nullptr; if (cudaStreamCreate(&_s) == cudaSuccess) state->stream1 = (void*)_s; }
+    { cudaEvent_t _e = nullptr; if (cudaEventCreate(&_e) == cudaSuccess) state->sync_event = (void*)_e; }
+
+    // Graph fields removed; reserved for future use
 
     state->kv_len = 0;
     return true;
@@ -1520,8 +1524,8 @@ extern "C" void mono27b_engine_free_state(Mono27BExecutorState * state) {
     }
     cudaFree(state->work_buf);
     if (state->q8_scratch) cudaFree(state->q8_scratch);
-    if (state->graphExec) { cudaGraphExecDestroy((cudaGraphExec_t)state->graphExec); state->graphExec = nullptr; }
-    if (state->graph) { cudaGraphDestroy((cudaGraph_t)state->graph); state->graph = nullptr; }
+    if (state->stream1) { cudaStreamDestroy((cudaStream_t)state->stream1); state->stream1 = nullptr; }
+    if (state->sync_event) { cudaEventDestroy((cudaEvent_t)state->sync_event); state->sync_event = nullptr; }
     std::memset(state, 0, sizeof(*state));
 }
 
@@ -1558,8 +1562,6 @@ static int l_quant_q8(const float * x, int rb) {
 // Single matvec: quantizes input, launches matvec (convenience wrapper)
 static void l_mv_quant(void * W, uint32_t ggml_type, int rb, int rc, const float * x, float * y) {
     if (rc == 0 || !W) return;
-    // Try Q8_1 dp4a path for K-quant types (fast).
-    // For F32/F16/Q8_0/etc., fall through to the f32 dequant fallback.
     if (g_q8_scratch && rb * 8 <= 544) {
         switch (ggml_type) {
             case MONO27B_GGML_TYPE_Q4_K:
@@ -1576,24 +1578,54 @@ static void l_mv_quant(void * W, uint32_t ggml_type, int rb, int rc, const float
 }
 
 // Matvec using ALREADY QUANTIZED Q8_1 data in g_q8_scratch
-static void l_mv_q8(void * W, uint32_t ggml_type, int rb, int rc, float * y) {
+// stream = 0 for default stream, or a custom CUDA stream for concurrency
+static void l_mv_q8_on(void * W, uint32_t ggml_type, int rb, int rc, float * y, cudaStream_t stream) {
     if (rc == 0 || !W) return;
     if (!g_q8_scratch || rb * 8 > 544) return;
     switch (ggml_type) {
         case MONO27B_GGML_TYPE_Q4_K:
-            k_q4k_mv_q8_dp4a<<<rc, 128>>>((const BlockQ4K *)W, g_q8_scratch, y, rb, rc);
+            k_q4k_mv_q8_dp4a<<<rc, 128, 0, stream>>>((const BlockQ4K *)W, g_q8_scratch, y, rb, rc);
             return;
         case MONO27B_GGML_TYPE_Q5_K:
-            k_q5k_mv_q8<<<rc, 128>>>((const BlockQ5K *)W, g_q8_scratch, y, rb, rc);
+            k_q5k_mv_q8<<<rc, 128, 0, stream>>>((const BlockQ5K *)W, g_q8_scratch, y, rb, rc);
             return;
         case MONO27B_GGML_TYPE_Q6_K:
-            k_q6k_mv_q8_dp4a<<<rc, 128>>>((const BlockQ6K *)W, g_q8_scratch, y, rb, rc);
+            k_q6k_mv_q8_dp4a<<<rc, 128, 0, stream>>>((const BlockQ6K *)W, g_q8_scratch, y, rb, rc);
             return;
         case 23:
-            k_iq4xs_mv_q8_dp4a<<<rc, 128>>>((const BlockIQ4XS *)W, g_q8_scratch, y, rb, rc);
+            k_iq4xs_mv_q8_dp4a<<<rc, 128, 0, stream>>>((const BlockIQ4XS *)W, g_q8_scratch, y, rb, rc);
             return;
         default: break;
     }
+}
+
+static void l_mv_q8(void * W, uint32_t ggml_type, int rb, int rc, float * y) {
+    l_mv_q8_on(W, ggml_type, rb, rc, y, 0);
+}
+
+// Launch two matvecs concurrently on the same Q8_1 input.
+// Quantize x once, then run w1→y1 on stream 0 and w2→y2 on stream 1.
+static void l_mv_pair(void * w1, uint32_t t1, int rb1, int rc1, float * y1,
+                      void * w2, uint32_t t2, int rb2, int rc2, float * y2,
+                      const float * x, int rb, cudaStream_t stream1, cudaEvent_t sync_ev) {
+    if (rc1 == 0 || !w1) { l_mv_quant(w2, t2, rb2, rc2, x, y2); return; }
+    if (rc2 == 0 || !w2) { l_mv_quant(w1, t1, rb1, rc1, x, y1); return; }
+    // Both need Q8_1 path — quantize once
+    if (g_q8_scratch && rb * 8 <= 544 && stream1 && sync_ev) {
+        l_quant_q8(x, rb);
+        cudaEventRecord(sync_ev, 0);  // quantize done on stream 0
+        // Launch w1 on stream 0 (ordered after quantize)
+        l_mv_q8_on(w1, t1, rb1, rc1, y1, 0);
+        // Launch w2 on stream 1 (waits for quantize via event)
+        cudaStreamWaitEvent(stream1, sync_ev, 0);
+        l_mv_q8_on(w2, t2, rb2, rc2, y2, stream1);
+        // Sync stream 1 so caller sees results
+        cudaStreamSynchronize(stream1);
+        return;
+    }
+    // Fallback: sequential
+    l_mv_quant(w1, t1, rb1, rc1, x, y1);
+    l_mv_quant(w2, t2, rb2, rc2, x, y2);
 }
 
 // Fallback path (F32 dequant)
@@ -1669,6 +1701,12 @@ static void debug_dump_vec(FILE * fp, const char * phase, int step, int pos, int
 #define MV_Q8(wv, y) l_mv_q8((wv).ptr, (wv).ggml_type, (wv).row_blocks, (wv).row_count, y)
 #define WV(wv) ((const float *)(wv).ptr)
 #define TRACE(lbl) ((void)0)
+
+// Concurrent matvec pair: quantize shared input once, run two matvecs in parallel
+#define MV_PAIR(w1, w2, x, y1, y2) l_mv_pair( \
+    (w1).ptr, (w1).ggml_type, (w1).row_blocks, (w1).row_count, y1, \
+    (w2).ptr, (w2).ggml_type, (w2).row_blocks, (w2).row_count, y2, \
+    x, (w1).row_blocks, (cudaStream_t)st->stream1, (cudaEvent_t)st->sync_event)
 
 // Production-performance CHECK_FINITE: skip finite checks for speed.
 // In debug mode, include them to catch NaN/Inf early.
@@ -1858,11 +1896,10 @@ extern "C" bool mono27b_engine_decode_step(
             if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "post_norm", h, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
             }
-            MV(L.ffn_gate, h, fb); TRACE("fg");
+            MV_PAIR(L.ffn_gate, L.ffn_up, h, fb, kb); TRACE("fg+fu");
             if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "ffn_gate", fb, MONO27B_TARGET_FFN, MONO27B_TARGET_FFN);
             }
-            MV(L.ffn_up, h, kb); TRACE("fu");
             if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "ffn_up", kb, MONO27B_TARGET_FFN, MONO27B_TARGET_FFN);
             }
@@ -1887,8 +1924,7 @@ extern "C" bool mono27b_engine_decode_step(
             }
 
             l_rms(h2, h, WV(L.attn_norm), MONO27B_TARGET_HIDDEN);
-            MV(L.wqkv, h2, sb);
-            MV(L.wqkv_gate, h2, gb);
+            MV_PAIR(L.wqkv, L.wqkv_gate, h2, sb, gb);
             if (dump_step && il == 0) {
                 // Dump FULL wqkv_gate (6144) for Python comparison
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "wqkv_gate", gb, MONO27B_SSM_D_INNER, MONO27B_SSM_D_INNER);
@@ -2038,11 +2074,10 @@ extern "C" bool mono27b_engine_decode_step(
             if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "post_norm", h, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
             }
-            MV(L.ffn_gate, h, fb);
+            MV_PAIR(L.ffn_gate, L.ffn_up, h, fb, kb);
             if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ffn_gate", fb, MONO27B_TARGET_FFN, MONO27B_TARGET_FFN);
             }
-            MV(L.ffn_up, h, kb);
             if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ffn_up", kb, MONO27B_TARGET_FFN, MONO27B_TARGET_FFN);
             }

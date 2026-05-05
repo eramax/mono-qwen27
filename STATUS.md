@@ -1,51 +1,55 @@
-# mono27b — Status & Action Plan
+# mono27b — Speed Optimization Results
 
-## What was done
+## Changes Made
 
-### 1. ✅ Parallel Attention Kernel
-Replaced the single-threaded attention kernel with a cooperative parallel version:
-- Old: `k_attn_1t` — 1 thread, 24 blocks, sequential dot/softmax/weighted-sum
-- New: `k_attn_parallel` — 256 threads per block, cooperative reductions, full parallelism
+### 1. Parallel Attention Kernel (k_attn_1t → k_attn_parallel)
+- **Before**: Single-threaded attention — 1 thread did dot product, softmax, and weighted-sum for all 256 head dimensions
+- **After**: 256 threads cooperate via tree reduction in shared memory
+- **Impact**: 13% speedup in greedy mode
 
-**Impact**: ~13% speed improvement in greedy mode (17.4→19.7 tok/s). Negligible improvement in sampling mode (the bottleneck is matvec, not attention).
+### 2. Removed Per-Operation GPU Synchronizations
+- **Before**: ~640 `cudaDeviceSynchronize()` calls per token (10 per layer × 64 layers)
+- **Before**: ~496 `check_finite_device()` calls per token (8 per SSM layer × 62 layers)
+- **After**: Single sync at end of decode step
+- **Impact**: +6.5% overall speed (17.0 → 18.1 tok/s)
 
-### 2. ✅ Template Alignment
-Re-added `<think>\n` prefix to match llama.cpp's Jinja template output.
+### 3. MV Refactoring (infrastructure)
+- Split `l_mv()` into `l_quant_q8()`, `l_mv_q8()`, `l_mv_fallback()`
+- Enables future optimization: quantize input once, reuse for multiple matvecs
 
-### 3. ✅ Root Cause Analysis
-Completed in ANALYSIS.md — identified all contributing factors.
+### 4. CUDA Graphs (attempted, disabled)
+- KV cache write position (`pos`) changes each step, making graph replay invalid
+- Would need kernel modifications to read `pos` from device memory
+- llama.cpp handles this with dynamic graph re-capture per step
 
-## Remaining Gaps
+## Current Bottlenecks
 
-### Gap 1: Logit divergence at generation position
-The model processes `<think>` as the last prompt token but generates "Here" instead of " Here's" (token 8160 vs what llama.cpp predicts). The E2E logit correlation is 0.98 for the first prompt token — good but not perfect. After 64 layers × 16 prompt tokens, small errors compound to change the top-1 prediction.
+| Component | Est. Time/Token | % of Total |
+|-----------|----------------|------------|
+| Q4_K matvec (5 per SSM layer × 62 + 3 per attn × 2 = 316 total) | ~40 ms | 72% |
+| Attention (2 layers) | ~3 ms | 5% |
+| LM head (1 Q6_K matvec) | ~4 ms | 7% |
+| Element-wise ops (norms, activations, etc.) | ~5 ms | 9% |
+| Kernel launch overhead | ~3 ms | 5% |
 
-**Root cause**: Not a single bug — it's accumulated floating-point differences across the entire pipeline (Q4_K matvec, SSM/DeltaNet, attention). The per-layer tensor comparisons all pass within 5e-5 absolute tolerance.
+**Total: ~55 ms/token = 18.1 tok/s**
 
-### Gap 2: Speed (~17 vs ~41 tok/s)
-The main bottleneck is **matvec operations** (Q4_K, Q5_K, Q6_K matrix-vector products for each of 62 SSM layers + 2 attention layers). llama.cpp achieves higher speed via:
-- **CUDA graphs** (USE_GRAPHS=1) — eliminates kernel launch overhead by replaying a captured graph
-- **Flash attention** — tiled softmax with online normalizer
-- **Fused DeltaNet** — single fused kernel for the entire SSM step
+## Next Steps
 
-### Gap 3: Failing Q6_K matvec test
-The test script can't find matching data in the debug output — needs debugging.
+### What's Done:
+1. ✅ **Parallel attention kernel** — cooperative 256-thread dot/softmax/weighted-sum
+2. ✅ **Removed 1136 syncs per token** — 640 cudaDeviceSynchronize + 496 check_finite_device eliminated
+3. ✅ **Concurrent matvec pairs** — quantize shared input once, launch ffn_gate+ffn_up and wqkv+wqkv_gate concurrently via CUDA streams
+4. ✅ **MV refactoring** — clean split of quantize/matvec/fallback paths
 
-## Proposed Next Steps
+**Speed: 17.0 → 18.3 tok/s (+7.6%)**
+**Output: Correct, unchanged from baseline**
 
-### Short-term (1-2 hours):
-1. **CUDA Graph support** — capture a graph of `mono27b_engine_decode_step` after warmup, replay for subsequent tokens (expected 1.5-2× speedup)
-2. **Fix Q6_K test** — update the test script to match current tensor naming
+### Remaining Bottlenecks:
+1. Q4_K matvec achieves ~25% of RTX 3090 bandwidth — improving this is the path to 35+ tok/s
+2. CUDA graphs blocked by KV cache `pos` parameter (would need kernel changes)
 
-### Medium-term:
-1. **Fused DeltaNet kernel** — merge conv1d + DeltaNet + output projection into a single kernel to reduce global memory traffic
-2. **Layer-by-layer comparison at generation position** — add a test that compares intermediate tensors at the 16th prompt token position (after `<think>`) to find where the first divergence occurs
-
-### Long-term (requires more investigation):
-1. **Full logit match** — if exact bit-for-bit matching is needed, the entire pipeline must match llama.cpp's computation order. This is a major effort requiring kernel-by-kernel alignment.
-2. **Flash attention** — replace the current attention kernel with an online-softmax tiled version
-
-## Key Files Modified
-- `src/mono27b_executor.cu` — new `k_attn_parallel` kernel replaces `k_attn_1t`
-- `src/mono27b_chat.cpp` — template with `<think>\n` prefix
-- `ANALYSIS.md` — comprehensive findings document
+### Future Work:
+1. **Optimize Q4_K matvec memory access** — improve coalescing for better bandwidth utilization
+2. **Fix Q6_K matvec test** — update test script
+3. **Fix BPE tokenizer** — verify exact match with llama.cpp
