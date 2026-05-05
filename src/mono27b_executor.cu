@@ -77,10 +77,9 @@ __global__ static void k_quant_q8_1(const float * x, BlockQ8_1 * y, int n) {
         amax = fmaxf(amax, fabsf(v));
     }
     float d = amax / 127.0f;
-    float id = d > 0.0f ? 1.0f / d : 0.0f;
     float sum_ = 0.0f;
     for (int j = 0; j < 32; j++) {
-        int qi = (int)(roundf(x[(size_t)b * 32 + j] * id));
+        int qi = (amax == 0.0f) ? 0 : (int)(roundf(x[(size_t)b * 32 + j] / d));
         y[b].qs[j] = (int8_t)qi;
         sum_ += (float)qi;
     }
@@ -100,15 +99,121 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 #endif
 }
 
+static __device__ __forceinline__ int get_int_b2(const void * x, const int & i32) {
+    const uint16_t * x16 = (const uint16_t *) x;
+    return x16[2*i32 + 0] | (x16[2*i32 + 1] << 16);
+}
+
+static __device__ __forceinline__ int2 get_int_from_table_16(const int & q4, const float * table) {
+    const uint32_t * table32 = (const uint32_t *) table;
+    uint32_t tmp[2];
+    const uint32_t low_high_selection_indices = (0x32103210 | ((q4 & 0x88888888) >> 1));
+    #pragma unroll
+    for (uint32_t i = 0; i < 2; ++i) {
+        const uint32_t shift = 16 * i;
+        const uint32_t low  = __byte_perm(table32[0], table32[1], q4 >> shift);
+        const uint32_t high = __byte_perm(table32[2], table32[3], q4 >> shift);
+        tmp[i] = __byte_perm(low, high, low_high_selection_indices >> shift);
+    }
+    return make_int2(__byte_perm(tmp[0], tmp[1], 0x6420), __byte_perm(tmp[0], tmp[1], 0x7531));
+}
+
 static __device__ __forceinline__ int get_int_b4(const void * x, const int & i32) {
     return ((const int *) x)[i32];
 }
 
-// ─── Q5_K vec_dot (from vecdotq.cuh, vmmq path) ─────────────────────────────
-// Constants matching ggml
+// ─── Q4_K vec_dot (from vecdotq.cuh, vmmq path) ─────────────────────────────
+
 #define MONO27B_QK8_1 32
-#define MONO27B_QR5_K 2
 #define MONO27B_QI8_1 (MONO27B_QK8_1 / 4)
+#define MONO27B_QR4_K 2
+#define MONO27B_QR5_K 2
+#define MONO27B_QR6_K 2
+#define MONO27B_QI6_K 32
+
+static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
+    const int * __restrict__ v, const int * __restrict__ u, const uint8_t * __restrict__ sc,
+    const uint8_t * __restrict__ m, const __half2 & dm4, const float * __restrict__ d8) {
+
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < MONO27B_QR4_K; ++i) {
+        const int v0i = (v[0] >> (4*i)) & 0x0F0F0F0F;
+        const int v1i = (v[1] >> (4*i)) & 0x0F0F0F0F;
+
+        const int dot1 = ggml_cuda_dp4a(v1i, u[2*i+1], ggml_cuda_dp4a(v0i, u[2*i+0], 0));
+        const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+1], ggml_cuda_dp4a(0x01010101, u[2*i+0], 0));
+
+        sumf_d += d8[i] * (dot1 * sc[i]);
+        sumf_m += d8[i] * (dot2 * m[i]);
+    }
+
+    const float2 dm4f = __half22float2(dm4);
+    return dm4f.x*sumf_d - dm4f.y*sumf_m;
+}
+
+static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
+    const void * __restrict__ vbq, const BlockQ8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const BlockQ4K * bq4_K = (const BlockQ4K *) vbq + kbx;
+
+    int    v[2];
+    int    u[2*MONO27B_QR4_K];
+    float d8[MONO27B_QR4_K];
+
+    const int bq8_offset = MONO27B_QR4_K * ((iqs/2) / (MONO27B_QI8_1/2));
+    const int * q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
+    v[0] = q4[0];
+    v[1] = q4[4];
+
+    const uint16_t * scales = (const uint16_t *)bq4_K->scales;
+    uint16_t aux[2];
+    const int j = bq8_offset/2;
+    if (j < 2) {
+        aux[0] = scales[j+0] & 0x3f3f;
+        aux[1] = scales[j+2] & 0x3f3f;
+    } else {
+        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
+        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
+    }
+    const uint8_t * sc = (const uint8_t *)aux;
+    const uint8_t * m  = sc + 2;
+
+    for (int i = 0; i < MONO27B_QR4_K; ++i) {
+        const BlockQ8_1 * bq8i = bq8_1 + bq8_offset + i;
+        d8[i] = __half2float(bq8i->d);
+
+        const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
+        u[2*i+0] = q8[0];
+        u[2*i+1] = q8[4];
+    }
+
+    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, *(const __half2 *)&bq4_K->d, d8);
+}
+
+__global__ static void k_q4k_mv_q8_dp4a(const BlockQ4K * W, const BlockQ8_1 * q8, float * y, int rb, int rc) {
+    int row = blockIdx.x;
+    if (row >= rc) return;
+    __shared__ float sh[128];
+    float sum = 0.0f;
+    const BlockQ4K * wp = W + (size_t)row * rb;
+    for (int idx = threadIdx.x; idx < rb * 16; idx += 128) {
+        int b = idx / 16;
+        int iqs = (idx % 16) * 2;
+        sum += vec_dot_q4_K_q8_1(wp, q8 + b * 8, b, iqs);
+    }
+    sh[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = 64; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) y[row] = sh[0];
+}
+
+// ─── Q5_K vec_dot (from vecdotq.cuh, vmmq path) ─────────────────────────────
 
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(
     const int * __restrict__ vl, const int * __restrict__ vh, const int * __restrict__ u,
@@ -206,6 +311,120 @@ __global__ static void k_q5k_mv_q8(const BlockQ5K * W, const BlockQ8_1 * q8, flo
     if (threadIdx.x == 0) y[row] = sh[0];
 }
 
+// ─── Q6_K vec_dot (from vecdotq.cuh, mmvq path) ─────────────────────────────
+
+#define MONO27B_QR6_K 2
+
+static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
+    const int & vl, const int & vh, const int * __restrict__ u, const int8_t * __restrict__ scales,
+    const float & d, const float * __restrict__ d8) {
+
+    float sumf = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < MONO27B_QR6_K; ++i) {
+        const int sc = scales[4*i];
+        const int vil = (vl >> (4*i)) & 0x0F0F0F0F;
+        const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
+        const int vi = __vsubss4((vil | vih), 0x20202020);
+        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc);
+    }
+
+    return d*sumf;
+}
+
+static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
+    const void * __restrict__ vbq, const BlockQ8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const BlockQ6K * bq6_K = (const BlockQ6K *) vbq + kbx;
+
+    const int bq8_offset = 2 * MONO27B_QR6_K * (iqs / (MONO27B_QI6_K/2)) + (iqs % (MONO27B_QI6_K/2)) / (MONO27B_QI6_K/4);
+    const int scale_offset = (MONO27B_QI6_K/4) * (iqs / (MONO27B_QI6_K/2)) + (iqs % (MONO27B_QI6_K/2)) / (MONO27B_QI6_K/8);
+    const int vh_shift = 2 * ((iqs % (MONO27B_QI6_K/2)) / (MONO27B_QI6_K/4));
+
+    const int vl = get_int_b2(bq6_K->ql, iqs);
+    const int vh = get_int_b2(bq6_K->qh, (MONO27B_QI6_K/4) * (iqs / (MONO27B_QI6_K/2)) + iqs % (MONO27B_QI6_K/4)) >> vh_shift;
+
+    const int8_t * scales = bq6_K->scales + scale_offset;
+
+    int    u[MONO27B_QR6_K];
+    float d8[MONO27B_QR6_K];
+
+#pragma unroll
+    for (int i = 0; i < MONO27B_QR6_K; ++i) {
+        u[i]  = get_int_b4(bq8_1[bq8_offset + 2*i].qs, iqs % MONO27B_QI8_1);
+        d8[i] = __half2float(bq8_1[bq8_offset + 2*i].d);
+    }
+
+    return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, __half2float(bq6_K->d), d8);
+}
+
+__global__ static void k_q6k_mv_q8_dp4a(const BlockQ6K * W, const BlockQ8_1 * q8, float * y, int rb, int rc) {
+    int row = blockIdx.x;
+    if (row >= rc) return;
+    __shared__ float sh[128];
+    float sum = 0.0f;
+    const BlockQ6K * wp = W + (size_t)row * rb;
+    for (int idx = threadIdx.x; idx < rb * 32; idx += 128) {
+        int b = idx / 32;
+        int iqs = idx % 32;
+        sum += vec_dot_q6_K_q8_1(wp, q8 + b * 8, b, iqs);
+    }
+    sh[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = 64; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) y[row] = sh[0];
+}
+
+// ─── IQ4_XS vec_dot (from vecdotq.cuh, mmvq path) ───────────────────────────
+
+static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
+    const void * __restrict__ vbq, const BlockQ8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const BlockIQ4XS * bq4 = (const BlockIQ4XS *) vbq + kbx;
+
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
+        const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
+
+        const int u0 = get_int_b4(bq8_1[iqs/4].qs, j + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/4].qs, j + 4);
+
+        sumi = ggml_cuda_dp4a(v.x, u0, sumi);
+        sumi = ggml_cuda_dp4a(v.y, u1, sumi);
+    }
+
+    const int ls = ((bq4->scales_l[iqs/8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs/2)) & 0x03) << 4);
+    sumi *= ls - 32;
+
+    const float d = __half2float(bq4->d) * __half2float(bq8_1[iqs/4].d);
+    return d * sumi;
+}
+
+__global__ static void k_iq4xs_mv_q8_dp4a(const BlockIQ4XS * W, const BlockQ8_1 * q8, float * y, int rb, int rc) {
+    int row = blockIdx.x;
+    if (row >= rc) return;
+    __shared__ float sh[128];
+    float sum = 0.0f;
+    const BlockIQ4XS * wp = W + (size_t)row * rb;
+    for (int idx = threadIdx.x; idx < rb * 8; idx += 128) {
+        int b = idx / 8;
+        int iqs = (idx % 8) * 4;
+        sum += vec_dot_iq4_xs_q8_1(wp, q8 + b * 8, b, iqs);
+    }
+    sh[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = 64; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) y[row] = sh[0];
+}
 
 // ─── Warp-level reductions ───────────────────────────────────────────────────
 
@@ -1247,46 +1466,6 @@ static void l_q6k(const BlockQ6K * W, int rb, int rc, const float * x, float * y
 // File-scope pointer to Q8_1 scratch buffer (set by engine before decode step)
 static BlockQ8_1 * g_q8_scratch = nullptr;
 
-// Q8_1-based matvec kernels (quantize F32 input → Q8_1, then use ref-style dot)
-// These are called with pre-quantized Q8_1 input from g_q8_scratch
-
-template <int BLK>
-__global__ static void k_q4k_mv_q8(const BlockQ4K * W, const BlockQ8_1 * q8, float * y, int rb, int rc, int ncols) {
-    int row = blockIdx.x;
-    if (row >= rc) return;
-    __shared__ float sh[BLK];
-    float sum = 0.0f;
-    const BlockQ4K * rp = W + (size_t)row * rb;
-    for (int b = threadIdx.x; b < rb; b += BLK) {
-        const BlockQ4K & qb = rp[b];
-        float d = __half2float(qb.d);
-        float mn = __half2float(qb.dmin);
-        for (int g = 0; g < 4; ++g) {
-            uint8_t s0, m0, s1, m1;
-            get_scale_min_k4(g * 2, qb.scales, s0, m0);
-            get_scale_min_k4(g * 2 + 1, qb.scales, s1, m1);
-            float d0 = d * s0, d1 = d * s1, mn0 = mn * m0, mn1 = mn * m1;
-            int base = b * 256 + g * 64;
-            const uint8_t * qg = qb.qs + g * 32;
-            for (int i = 0; i < 32; ++i) {
-                int e = base + i;
-                float val_q8 = __half2float(q8[e / 32].d) * (float)q8[e / 32].qs[e % 32];
-                sum += (d0 * (qg[i] & 0x0F) - mn0) * val_q8;
-                e = base + 32 + i;
-                float val_q8_2 = __half2float(q8[e / 32].d) * (float)q8[e / 32].qs[e % 32];
-                sum += (d1 * (qg[i] >> 4) - mn1) * val_q8_2;
-            }
-        }
-    }
-    sh[threadIdx.x] = sum;
-    __syncthreads();
-    for (int s = BLK / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) { sh[threadIdx.x] += sh[threadIdx.x + s]; }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) y[row] = sh[0];
-}
-
 // Type-dispatched matvec: W at ggml_type, rb blocks per row, rc rows, x input, y output
 static void l_mv(void * W, uint32_t ggml_type, int rb, int rc, const float * x, float * y) {
     if (rc == 0 || !W) return;
@@ -1294,9 +1473,24 @@ static void l_mv(void * W, uint32_t ggml_type, int rb, int rc, const float * x, 
     int n_q8 = rb * 8;  // 256 elements per K-quant block / 32 per Q8_1 block
     if (g_q8_scratch && n_q8 <= 544) {
         switch (ggml_type) {
+            case MONO27B_GGML_TYPE_Q4_K: {
+                k_quant_q8_1<<<(n_q8 + 127) / 128, 128>>>(x, g_q8_scratch, n_q8 * 32);
+                k_q4k_mv_q8_dp4a<<<rc, 128>>>((const BlockQ4K *)W, g_q8_scratch, y, rb, rc);
+                return;
+            }
             case MONO27B_GGML_TYPE_Q5_K: {
                 k_quant_q8_1<<<(n_q8 + 127) / 128, 128>>>(x, g_q8_scratch, n_q8 * 32);
                 k_q5k_mv_q8<<<rc, 128>>>((const BlockQ5K *)W, g_q8_scratch, y, rb, rc);
+                return;
+            }
+            case MONO27B_GGML_TYPE_Q6_K: {
+                k_quant_q8_1<<<(n_q8 + 127) / 128, 128>>>(x, g_q8_scratch, n_q8 * 32);
+                k_q6k_mv_q8_dp4a<<<rc, 128>>>((const BlockQ6K *)W, g_q8_scratch, y, rb, rc);
+                return;
+            }
+            case 23: {
+                k_quant_q8_1<<<(n_q8 + 127) / 128, 128>>>(x, g_q8_scratch, n_q8 * 32);
+                k_iq4xs_mv_q8_dp4a<<<rc, 128>>>((const BlockIQ4XS *)W, g_q8_scratch, y, rb, rc);
                 return;
             }
             default: break;
