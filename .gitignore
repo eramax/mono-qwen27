@@ -9,6 +9,6 @@ debug/verify/ref_logits.bin
 debug/verify/our_logits.bin
 debug/verify/ref_intermediates.txt
 debug/verify/__pycache__
-debug/verify/attn_norm_full.txt
 debug/verify/test_kernels
+debug/verify/debug/
 model/
