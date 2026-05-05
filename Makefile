@@ -1,4 +1,4 @@
-.PHONY: build test quick-test large-test clean verify verify-all generate-verify-data
+.PHONY: build test quick-test large-test clean verify verify-all e2e e2e-text generate-verify-data
 
 MODEL_PATH ?= /mnt/mydata/projects2/mono27b/model/Qwen3.6-27B-UD-Q4_K_XL.gguf
 PROMPT ?= "give me 2 py example"
@@ -28,6 +28,12 @@ verify-only:
 e2e: build
 	$(MAKE) -f debug/verify/Makefile e2e GGUF=$(MODEL_PATH)
 
+e2e-text: build
+	$(MAKE) -f debug/verify/Makefile e2e-text GGUF=$(MODEL_PATH)
+
+e2e-text-all: build
+	$(MAKE) -f debug/verify/Makefile e2e-text-all GGUF=$(MODEL_PATH)
+
 clean:
 	rm -rf build
 
@@ -40,7 +46,9 @@ help:
 	@echo "  quick-test  - Run quick 5-token generation"
 	@echo "  large-test  - Run 20-token generation"
 	@echo "  verify      - Run all verification scripts (generates data first)"
-	@echo "  verify-all  - Rebuild, generate data, run all verifications"
+	@echo "  verify-all  - Rebuild, generate data, run all verifications (incl. text)"
+	@echo "  e2e         - End-to-end logit comparison (single token)"
+	@echo "  e2e-text    - End-to-end text comparison (50 tokens, --chat mode)"
 	@echo "  clean       - Remove build directory"
 	@echo ""
 	@echo "Variables:"

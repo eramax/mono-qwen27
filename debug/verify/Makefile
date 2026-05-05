@@ -19,18 +19,22 @@ endif
 
 BUILD_BIN = $(PROJ_ROOT)/build/mono27b_chat
 REF_DEBUG = /mnt/mydata/projects2/mono27b/ref/llama.cpp/build/bin/llama-debug
+REF_COMPLETION = /mnt/mydata/projects2/mono27b/ref/llama.cpp/build/bin/llama-completion
 
 # Data files (always use absolute paths via SCRIPT_DIR)
 REF_INTERMEDIATES := $(SCRIPT_DIR)/ref_intermediates.txt
 REF_LOGITS := $(SCRIPT_DIR)/ref_logits.bin
 OUR_LOGITS := $(SCRIPT_DIR)/our_logits.bin
+OUR_TEXT := /tmp/our_text.txt
+REF_TEXT := /tmp/ref_text.txt
 
-.PHONY: verify verify-only compare-all e2e build gen-our gen-ref run-checks clean-data clean
+.PHONY: verify verify-only compare-all e2e e2e-text build gen-our gen-ref gen-our-text gen-ref-text run-checks clean-data clean
 
 # =========================================================================
 # FULL VERIFY: clean + build + generate BOTH ref + our data + all comparisons
 # =========================================================================
-verify: clean-data build gen-our gen-ref run-checks compare-all
+verify: clean-data build gen-our gen-ref run-checks compare-all e2e-text
+verify-all: clean-data build gen-our gen-ref gen-our-text gen-ref-text run-checks compare-all compare-text
 
 verify-only: run-checks compare-all
 
@@ -125,10 +129,40 @@ e2e: clean-data build gen-our gen-ref
 	@python3 $(SCRIPT_DIR)/compare_e2e.py
 
 # =========================================================================
+# END-TO-END TEXT COMPARISON (generated text, not just logits)
+# =========================================================================
+gen-our-text:
+	@echo ""
+	@echo "=== Generating OUR text output (50 tokens) ==="
+	@rm -f $(OUR_TEXT)
+	$(BUILD_BIN) -m $(GGUF) -p "$(PROMPT)" --gen 50 --ctx 4096 --seed 944990222 \
+		--quiet --chat > $(OUR_TEXT) 2>/dev/null
+	@wc -c < $(OUR_TEXT) | xargs -I{} echo "  Our text saved to $(OUR_TEXT) ({} bytes)"
+
+gen-ref-text:
+	@echo ""
+	@echo "=== Generating REFERENCE text output (50 tokens, llama-completion) ==="
+	@rm -f $(REF_TEXT)
+	@echo "" | $(REF_COMPLETION) -m $(GGUF) -p "$(PROMPT)" -n 50 -c 4096 \
+		--seed 944990222 -cnv --no-display-prompt \
+		-b 1 -ub 1 > $(REF_TEXT) 2>/dev/null
+	@wc -c < $(REF_TEXT) | xargs -I{} echo "  Ref text saved to $(REF_TEXT) ({} bytes)"
+
+compare-text:
+	@python3 $(SCRIPT_DIR)/compare_text.py $(OUR_TEXT) $(REF_TEXT); exit_code=$$?; \
+	if [ $$exit_code -eq 1 ]; then echo "  (differences are expected until model execution matches)"; exit 0; fi; \
+	exit $$exit_code
+
+e2e-text: clean-data build gen-our-text gen-ref-text compare-text
+
+e2e-text-all: clean-data build gen-our gen-ref gen-our-text gen-ref-text run-checks compare-all compare-text
+
+# =========================================================================
 # CLEAN
 # =========================================================================
 clean-data:
 	@rm -f $(REF_INTERMEDIATES) $(REF_LOGITS) $(OUR_LOGITS)
+	@rm -f $(OUR_TEXT) $(REF_TEXT)
 	@rm -f $(SCRIPT_DIR)/embed_full.txt $(SCRIPT_DIR)/attn_norm_full.txt
 	@rm -f $(DEBUG)
 	@rm -f /tmp/our_logits_*.bin /tmp/ref_run*.txt

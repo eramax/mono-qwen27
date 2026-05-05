@@ -395,13 +395,30 @@ int main(int argc, char ** argv) {
         user_prompt.pop_back();
     }
 
-    // --chat: wrap prompt in Qwen3 chat format to match llama.cpp template behavior.
-    // Format: <|im_start|>user\n{msg}\n<|im_end|>\n<|im_start|>assistant\n
-    // <|im_end|> (248046) is a single special token; <|im_start|> is character tokens.
+    // --chat: render prompt using GGUF chat_template to match llama.cpp behavior.
+    // Qwen3.6 template (from tokenizer.chat_template) renders:
+    //   per-user-message: <|im_start|>user\n{content}<|im_end|>\n
+    //   generation prompt: <|im_start|>assistant\n<think>\n
     if (args.chat) {
-        // Qwen3 chat template: <|im_start|>user\n{msg}\n<|im_end|>\n<|im_start|>assistant
-        // No trailing \n — model generates the newline as its first token.
-        user_prompt = "<|im_start|>user\n" + user_prompt + "\n<|im_end|>\n<|im_start|>assistant";
+        const std::string & tmpl = gguf.metadata.chat_template;
+        // Extract generation-prompt suffix from template (after add_generation_prompt)
+        std::string gen_prompt = "<|im_start|>assistant\n<think>\n";
+        if (!tmpl.empty()) {
+            auto pos_gen = tmpl.find("add_generation_prompt");
+            if (pos_gen != std::string::npos) {
+                auto pos_start = tmpl.find("<|im_start|>", pos_gen);
+                if (pos_start != std::string::npos) {
+                    auto pos_think = tmpl.find("<think>", pos_start);
+                    auto pos_end = tmpl.find("{%- endif %}", pos_start);
+                    if (pos_think != std::string::npos && pos_think < pos_end) {
+                        gen_prompt = "<|im_start|>assistant\n<think>\n";
+                    } else {
+                        gen_prompt = "<|im_start|>assistant\n";
+                    }
+                }
+            }
+        }
+        user_prompt = "<|im_start|>user\n" + user_prompt + "\n<|im_end|>\n" + gen_prompt;
     }
 
     std::vector<int32_t> prompt_ids;
