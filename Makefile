@@ -2,7 +2,7 @@
 
 MODEL_PATH ?= /mnt/mydata/projects2/mono27b/model/Qwen3.6-27B-UD-Q4_K_XL.gguf
 PROMPT ?= "give me 2 py example"
-GEN ?= 10
+GEN ?= 500
 CTX ?= 4096
 
 build:
