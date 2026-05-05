@@ -1,0 +1,1 @@
+{"type":"config","name":"Mono27B text generation speed optimization","metricName":"gen_tok_per_sec","metricUnit":"tok/s","bestDirection":"higher"}
