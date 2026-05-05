@@ -16,6 +16,8 @@ struct Mono27BChatArgs {
     int max_ctx = 131072;
     int max_gen = 512;
     bool show_help = false;
+    bool greedy = false;
+    bool chat = false;
 };
 
 struct Mono27BPackArgs {

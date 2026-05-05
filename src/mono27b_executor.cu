@@ -1995,20 +1995,37 @@ extern "C" bool mono27b_engine_decode_step(
             debug_dump_vec(debug_fp, "out", -1, pos, tok, "output_norm", h2, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
         }
     }
-    // REAL LM head: use the proper Q6_K matvec in chunks
+    // REAL LM head: quantize h2 to Q8_1 once, then use dp4a for all vocab rows.
+    // This matches llama.cpp's mmvq (matrix-vector quantized) path for Q6_K.
     {
         int total = (int)we->lm_head.row_count;
         int rb = (int)we->lm_head.row_blocks;
         auto * base = (const BlockQ6K *)we->lm_head.ptr;
-        int chunk = 4096;
-        for (int off = 0; off < total; off += chunk) {
-            int n = (off + chunk > total) ? total - off : chunk;
-            k_q6k_mt<<<n, 256>>>(base + (size_t)off * rb, h2, out->logits + off, rb, n);
+        // n_q8 = rb * 8 = 20 * 8 = 160, well within scratch capacity of 544
+        int n_q8 = rb * 8;
+        if (g_q8_scratch && n_q8 <= 544) {
+            // Quantize h2 → Q8_1 once (same input for all rows)
+            k_quant_q8_1<<<(n_q8 + 127) / 128, 128>>>(h2, g_q8_scratch, MONO27B_TARGET_HIDDEN);
             sync_err = cudaDeviceSynchronize();
-            if (sync_err != cudaSuccess) break;
+            if (sync_err == cudaSuccess) {
+                // One big kernel launch for all vocab rows
+                k_q6k_mv_q8_dp4a<<<total, 128>>>(base, g_q8_scratch, out->logits, rb, total);
+                sync_err = cudaDeviceSynchronize();
+            }
+        }
+        if (!g_q8_scratch || n_q8 > 544 || sync_err != cudaSuccess) {
+            // Fallback: F32 dequant path in chunks
+            sync_err = cudaSuccess;
+            int chunk = 4096;
+            for (int off = 0; off < total; off += chunk) {
+                int n = (off + chunk > total) ? total - off : chunk;
+                k_q6k_mt<<<n, 256>>>(base + (size_t)off * rb, h2, out->logits + off, rb, n);
+                sync_err = cudaDeviceSynchronize();
+                if (sync_err != cudaSuccess) break;
+            }
         }
         if (sync_err != cudaSuccess) {
-            // Fallback: identity output
+            // Last-resort fallback
             cudaMemset(out->logits, 0, MONO27B_TARGET_VOCAB * sizeof(float));
             float v = 1.0f;
             cudaMemcpy(out->logits, &v, 4, cudaMemcpyHostToDevice);

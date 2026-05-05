@@ -75,6 +75,14 @@ bool mono27b_parse_chat_args(int argc, char ** argv, Mono27BChatArgs & out) {
             out.replay_trace_path = argv[++i];
             continue;
         }
+        if (arg == "--greedy") {
+            out.greedy = true;
+            continue;
+        }
+        if (arg == "--chat") {
+            out.chat = true;
+            continue;
+        }
         return false;
     }
     const bool has_blob = !out.blob_path.empty();

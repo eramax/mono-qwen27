@@ -390,6 +390,16 @@ int main(int argc, char ** argv) {
                                     user_prompt.back() == '\t' || user_prompt.back() == ' ')) {
         user_prompt.pop_back();
     }
+
+    // --chat: wrap prompt in Qwen3 chat format to match llama.cpp template behavior.
+    // Format: <|im_start|>user\n{msg}\n<|im_end|>\n<|im_start|>assistant\n
+    // <|im_end|> (248046) is a single special token; <|im_start|> is character tokens.
+    if (args.chat) {
+        // Qwen3 chat template: <|im_start|>user\n{msg}\n<|im_end|>\n<|im_start|>assistant
+        // No trailing \n — model generates the newline as its first token.
+        user_prompt = "<|im_start|>user\n" + user_prompt + "\n<|im_end|>\n<|im_start|>assistant";
+    }
+
     std::vector<int32_t> prompt_ids;
     prompt_ids = tokenizer.encode(user_prompt);
     if (gguf.metadata.add_bos_token) {
@@ -485,6 +495,8 @@ int main(int argc, char ** argv) {
             chosen = replay_tokens[static_cast<size_t>(step)];
             best = argmax_from_logits(logits_host, &best);
             std::fprintf(stderr, "[replay] step %d forcing token %d\n", step, chosen);
+        } else if (args.greedy) {
+            chosen = argmax_from_logits(logits_host, &best);
         } else {
             chosen = sample_from_logits(logits_host, gguf, rng, top_k, top_p, min_p, &best);
         }

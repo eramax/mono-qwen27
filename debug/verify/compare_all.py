@@ -195,10 +195,17 @@ def compare_tensors(our_vals, ref_vals):
         'gt_1pct': sum(1 for r in robust_rels if r > 0.01),
         'gt_5pct': sum(1 for r in robust_rels if r > 0.05),
         'gt_10pct': sum(1 for r in robust_rels if r > 0.10),
+        'max_abs_ref': max_abs,
     }
 
-    # PASS threshold: either very small absolute or small relative
-    stats['pass'] = (stats['max_diff'] < 1e-4) or (stats['rel_max'] < 0.01)
+    # PASS thresholds:
+    #   exact-match kernels (embedding, RMS norm): max_diff < 1e-4
+    #   quantized matvec (Q4_K/Q5_K/Q6_K dp4a): max_diff / max_abs_ref < 0.05
+    # Normalising by max_abs_ref avoids false FAILs from near-zero denominators
+    # (a 0.01 absolute diff on an element whose ref is 0.003 gives 3x relative
+    # diff even though the error is negligible relative to the tensor's scale).
+    scale_err = stats['max_diff'] / max(max_abs, 1e-6)
+    stats['pass'] = (stats['max_diff'] < 1e-4) or (scale_err < 0.05)
     return stats
 
 
