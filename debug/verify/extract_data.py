@@ -10,16 +10,20 @@ with open(debug_path, 'r') as f:
 
 saved = 0
 for line in content.split('\n'):
-    if line.startswith('embed\t0\t0\t44883\th\t5120'):
+    if line.startswith('embed\t0\t0\t'):
         parts = line.strip().split('\t')
+        if len(parts) < 11:
+            continue
         vals = [float(v) for v in parts[10].split(',')]
         with open('embed_full.txt', 'w') as f:
             for v in vals:
                 f.write(f'{v:.10f}\n')
         print(f'Saved embed_full.txt ({len(vals)} vals)')
         saved += 1
-    if 'ssm\t0\t0\t44883\tattn_norm\t5120' in line:
+    if '\tssm\t0\t0\t' in line and '\tattn_norm\t5120' in line:
         parts = line.strip().split('\t')
+        if len(parts) < 11:
+            continue
         vals = [float(v) for v in parts[10].split(',')]
         with open('attn_norm_full.txt', 'w') as f:
             for v in vals:

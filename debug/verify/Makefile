@@ -5,6 +5,7 @@
 # make compare-all   -> comprehensive tensor comparison (all layers, all tensors)
 
 GGUF ?= /mnt/mydata/projects2/specfusion/model/Qwen3.6-27B-UD-Q4_K_XL.gguf
+PROMPT ?= give
 DEBUG ?= /tmp/mono_verify.debug.tsv
 BUILD_BIN = build/mono27b_chat
 REF_DEBUG = /mnt/mydata/projects2/mono27b/ref/llama.cpp/build/bin/llama-debug
@@ -37,7 +38,7 @@ gen-our:
 	@echo "=== Generating OUR debug data ==="
 	@mkdir -p debug/verify
 	@rm -f $(DEBUG)
-	$(BUILD_BIN) -m $(GGUF) -p "give" --gen 1 --ctx 4096 --seed 944990222 \
+	$(BUILD_BIN) -m $(GGUF) -p "$(PROMPT)" --gen 1 --ctx 4096 --seed 944990222 \
 		--trace /dev/null --debug $(DEBUG) > /dev/null 2>&1
 	@cd debug/verify && python3 extract_data.py $(DEBUG)
 	@# Save our logits as binary (prompt token = pos 0)
@@ -51,12 +52,12 @@ gen-ref:
 	@echo ""
 	@echo "=== Generating REFERENCE data (llama-debug) ==="
 	@# Save reference logits
-	$(REF_DEBUG) -m $(GGUF) -p "give" -c 4096 -b 1 -ub 1 \
+	$(REF_DEBUG) -m $(GGUF) -p "$(PROMPT)" -c 4096 -b 1 -ub 1 \
 		--save-logits --logits-output-dir /tmp/ref_logits 2>/dev/null
 	@cp /tmp/ref_logits/llamacpp-Qwen3.6-27B-UD-Q4_K_XL.bin \
 	   debug/verify/ref_logits.bin 2>/dev/null || true
 	@# Save reference intermediate tensors (SSM layer 0 + attention layer 3)
-	$(REF_DEBUG) -m $(GGUF) -p "give" -c 4096 -b 1 -ub 1 \
+	$(REF_DEBUG) -m $(GGUF) -p "$(PROMPT)" -c 4096 -b 1 -ub 1 \
 	--tensor-filter 'model.input_embed$$|attn_norm-0$$|linear_attn_qkv_mixed-0$$|z-0$$|conv_output_raw-0$$|conv_output_silu-0$$|q_conv_predelta-0$$|k_conv_predelta-0$$|attn_output-0$$|final_output-0$$|linear_attn_out-0$$|post_attention_norm-0$$|ffn_gate-0$$|ffn_up-0$$|ffn_mul-0$$|ffn_down-0$$|l_out-0$$|attn_norm-3$$|Qcur_full-3$$|Qcur_normed-3$$|attn_pregate-3$$|attn_gated-3$$|attn_output-3$$|attn_post_norm-3$$|ffn_gate-3$$|ffn_up-3$$|ffn_out-3$$|l_out-3$$' \
 		> /tmp/ref_stdout.txt 2>/tmp/ref_stderr.txt
 	@cp /tmp/ref_stdout.txt debug/verify/ref_intermediates.txt 2>/dev/null || true
