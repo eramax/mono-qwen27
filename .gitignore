@@ -12,3 +12,4 @@ debug/verify/__pycache__
 debug/verify/test_kernels
 debug/verify/debug/
 model/
+embed_full.txt

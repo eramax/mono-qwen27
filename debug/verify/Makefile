@@ -7,17 +7,30 @@
 GGUF ?= /mnt/mydata/projects2/specfusion/model/Qwen3.6-27B-UD-Q4_K_XL.gguf
 PROMPT ?= give
 DEBUG ?= /tmp/mono_verify.debug.tsv
-# Auto-detect project root: if invoked via -f from project root, use CURDIR; if cd'd into debug/verify, use ../..
-PROJ_ROOT := $(shell test -f CMakeLists.txt && echo . || echo ../..)
+
+# Auto-detect invocation: -f from project root vs cd'd into debug/verify
+ifeq ($(wildcard CMakeLists.txt),CMakeLists.txt)
+  PROJ_ROOT := .
+  SCRIPT_DIR := $(CURDIR)/debug/verify
+else
+  PROJ_ROOT := ../..
+  SCRIPT_DIR := $(CURDIR)
+endif
+
 BUILD_BIN = $(PROJ_ROOT)/build/mono27b_chat
 REF_DEBUG = /mnt/mydata/projects2/mono27b/ref/llama.cpp/build/bin/llama-debug
 
-.PHONY: verify verify-only compare-all e2e build gen-our gen-ref run-checks clean
+# Data files (always use absolute paths via SCRIPT_DIR)
+REF_INTERMEDIATES := $(SCRIPT_DIR)/ref_intermediates.txt
+REF_LOGITS := $(SCRIPT_DIR)/ref_logits.bin
+OUR_LOGITS := $(SCRIPT_DIR)/our_logits.bin
+
+.PHONY: verify verify-only compare-all e2e build gen-our gen-ref run-checks clean-data clean
 
 # =========================================================================
-# FULL VERIFY: build + generate BOTH ref + our data + all comparisons
+# FULL VERIFY: clean + build + generate BOTH ref + our data + all comparisons
 # =========================================================================
-verify: build gen-our gen-ref run-checks compare-all
+verify: clean-data build gen-our gen-ref run-checks compare-all
 
 verify-only: run-checks compare-all
 
@@ -38,13 +51,11 @@ build:
 gen-our:
 	@echo ""
 	@echo "=== Generating OUR debug data ==="
-	
 	@rm -f $(DEBUG)
 	$(BUILD_BIN) -m $(GGUF) -p "$(PROMPT)" --gen 1 --ctx 4096 --seed 944990222 \
 		--trace /dev/null --debug $(DEBUG) > /dev/null 2>&1
-	@python3 extract_data.py $(DEBUG)
-	@# Save our logits as binary (prompt token = pos 0)
-	@cp /tmp/our_logits_0.bin our_logits.bin 2>/dev/null || true
+	@python3 $(SCRIPT_DIR)/extract_data.py $(DEBUG)
+	@cp /tmp/our_logits_0.bin $(OUR_LOGITS) 2>/dev/null || true
 	@echo "  Our data ready."
 
 # =========================================================================
@@ -55,11 +66,12 @@ gen-our:
 gen-ref:
 	@echo ""
 	@echo "=== Generating REFERENCE data (llama-debug, per-layer runs) ==="
+	@rm -f $(REF_INTERMEDIATES) $(REF_LOGITS)
 	@# Save reference logits (prompt token)
 	$(REF_DEBUG) -m $(GGUF) -p "$(PROMPT)" -c 4096 -b 1 -ub 1 \
 		--save-logits --logits-output-dir /tmp/ref_logits 2>/dev/null
 	@cp /tmp/ref_logits/llamacpp-Qwen3.6-27B-UD-Q4_K_XL.bin \
-	   ref_logits.bin 2>/dev/null || true
+	   $(REF_LOGITS) 2>/dev/null || true
 	@# Run 1: embedding + SSM layer 0 pre-FFN
 	$(REF_DEBUG) -m $(GGUF) -p "$(PROMPT)" -c 4096 -b 1 -ub 1 \
 		--tensor-filter 'model.input_embed$$|attn_norm-0$$|z-0$$|conv_output_raw-0$$|conv_output_silu-0$$' \
@@ -82,7 +94,7 @@ gen-ref:
 		> /tmp/ref_run5.txt 2>/dev/null
 	@# Merge all runs into a single ref_intermediates.txt
 	@cat /tmp/ref_run1.txt /tmp/ref_run2.txt /tmp/ref_run3.txt \
-	     /tmp/ref_run4.txt /tmp/ref_run5.txt > ref_intermediates.txt
+	     /tmp/ref_run4.txt /tmp/ref_run5.txt > $(REF_INTERMEDIATES)
 	@echo "  Reference data ready."
 
 # =========================================================================
@@ -91,8 +103,8 @@ gen-ref:
 run-checks:
 	@echo ""
 	@echo "=== Running Component Checks ==="
-	@python3 run_all_checks.py \
-		--gguf $(GGUF) --debug $(DEBUG) --ref-intermediates ref_intermediates.txt
+	@python3 $(SCRIPT_DIR)/run_all_checks.py \
+		--gguf $(GGUF) --debug $(DEBUG) --ref-intermediates $(REF_INTERMEDIATES)
 
 # =========================================================================
 # COMPREHENSIVE TENSOR COMPARISON (all comparable tensors, all layers)
@@ -100,21 +112,26 @@ run-checks:
 compare-all:
 	@echo ""
 	@echo "=== Running Comprehensive Tensor Comparison ==="
-	@python3 compare_all.py \
+	@python3 $(SCRIPT_DIR)/compare_all.py \
 		--our-debug $(DEBUG) \
-		--ref ref_intermediates.txt \
-		--ref-logits ref_logits.bin \
-		--our-logits our_logits.bin
+		--ref $(REF_INTERMEDIATES) \
+		--ref-logits $(REF_LOGITS) \
+		--our-logits $(OUR_LOGITS)
 
 # =========================================================================
 # END-TO-END LOGIT COMPARISON (standalone)
 # =========================================================================
-e2e: build gen-our gen-ref
-	@python3 compare_e2e.py
+e2e: clean-data build gen-our gen-ref
+	@python3 $(SCRIPT_DIR)/compare_e2e.py
 
 # =========================================================================
 # CLEAN
 # =========================================================================
-clean:
-	rm -f embed_full.txt attn_norm_full.txt
-	rm -f ref_intermediates.txt ref_logits.bin our_logits.bin
+clean-data:
+	@rm -f $(REF_INTERMEDIATES) $(REF_LOGITS) $(OUR_LOGITS)
+	@rm -f $(SCRIPT_DIR)/embed_full.txt $(SCRIPT_DIR)/attn_norm_full.txt
+	@rm -f $(DEBUG)
+	@rm -f /tmp/our_logits_*.bin /tmp/ref_run*.txt
+	@rm -rf /tmp/ref_logits
+
+clean: clean-data
