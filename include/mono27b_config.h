@@ -5,6 +5,9 @@
 #include <cstddef>
 #include <cstdio>
 
+// Global quiet flag — suppresses DBG messages from executor
+extern bool g_mono27b_quiet;
+
 // Model architecture constants — Qwen3.5-27B hybrid
 constexpr int MONO27B_TARGET_N_HEAD     = 24;
 constexpr int MONO27B_TARGET_N_KV_HEAD  = 4;

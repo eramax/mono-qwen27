@@ -10,6 +10,8 @@
 #include <cstring>
 #include <vector>
 
+bool g_mono27b_quiet = false;
+
 // ─── Quant Block Layouts ─────────────────────────────────────────────────────
 
 struct BlockQ4K {

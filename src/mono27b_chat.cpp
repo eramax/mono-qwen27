@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -419,6 +420,11 @@ int main(int argc, char ** argv) {
     int last_tok = 0;
     std::vector<int32_t> generated;
     std::vector<float> last_prompt_logits;
+    using clock = std::chrono::steady_clock;
+    auto t_prefill_start = clock::now();
+    auto t_prefill_end = t_prefill_start;
+    auto t_gen_start = t_prefill_start;
+    auto t_gen_end = t_prefill_start;
     std::ofstream trace;
     std::FILE * debug_fp = nullptr;
     std::vector<int32_t> replay_tokens = load_replay_tokens(args.replay_trace_path);
@@ -438,6 +444,7 @@ int main(int argc, char ** argv) {
         }
         std::fprintf(debug_fp, "phase\tstep\tpos\ttok\tlabel\tn\tmin\tmax\tmean\tl2\tvalues\n");
     }
+    t_prefill_start = clock::now();
     for (size_t i = 0; i < prompt_ids.size(); ++i) {
         Mono27BLogitsOutput logits{};
         if (!mono27b_engine_decode_step(&gpu_weights, &state,
@@ -477,10 +484,13 @@ int main(int argc, char ** argv) {
         }
         mono27b_engine_free_logits(&logits);
     }
+    t_prefill_end = clock::now();
 
     // Generate tokens — step 0 reuses logits from last prompt token (matching llama.cpp).
     pos = static_cast<int>(prompt_ids.size());
     last_tok = prompt_ids.empty() ? 0 : prompt_ids.back();
+
+    t_gen_start = clock::now();
 
     for (int step = 0; step < std::max(1, args.max_gen); ++step) {
         std::vector<float> logits_host;
@@ -536,6 +546,7 @@ int main(int argc, char ** argv) {
         generated.push_back(chosen);
         last_tok = chosen;
     }
+    t_gen_end = clock::now();
 
     // Decode and output
     if (quiet && !generated.empty()) {
@@ -548,6 +559,67 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "[assistant]\n%s\n", text.c_str());
     } else if (!quiet) {
         std::fprintf(stderr, "[generated] (no tokens)\n");
+    }
+
+    // Print performance stats
+    {
+        double prefill_ms = std::chrono::duration<double, std::milli>(t_prefill_end - t_prefill_start).count();
+        double gen_ms = std::chrono::duration<double, std::milli>(t_gen_end - t_gen_start).count();
+        int n_prompt = static_cast<int>(prompt_ids.size());
+        int n_gen = static_cast<int>(generated.size());
+        double prefill_tps = (n_prompt > 0 && prefill_ms > 0) ? (n_prompt / prefill_ms * 1000.0) : 0.0;
+        double gen_tps = (n_gen > 0 && gen_ms > 0) ? (n_gen / gen_ms * 1000.0) : 0.0;
+
+        size_t vram_free = 0, vram_total = 0;
+        cudaMemGetInfo(&vram_free, &vram_total);
+        size_t vram_used = vram_total - vram_free;
+
+        cudaDeviceProp prop{};
+        cudaGetDeviceProperties(&prop, 0);
+
+        auto mb = [](size_t bytes) -> long long { return static_cast<long long>(bytes / (1024 * 1024)); };
+
+        // Box width = 54 chars. Content area = 39 chars (between label end and right border)
+        // Extract model filename from path
+        std::string model_name = target_path;
+        auto last_slash = model_name.rfind('/');
+        if (last_slash != std::string::npos) model_name = model_name.substr(last_slash + 1);
+        if (model_name.size() > 39) model_name.resize(39);
+
+        std::fprintf(stderr, "\n");
+        std::fprintf(stderr, "╔════════════════════════════════════════════════════╗\n");
+        std::fprintf(stderr, "║              Performance Summary                   ║\n");
+        std::fprintf(stderr, "╠════════════════════════════════════════════════════╣\n");
+        std::fprintf(stderr, "║  GPU       %-40s║\n", prop.name);
+        std::fprintf(stderr, "║  Model     %-40s║\n", model_name.c_str());
+        std::fprintf(stderr, "╠════════════════════════════════════════════════════╣\n");
+
+        // Timing rows
+        char buf1[64], buf2[64];
+        std::snprintf(buf1, sizeof(buf1), "%.1f ms / %d tok = %.1f tok/s", prefill_ms, n_prompt, prefill_tps);
+        std::snprintf(buf2, sizeof(buf2), "%.1f ms / %d tok = %.1f tok/s", gen_ms, n_gen, gen_tps);
+        std::fprintf(stderr, "║  Prefill   %-40s║\n", buf1);
+        std::fprintf(stderr, "║  Generate  %-40s║\n", buf2);
+
+        std::fprintf(stderr, "╠════════════════════════════════════════════════════╣\n");
+
+        // Context + tokens
+        char buf3[64], buf4[64], buf5[64];
+        std::snprintf(buf3, sizeof(buf3), "%d / %d", pos, args.max_ctx);
+        std::snprintf(buf4, sizeof(buf4), "%d tokens", n_gen);
+        std::snprintf(buf5, sizeof(buf5), "%lld MiB / %lld MiB (%.1f%%)",
+                      mb(vram_used), mb(vram_total),
+                      vram_total > 0 ? (100.0 * vram_used / vram_total) : 0.0);
+        std::fprintf(stderr, "║  Ctx       %-40s║\n", buf3);
+        std::fprintf(stderr, "║  Output    %-40s║\n", buf4);
+        std::fprintf(stderr, "║  VRAM      %-40s║\n", buf5);
+
+        char buf6[32];
+        std::snprintf(buf6, sizeof(buf6), "%lld MiB", mb(vram_free));
+        std::fprintf(stderr, "║  VRAM free %-40s║\n", buf6);
+
+        std::fprintf(stderr, "╚════════════════════════════════════════════════════╝\n");
+        std::fprintf(stderr, "\n");
     }
 
 cleanup:
