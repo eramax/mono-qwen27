@@ -2,3 +2,6 @@ understand this app, it is a dependency free engine to run qwen 27 gguf 4km . i 
 I am not sure we are using the same way to calc tk/s which llama.cpp uses.
 the generated text is diffent i think we supposed to have exact the generated text. 
 there are some changes now but i dont know if we should merge them since i feel it affect the generated thinking data 
+check also the template is impleted correct as llama.cpp
+try make e2e-text-all
+

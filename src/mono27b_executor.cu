@@ -977,40 +977,87 @@ static bool q4k_embed_host(const BlockQ4K * rows_dev, int tok, float * hidden,
 
 // ─── Single-token attention (1 thread, sequential) ──────────────────────────
 
-// Attention: proper softmax with KV cache in [pos][head][dim] layout
-__global__ static void k_attn_1t(const float * Q, const float * K, const float * V, float * O,
-                                  int kv_len, int n_h, int n_kvh, int hd, int max_ctx, float scale) {
+// ─── Parallel attention: cooperative dot product, softmax, weighted sum ─────
+// Each block handles one query head. All 256 threads cooperate on dot products,
+// softmax reduction, and output accumulation. This replaces the old single-thread
+// kernel which was both slow and numerically different from flash attention.
+__global__ static void k_attn_parallel(
+    const float * __restrict__ Q, const float * __restrict__ K,
+    const float * __restrict__ V, float * __restrict__ O,
+    int kv_len, int n_h, int n_kvh, int hd, int max_ctx, float scale) {
+
     int qh = blockIdx.x;
     if (qh >= n_h) return;
     int kvh = qh / (n_h / n_kvh);
     const float * qr = Q + (size_t)qh * hd;
     float * or_ = O + (size_t)qh * hd;
     size_t pos_stride = (size_t)n_kvh * hd;
+    int t = threadIdx.x;
 
-    if (threadIdx.x == 0) {
-        extern __shared__ float scores[];
-        float maxv = -1e30f;
-        for (int p = 0; p < kv_len; ++p) {
-            const float * kr = K + (size_t)p * pos_stride + (size_t)kvh * hd;
-            float d = 0.0f;
-            for (int j = 0; j < hd; ++j) d += qr[j] * kr[j];
-            d *= scale; scores[p] = d;
-            if (d > maxv) maxv = d;
+    // Shared memory: scores[kv_len] + max_val[1] + sum_exp[1] + scratch[256]
+    extern __shared__ float smem[];
+    float * scores  = smem;
+    float * s_max   = smem + kv_len;
+    float * s_sum   = s_max + 1;
+    float * scratch = s_sum + 1;
+
+    // Each thread loads one element of Q (reused across all positions)
+    float q_elem = qr[t];
+
+    // Phase 1: compute dot products and find max
+    float maxv = -1e30f;
+    for (int p = 0; p < kv_len; ++p) {
+        const float * kr = K + (size_t)p * pos_stride + (size_t)kvh * hd;
+        float d = q_elem * kr[t];
+        scratch[t] = d;
+        // Block reduction (tree) to sum all partial dots
+        for (int s = hd / 2; s > 0; s >>= 1) {
+            __syncthreads();
+            if (t < s) scratch[t] += scratch[t + s];
         }
-        if (maxv > 64.0f) maxv = 64.0f;
-        float sume = 0.0f;
-        for (int p = 0; p < kv_len; ++p) {
-            float v = expf(fmaxf(scores[p] - maxv, -64.0f));
-            scores[p] = v; sume += v;
+        __syncthreads();
+        if (t == 0) {
+            float dot = scratch[0] * scale;
+            scores[p] = dot;
+            if (dot > maxv) maxv = dot;
         }
-        float invs = 1.0f / (sume + 1e-10f);
-        for (int d = 0; d < hd; ++d) {
-            float v = 0.0f;
-            for (int p = 0; p < kv_len; ++p)
-                v += scores[p] * V[(size_t)p * pos_stride + (size_t)kvh * hd + d];
-            or_[d] = v * invs;
-        }
+        __syncthreads();
     }
+    __syncthreads();
+
+    // Broadcast max to all threads via shared memory
+    if (t == 0) {
+        if (maxv > 64.0f) maxv = 64.0f;
+        s_max[0] = maxv;
+    }
+    __syncthreads();
+    maxv = s_max[0];
+
+    // Phase 2: softmax — compute exp(s - max) and sum
+    float local_sum = 0.0f;
+    for (int p = t; p < kv_len; p += blockDim.x) {
+        float v = expf(fmaxf(scores[p] - maxv, -64.0f));
+        scores[p] = v;
+        local_sum += v;
+    }
+    // Reduce partial sums
+    scratch[t] = local_sum;
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        __syncthreads();
+        if (t < s) scratch[t] += scratch[t + s];
+    }
+    __syncthreads();
+    if (t == 0) s_sum[0] = scratch[0];
+    __syncthreads();
+    float inv_sum = 1.0f / (s_sum[0] + 1e-10f);
+
+    // Phase 3: weighted sum of V values
+    float out_val = 0.0f;
+    for (int p = 0; p < kv_len; ++p) {
+        float sv = scores[p] * inv_sum;
+        out_val += sv * V[(size_t)p * pos_stride + (size_t)kvh * hd + t];
+    }
+    or_[t] = out_val;
 }
 
 // ─── SSM conv1d (1 thread per channel) ───────────────────────────────────────
@@ -1480,37 +1527,62 @@ static void l_q6k(const BlockQ6K * W, int rb, int rc, const float * x, float * y
 // File-scope pointer to Q8_1 scratch buffer (set by engine before decode step)
 static BlockQ8_1 * g_q8_scratch = nullptr;
 
-// Type-dispatched matvec: W at ggml_type, rb blocks per row, rc rows, x input, y output
-static void l_mv(void * W, uint32_t ggml_type, int rb, int rc, const float * x, float * y) {
-    if (rc == 0 || !W) return;
-    // Q8_1-based dp4a path for K-quant types (matches ggml mmvq)
-    int n_q8 = rb * 8;  // 256 elements per K-quant block / 32 per Q8_1 block
+// Forward declarations
+static void l_mv_q8(void * W, uint32_t ggml_type, int rb, int rc, float * y);
+static void l_mv_fallback(void * W, uint32_t ggml_type, int rb, int rc, const float * x, float * y);
+
+// Quantize x to Q8_1 in the global scratch buffer; returns n_q8 blocks used
+static int l_quant_q8(const float * x, int rb) {
+    int n_q8 = rb * 8;
     if (g_q8_scratch && n_q8 <= 544) {
+        k_quant_q8_1<<<(n_q8 + 127) / 128, 128>>>(x, g_q8_scratch, n_q8 * 32);
+    }
+    return n_q8;
+}
+
+// Single matvec: quantizes input, launches matvec (convenience wrapper)
+static void l_mv_quant(void * W, uint32_t ggml_type, int rb, int rc, const float * x, float * y) {
+    if (rc == 0 || !W) return;
+    // Try Q8_1 dp4a path for K-quant types (fast).
+    // For F32/F16/Q8_0/etc., fall through to the f32 dequant fallback.
+    if (g_q8_scratch && rb * 8 <= 544) {
         switch (ggml_type) {
-            case MONO27B_GGML_TYPE_Q4_K: {
-                k_quant_q8_1<<<(n_q8 + 127) / 128, 128>>>(x, g_q8_scratch, n_q8 * 32);
-                k_q4k_mv_q8_dp4a<<<rc, 128>>>((const BlockQ4K *)W, g_q8_scratch, y, rb, rc);
+            case MONO27B_GGML_TYPE_Q4_K:
+            case MONO27B_GGML_TYPE_Q5_K:
+            case MONO27B_GGML_TYPE_Q6_K:
+            case 23:
+                l_quant_q8(x, rb);
+                l_mv_q8(W, ggml_type, rb, rc, y);
                 return;
-            }
-            case MONO27B_GGML_TYPE_Q5_K: {
-                k_quant_q8_1<<<(n_q8 + 127) / 128, 128>>>(x, g_q8_scratch, n_q8 * 32);
-                k_q5k_mv_q8<<<rc, 128>>>((const BlockQ5K *)W, g_q8_scratch, y, rb, rc);
-                return;
-            }
-            case MONO27B_GGML_TYPE_Q6_K: {
-                k_quant_q8_1<<<(n_q8 + 127) / 128, 128>>>(x, g_q8_scratch, n_q8 * 32);
-                k_q6k_mv_q8_dp4a<<<rc, 128>>>((const BlockQ6K *)W, g_q8_scratch, y, rb, rc);
-                return;
-            }
-            case 23: {
-                k_quant_q8_1<<<(n_q8 + 127) / 128, 128>>>(x, g_q8_scratch, n_q8 * 32);
-                k_iq4xs_mv_q8_dp4a<<<rc, 128>>>((const BlockIQ4XS *)W, g_q8_scratch, y, rb, rc);
-                return;
-            }
             default: break;
         }
     }
-    // Fallback: original F32-path
+    l_mv_fallback(W, ggml_type, rb, rc, x, y);
+}
+
+// Matvec using ALREADY QUANTIZED Q8_1 data in g_q8_scratch
+static void l_mv_q8(void * W, uint32_t ggml_type, int rb, int rc, float * y) {
+    if (rc == 0 || !W) return;
+    if (!g_q8_scratch || rb * 8 > 544) return;
+    switch (ggml_type) {
+        case MONO27B_GGML_TYPE_Q4_K:
+            k_q4k_mv_q8_dp4a<<<rc, 128>>>((const BlockQ4K *)W, g_q8_scratch, y, rb, rc);
+            return;
+        case MONO27B_GGML_TYPE_Q5_K:
+            k_q5k_mv_q8<<<rc, 128>>>((const BlockQ5K *)W, g_q8_scratch, y, rb, rc);
+            return;
+        case MONO27B_GGML_TYPE_Q6_K:
+            k_q6k_mv_q8_dp4a<<<rc, 128>>>((const BlockQ6K *)W, g_q8_scratch, y, rb, rc);
+            return;
+        case 23:
+            k_iq4xs_mv_q8_dp4a<<<rc, 128>>>((const BlockIQ4XS *)W, g_q8_scratch, y, rb, rc);
+            return;
+        default: break;
+    }
+}
+
+// Fallback path (F32 dequant)
+static void l_mv_fallback(void * W, uint32_t ggml_type, int rb, int rc, const float * x, float * y) {
     switch (ggml_type) {
         case MONO27B_GGML_TYPE_Q4_K: l_q4k((const BlockQ4K *)W, rb, rc, x, y); break;
         case MONO27B_GGML_TYPE_Q5_K: l_q5k((const BlockQ5K *)W, rb, rc, x, y); break;
@@ -1578,9 +1650,25 @@ static void debug_dump_vec(FILE * fp, const char * phase, int step, int pos, int
 
 // ─── decode_step ─────────────────────────────────────────────────────────────
 
-#define MV(wv, x, y) l_mv((wv).ptr, (wv).ggml_type, (wv).row_blocks, (wv).row_count, x, y)
+#define MV(wv, x, y) l_mv_quant((wv).ptr, (wv).ggml_type, (wv).row_blocks, (wv).row_count, x, y)
+#define MV_Q8(wv, y) l_mv_q8((wv).ptr, (wv).ggml_type, (wv).row_blocks, (wv).row_count, y)
 #define WV(wv) ((const float *)(wv).ptr)
 #define TRACE(lbl) ((void)0)
+
+// Production-performance CHECK_FINITE: skip finite checks for speed.
+// In debug mode, include them to catch NaN/Inf early.
+#ifdef MONO27B_DEBUG_FINITE
+#define CHECK_FINITE(label, ptr, n) do { \
+    if (!check_finite_device(label, ptr, n, error, error_cap)) goto cleanup; \
+} while(0)
+#define CHECK_FINITE_FMT(fmt, arg, ptr, n) do { \
+    char _lbl[64]; std::snprintf(_lbl, sizeof(_lbl), fmt, arg); \
+    if (!check_finite_device(_lbl, ptr, n, error, error_cap)) goto cleanup; \
+} while(0)
+#else
+#define CHECK_FINITE(label, ptr, n) ((void)0)
+#define CHECK_FINITE_FMT(fmt, arg, ptr, n) ((void)0)
+#endif
 
 extern "C" bool mono27b_engine_decode_step(
     const Mono27BExecutorWeights * we,
@@ -1719,13 +1807,11 @@ extern "C" bool mono27b_engine_decode_step(
             }
             TRACE("kvc");
 
-            // Attention: copy Q through (identity attention, use V values)
-            // V values are in kb + KV_DIM, need to copy appropriate heads
-            // For now: just copy first KV_DIM values of V directly as output
+            // Attention: parallel cooperative kernel
             {
                 int kvl = pos + 1;
-                // Use the correct attention kernel
-                k_attn_1t<<<MONO27B_TARGET_N_HEAD, 1, (size_t)kvl * sizeof(float)>>>(
+                size_t smem_sz = ((size_t)kvl + 2 + MONO27B_TARGET_HEAD_DIM) * sizeof(float);
+                k_attn_parallel<<<MONO27B_TARGET_N_HEAD, MONO27B_TARGET_HEAD_DIM, smem_sz>>>(
                     qb, st->kv_cache_k[fa_i], st->kv_cache_v[fa_i], qb,
                     kvl, MONO27B_TARGET_N_HEAD, MONO27B_TARGET_N_KV_HEAD,
                     MONO27B_TARGET_HEAD_DIM, max_ctx, 1.0f / sqrtf(MONO27B_TARGET_HEAD_DIM));
@@ -1759,18 +1845,12 @@ extern "C" bool mono27b_engine_decode_step(
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "ffn_up", kb, MONO27B_TARGET_FFN, MONO27B_TARGET_FFN);
             }
             k_elem_swiglu<<<(MONO27B_TARGET_FFN + 255) / 256, 256>>>(fb, kb, MONO27B_TARGET_FFN); TRACE("mul");
-            { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d ffn: %s", il, cudaGetErrorString(e)); goto cleanup; } }
             MV(L.ffn_down, fb, h); TRACE("fd");
             if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "ffn_down", h, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
             }
             k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h, h2, MONO27B_TARGET_HIDDEN);
-            { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d attn: %s", il, cudaGetErrorString(e)); goto cleanup; } }
-            {
-                char lbl[64];
-                std::snprintf(lbl, sizeof(lbl), "attn layer %d output", il);
-                if (!check_finite_device(lbl, h, MONO27B_TARGET_HIDDEN, error, error_cap)) goto cleanup;
-            }
+            CHECK_FINITE_FMT("attn layer %d output", il, h, MONO27B_TARGET_HIDDEN);
             if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "post_ffn", h, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
             }
@@ -1803,14 +1883,11 @@ extern "C" bool mono27b_engine_decode_step(
                 int dr = MONO27B_SSM_DT_RANK;
                 MV(L.ssm_beta, h2, kb);
                 k_elem_sigmoid<<<(dr + 31) / 32, 32>>>(kb, dr);
-                { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d beta: %s", il, cudaGetErrorString(e)); goto cleanup; } }
-                if (!check_finite_device("ssm beta", kb, dr, error, error_cap)) goto cleanup;
+                CHECK_FINITE("ssm beta", kb, dr);
                 MV(L.ssm_alpha, h2, qb);
-                { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d alp: %s", il, cudaGetErrorString(e)); goto cleanup; } }
                 k_elem_softplus<<<(dr + 31) / 32, 32>>>(qb, WV(L.ssm_dt_bias), qb, dr);
                 k_elem_mul<<<(dr + 31) / 32, 32>>>(qb, WV(L.ssm_a_log), dr);
-                { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d dt: %s", il, cudaGetErrorString(e)); goto cleanup; } }
-                if (!check_finite_device("ssm dt", qb, dr, error, error_cap)) goto cleanup;
+                CHECK_FINITE("ssm dt", qb, dr);
                 if (dump_step && il < 4) {
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "beta", kb, dr);
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "dt", qb, dr);
@@ -1856,8 +1933,7 @@ extern "C" bool mono27b_engine_decode_step(
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "conv_raw", sb, MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_CH);
                 }
                 k_elem_silu<<<(MONO27B_SSM_CONV_CH + 255) / 256, 256>>>(sb, MONO27B_SSM_CONV_CH);
-                { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d conv: %s", il, cudaGetErrorString(e)); goto cleanup; } }
-                if (!check_finite_device("ssm conv", sb, MONO27B_SSM_CONV_CH, error, error_cap)) goto cleanup;
+                CHECK_FINITE("ssm conv", sb, MONO27B_SSM_CONV_CH);
                 if (dump_step && il < 3) {
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "conv", sb, MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_CH);
                 }
@@ -1868,8 +1944,7 @@ extern "C" bool mono27b_engine_decode_step(
 
                 k_l2_norm_g<<<MONO27B_SSM_N_GROUP, 128>>>(qr, MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP);
                 k_l2_norm_g<<<MONO27B_SSM_N_GROUP, 128>>>(kr, MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP);
-                { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d l2: %s", il, cudaGetErrorString(e)); goto cleanup; } }
-                if (!check_finite_device("ssm qk", sb, MONO27B_SSM_CONV_CH, error, error_cap)) goto cleanup;
+                CHECK_FINITE("ssm qk", sb, MONO27B_SSM_CONV_CH);
 
                 // Gated DeltaNet
                 if (st->ssm_state[ssm_i]) {
@@ -1877,8 +1952,7 @@ extern "C" bool mono27b_engine_decode_step(
                         st->ssm_state[ssm_i], gb, st->ssm_state[ssm_i],
                         MONO27B_SSM_N_GROUP, MONO27B_SSM_DT_RANK,
                         MONO27B_SSM_HEAD_V, MONO27B_SSM_HEAD_K);
-                    { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d deltanet: %s", il, cudaGetErrorString(e)); goto cleanup; } }
-                    if (!check_finite_device("ssm deltanet", gb, MONO27B_SSM_D_INNER, error, error_cap)) goto cleanup;
+                    CHECK_FINITE("ssm deltanet", gb, MONO27B_SSM_D_INNER);
                     if (dump_step && il < 4) {
                         debug_dump_vec(debug_fp, "ssm", il, pos, tok, "deltanet", gb, MONO27B_SSM_D_INNER, MONO27B_SSM_D_INNER);
                     }
@@ -1916,12 +1990,7 @@ extern "C" bool mono27b_engine_decode_step(
                 }
                 k_elem_copy<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h2, sb, MONO27B_TARGET_HIDDEN); TRACE("scp");
                 k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h2, h, MONO27B_TARGET_HIDDEN); TRACE("sadd");
-                { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d ssm: %s", il, cudaGetErrorString(e)); goto cleanup; } }
-                {
-                    char lbl[64];
-                    std::snprintf(lbl, sizeof(lbl), "ssm layer %d output", il);
-                    if (!check_finite_device(lbl, h2, MONO27B_TARGET_HIDDEN, error, error_cap)) goto cleanup;
-                }
+                CHECK_FINITE_FMT("ssm layer %d output", il, h2, MONO27B_TARGET_HIDDEN);
                 if (dump_step && il < MONO27B_TARGET_LAYERS) {
                     // layer_out will be dumped after FFN below
                 }
@@ -1939,12 +2008,7 @@ extern "C" bool mono27b_engine_decode_step(
                 }
                 MV(L.ssm_out, sb, h2);
                 k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h2, h, MONO27B_TARGET_HIDDEN);
-                { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d ssm2: %s", il, cudaGetErrorString(e)); goto cleanup; } }
-                {
-                    char lbl[64];
-                    std::snprintf(lbl, sizeof(lbl), "ssm layer %d output", il);
-                    if (!check_finite_device(lbl, h2, MONO27B_TARGET_HIDDEN, error, error_cap)) goto cleanup;
-                }
+                CHECK_FINITE_FMT("ssm layer %d output", il, h2, MONO27B_TARGET_HIDDEN);
             }
 
         ssm_ffn:
@@ -1961,7 +2025,6 @@ extern "C" bool mono27b_engine_decode_step(
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ffn_up", kb, MONO27B_TARGET_FFN, MONO27B_TARGET_FFN);
             }
             k_elem_swiglu<<<(MONO27B_TARGET_FFN + 255) / 256, 256>>>(fb, kb, MONO27B_TARGET_FFN);
-            { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) { std::snprintf(error, error_cap, "l%d ffn: %s", il, cudaGetErrorString(e)); goto cleanup; } }
             if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ffn_mul", fb, MONO27B_TARGET_FFN, MONO27B_TARGET_FFN);
             }

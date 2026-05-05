@@ -406,9 +406,9 @@ int main(int argc, char ** argv) {
         user_prompt.pop_back();
     }
 
-    // --chat: render the same ChatML framing used by llama.cpp conversation mode.
+    // --chat: render the same Qwen thinking template used by llama.cpp.
     if (args.chat) {
-        user_prompt = "<|im_start|>user\n" + user_prompt + "<|im_end|>\n<|im_start|>assistant\n";
+        user_prompt = "<|im_start|>user\n" + user_prompt + "<|im_end|>\n<|im_start|>assistant\n<think>\n";
     }
 
     std::vector<int32_t> prompt_ids;
