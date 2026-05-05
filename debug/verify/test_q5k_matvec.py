@@ -101,7 +101,11 @@ def main():
     print(f"CPU dot: {cpu_dot:.10f}")
     print(f"GPU val: {gpu_val:.10f}")
     print(f"Diff:    {abs(cpu_dot - gpu_val):.10f}")
-    print(f"MATCH:   {'YES' if abs(cpu_dot - gpu_val) < 1e-4 else 'NO'}")
+    # GPU now uses Q8_1 + __dp4a (matching llama.cpp mmvq), which naturally
+    # differs from CPU F32 dequant by ~1-2%. E2E parity is verified via
+    # compare_intermediates_last.py against llama-debug reference.
+    tol = 5e-2  # Allow 5% tolerance for Q8_1 rounding vs F32 dequant
+    print(f"MATCH:   {'YES' if abs(cpu_dot - gpu_val) < tol else 'NO'}")
     return 0
 
 if __name__ == '__main__':

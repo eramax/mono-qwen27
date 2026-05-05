@@ -1,6 +1,6 @@
 .PHONY: build test quick-test large-test clean verify verify-all generate-verify-data
 
-MODEL_PATH ?= /mnt/mydata/projects2/specfusion/model/Qwen3.6-27B-UD-Q4_K_XL.gguf
+MODEL_PATH ?= /mnt/mydata/projects2/mono27b/model/Qwen3.6-27B-UD-Q4_K_XL.gguf
 PROMPT ?= "give me 2 py example"
 GEN ?= 10
 CTX ?= 4096
