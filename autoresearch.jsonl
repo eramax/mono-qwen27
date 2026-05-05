@@ -1,1 +1,2 @@
 {"type":"config","name":"Mono27B text generation speed optimization","metricName":"gen_tok_per_sec","metricUnit":"tok/s","bestDirection":"higher"}
+{"run":1,"commit":"913bee7","metric":18.4,"metrics":{},"status":"keep","description":"Baseline: 18.4 tok/s with quick-test prompt, 100 gen tokens","timestamp":1778012659949,"segment":0,"confidence":null,"asi":{"hypothesis":"baseline measurement","bottlenecks":"4x cudaDeviceSynchronize per token, 1MB logits D2H copy, CPU argmax, shared mem tree reduction in matvec"}}

@@ -103,6 +103,7 @@ struct Mono27BExecutorState {
     float * work_buf;
     size_t work_buf_size;
     void * q8_scratch;  // Q8_1 buffer for matvec (544 blocks × 36 bytes)
+    int * argmax_result;  // GPU-side argmax output (single int)
     int max_ctx;
     int kv_len;
     // Concurrent streams for paired matvec execution
@@ -187,3 +188,6 @@ extern "C" bool mono27b_engine_decode_step(
     char * error, size_t error_cap);
 
 extern "C" void mono27b_engine_free_logits(Mono27BLogitsOutput * output);
+
+// GPU-side argmax: avoids 1MB D2H logits copy. Returns the token id.
+extern "C" int mono27b_engine_argmax(Mono27BExecutorState * st, const float * logits, int n);

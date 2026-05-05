@@ -125,6 +125,72 @@ static __device__ __forceinline__ int get_int_b4(const void * x, const int & i32
     return ((const int *) x)[i32];
 }
 
+// ─── Warp / block reductions (must precede all kernels using them) ──────────
+
+template <int W>
+__device__ float warp_reduce_sum(float v) {
+    #pragma unroll
+    for (int s = W / 2; s > 0; s >>= 1) v += __shfl_xor_sync(0xFFFFFFFF, v, s);
+    return v;
+}
+
+template <int W>
+__device__ float warp_reduce_max(float v) {
+    #pragma unroll
+    for (int s = W / 2; s > 0; s >>= 1) v = fmaxf(v, __shfl_xor_sync(0xFFFFFFFF, v, s));
+    return v;
+}
+
+template <int BLK>
+__device__ float block_reduce_sum(float v) {
+    constexpr int NWARPS = BLK / 32;
+    __shared__ float smem[NWARPS];
+    int lane = threadIdx.x & 31;
+    int wid  = threadIdx.x >> 5;
+    v = warp_reduce_sum<32>(v);
+    if (lane == 0) smem[wid] = v;
+    __syncthreads();
+    if (wid == 0) {
+        float val = (lane < NWARPS) ? smem[lane] : 0.0f;
+        val = warp_reduce_sum<32>(val);
+        if (lane == 0) smem[0] = val;
+    }
+    __syncthreads();
+    return smem[0];
+}
+
+// ─── GPU Argmax kernel ────────────────────────────────────────────────────────
+// Returns index of max value. Single-block, 512 threads, grid-stride loop.
+__global__ static void k_argmax(const float * __restrict__ data, int n, int * result) {
+    __shared__ int s_idx[16];   // 16 warps for 512 threads
+    __shared__ float s_val[16];
+    int best_idx = -1;
+    float best_val = -1e30f;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x) {
+        if (data[i] > best_val) { best_val = data[i]; best_idx = i; }
+    }
+    int lane = threadIdx.x & 31;
+    int wid  = threadIdx.x >> 5;
+    for (int s = 16; s > 0; s >>= 1) {
+        float ov = __shfl_xor_sync(0xFFFFFFFF, best_val, s);
+        int oi   = __shfl_xor_sync(0xFFFFFFFF, best_idx, s);
+        if (ov > best_val) { best_val = ov; best_idx = oi; }
+    }
+    if (lane == 0) { s_idx[wid] = best_idx; s_val[wid] = best_val; }
+    __syncthreads();
+    int nw = (blockDim.x + 31) / 32;
+    if (wid == 0) {
+        best_val = (lane < nw) ? s_val[lane] : -1e30f;
+        best_idx = (lane < nw) ? s_idx[lane] : -1;
+        for (int s = 16; s > 0; s >>= 1) {
+            float ov = __shfl_xor_sync(0xFFFFFFFF, best_val, s);
+            int oi   = __shfl_xor_sync(0xFFFFFFFF, best_idx, s);
+            if (ov > best_val) { best_val = ov; best_idx = oi; }
+        }
+        if (lane == 0) *result = best_idx;
+    }
+}
+
 // ─── Q4_K vec_dot (from vecdotq.cuh, vmmq path) ─────────────────────────────
 
 #define MONO27B_QK8_1 32
@@ -199,7 +265,6 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
 __global__ static void k_q4k_mv_q8_dp4a(const BlockQ4K * W, const BlockQ8_1 * q8, float * y, int rb, int rc) {
     int row = blockIdx.x;
     if (row >= rc) return;
-    __shared__ float sh[128];
     float sum = 0.0f;
     const BlockQ4K * wp = W + (size_t)row * rb;
     for (int idx = threadIdx.x; idx < rb * 16; idx += 128) {
@@ -207,13 +272,8 @@ __global__ static void k_q4k_mv_q8_dp4a(const BlockQ4K * W, const BlockQ8_1 * q8
         int iqs = (idx % 16) * 2;
         sum += vec_dot_q4_K_q8_1(wp, q8 + b * 8, b, iqs);
     }
-    sh[threadIdx.x] = sum;
-    __syncthreads();
-    for (int s = 64; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) y[row] = sh[0];
+    sum = block_reduce_sum<128>(sum);
+    if (threadIdx.x == 0) y[row] = sum;
 }
 
 // ─── Q5_K vec_dot (from vecdotq.cuh, vmmq path) ─────────────────────────────
@@ -297,7 +357,6 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
 __global__ static void k_q5k_mv_q8(const BlockQ5K * W, const BlockQ8_1 * q8, float * y, int rb, int rc) {
     int row = blockIdx.x;
     if (row >= rc) return;
-    __shared__ float sh[128];
     float sum = 0.0f;
     const BlockQ5K * wp = W + (size_t)row * rb;
     for (int idx = threadIdx.x; idx < rb * 16; idx += 128) {
@@ -305,13 +364,8 @@ __global__ static void k_q5k_mv_q8(const BlockQ5K * W, const BlockQ8_1 * q8, flo
         int iqs = (idx % 16) * 2;
         sum += vec_dot_q5_K_q8_1(wp, q8 + b * 8, b, iqs);
     }
-    sh[threadIdx.x] = sum;
-    __syncthreads();
-    for (int s = 64; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) y[row] = sh[0];
+    sum = block_reduce_sum<128>(sum);
+    if (threadIdx.x == 0) y[row] = sum;
 }
 
 // ─── Q6_K vec_dot (from vecdotq.cuh, mmvq path) ─────────────────────────────
@@ -365,7 +419,6 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
 __global__ static void k_q6k_mv_q8_dp4a(const BlockQ6K * W, const BlockQ8_1 * q8, float * y, int rb, int rc) {
     int row = blockIdx.x;
     if (row >= rc) return;
-    __shared__ float sh[128];
     float sum = 0.0f;
     const BlockQ6K * wp = W + (size_t)row * rb;
     for (int idx = threadIdx.x; idx < rb * 32; idx += 128) {
@@ -373,13 +426,8 @@ __global__ static void k_q6k_mv_q8_dp4a(const BlockQ6K * W, const BlockQ8_1 * q8
         int iqs = idx % 32;
         sum += vec_dot_q6_K_q8_1(wp, q8 + b * 8, b, iqs);
     }
-    sh[threadIdx.x] = sum;
-    __syncthreads();
-    for (int s = 64; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) y[row] = sh[0];
+    sum = block_reduce_sum<128>(sum);
+    if (threadIdx.x == 0) y[row] = sum;
 }
 
 // ─── IQ4_XS vec_dot (from vecdotq.cuh, mmvq path) ───────────────────────────
@@ -412,7 +460,6 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
 __global__ static void k_iq4xs_mv_q8_dp4a(const BlockIQ4XS * W, const BlockQ8_1 * q8, float * y, int rb, int rc) {
     int row = blockIdx.x;
     if (row >= rc) return;
-    __shared__ float sh[128];
     float sum = 0.0f;
     const BlockIQ4XS * wp = W + (size_t)row * rb;
     for (int idx = threadIdx.x; idx < rb * 8; idx += 128) {
@@ -420,29 +467,8 @@ __global__ static void k_iq4xs_mv_q8_dp4a(const BlockIQ4XS * W, const BlockQ8_1 
         int iqs = (idx % 8) * 4;
         sum += vec_dot_iq4_xs_q8_1(wp, q8 + b * 8, b, iqs);
     }
-    sh[threadIdx.x] = sum;
-    __syncthreads();
-    for (int s = 64; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) y[row] = sh[0];
-}
-
-// ─── Warp-level reductions ───────────────────────────────────────────────────
-
-template <int W>
-__device__ float warp_reduce_sum(float v) {
-    #pragma unroll
-    for (int s = W / 2; s > 0; s >>= 1) v += __shfl_xor_sync(0xFFFFFFFF, v, s);
-    return v;
-}
-
-template <int W>
-__device__ float warp_reduce_max(float v) {
-    #pragma unroll
-    for (int s = W / 2; s > 0; s >>= 1) v = fmaxf(v, __shfl_xor_sync(0xFFFFFFFF, v, s));
-    return v;
+    sum = block_reduce_sum<128>(sum);
+    if (threadIdx.x == 0) y[row] = sum;
 }
 
 // ─── Helper: get_scale_min_k4 ───────────────────────────────────────────────
@@ -1495,6 +1521,11 @@ extern "C" bool mono27b_engine_init_state(int max_ctx, Mono27BExecutorState * st
     { cudaEvent_t _e = nullptr; if (cudaEventCreate(&_e) == cudaSuccess) state->sync_event = (void*)_e; }
 
     state->kv_len = 0;
+
+    // GPU argmax result buffer
+    state->argmax_result = nullptr;
+    cudaMalloc(&state->argmax_result, sizeof(int));
+
     return true;
 fail:
     if (error[0] == '\0')
@@ -1513,6 +1544,7 @@ extern "C" void mono27b_engine_free_state(Mono27BExecutorState * state) {
     }
     cudaFree(state->work_buf);
     if (state->q8_scratch) cudaFree(state->q8_scratch);
+    if (state->argmax_result) { cudaFree(state->argmax_result); state->argmax_result = nullptr; }
     if (state->stream1) { cudaStreamDestroy((cudaStream_t)state->stream1); state->stream1 = nullptr; }
     if (state->sync_event) { cudaEventDestroy((cudaEvent_t)state->sync_event); state->sync_event = nullptr; }
     std::memset(state, 0, sizeof(*state));
@@ -2086,7 +2118,7 @@ extern "C" bool mono27b_engine_decode_step(
     }
     TRACE("post-loop");
 
-    // Sync after all layers
+    // Sync after all layers — needed once before reading output
     sync_err = cudaDeviceSynchronize();
     if (sync_err != cudaSuccess) {
         std::snprintf(error, error_cap, "layers: %s", cudaGetErrorString(sync_err));
@@ -2106,36 +2138,27 @@ extern "C" bool mono27b_engine_decode_step(
         }
     }
     // REAL LM head: quantize h2 to Q8_1 once, then use dp4a for all vocab rows.
-    // This matches llama.cpp's mmvq (matrix-vector quantized) path for Q6_K.
     {
         int total = (int)we->lm_head.row_count;
         int rb = (int)we->lm_head.row_blocks;
         auto * base = (const BlockQ6K *)we->lm_head.ptr;
-        // n_q8 = rb * 8 = 20 * 8 = 160, well within scratch capacity of 544
         int n_q8 = rb * 8;
         if (g_q8_scratch && n_q8 <= 544) {
-            // Quantize h2 → Q8_1 once (same input for all rows)
             k_quant_q8_1<<<(n_q8 + 127) / 128, 128>>>(h2, g_q8_scratch, MONO27B_TARGET_HIDDEN);
+            // No sync needed — quantize and matvec are on same stream, already ordered
+            k_q6k_mv_q8_dp4a<<<total, 128>>>(base, g_q8_scratch, out->logits, rb, total);
             sync_err = cudaDeviceSynchronize();
-            if (sync_err == cudaSuccess) {
-                // One big kernel launch for all vocab rows
-                k_q6k_mv_q8_dp4a<<<total, 128>>>(base, g_q8_scratch, out->logits, rb, total);
-                sync_err = cudaDeviceSynchronize();
-            }
         }
         if (!g_q8_scratch || n_q8 > 544 || sync_err != cudaSuccess) {
-            // Fallback: F32 dequant path in chunks
             sync_err = cudaSuccess;
             int chunk = 4096;
             for (int off = 0; off < total; off += chunk) {
                 int n = (off + chunk > total) ? total - off : chunk;
                 k_q6k_mt<<<n, 256>>>(base + (size_t)off * rb, h2, out->logits + off, rb, n);
-                sync_err = cudaDeviceSynchronize();
-                if (sync_err != cudaSuccess) break;
             }
+            sync_err = cudaDeviceSynchronize();
         }
         if (sync_err != cudaSuccess) {
-            // Last-resort fallback
             cudaMemset(out->logits, 0, MONO27B_TARGET_VOCAB * sizeof(float));
             float v = 1.0f;
             cudaMemcpy(out->logits, &v, 4, cudaMemcpyHostToDevice);
@@ -2161,6 +2184,15 @@ cleanup:
 extern "C" void mono27b_engine_free_logits(Mono27BLogitsOutput * out) {
     // logits is part of state.work_buf, don't free it separately
     out->logits = nullptr;
+}
+
+extern "C" int mono27b_engine_argmax(Mono27BExecutorState * st, const float * logits, int n) {
+    if (!st->argmax_result || !logits || n <= 0) return 0;
+    k_argmax<<<1, 512>>>(logits, n, st->argmax_result);
+    cudaDeviceSynchronize();
+    int result = 0;
+    cudaMemcpy(&result, st->argmax_result, sizeof(int), cudaMemcpyDeviceToHost);
+    return result;
 }
 
 // ─── Embedding ───────────────────────────────────────────────────────────────

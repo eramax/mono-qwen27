@@ -501,6 +501,7 @@ int main(int argc, char ** argv) {
 
     for (int step = 0; step < std::max(1, args.max_gen); ++step) {
         std::vector<float> logits_host;
+        int gpu_argmax_id = -1;  // set when using GPU-side argmax
 
         if (step == 0 && !last_prompt_logits.empty()) {
             logits_host = std::move(last_prompt_logits);
@@ -513,11 +514,15 @@ int main(int argc, char ** argv) {
                 mono27b_engine_free_logits(&logits);
                 goto cleanup;
             }
-            logits_host.resize(MONO27B_TARGET_VOCAB);
-            cudaError_t copy_err = cudaMemcpy(logits_host.data(), logits.logits,
-                                              MONO27B_TARGET_VOCAB * sizeof(float), cudaMemcpyDeviceToHost);
-            if (copy_err != cudaSuccess) {
-                std::fprintf(stderr, "step %d logits copy error: %s\n", step, cudaGetErrorString(copy_err));
+            // Always do GPU argmax to avoid 1MB D2H copy. Only copy full logits if we need them (sampling or trace).
+            if (args.greedy && !trace) {
+                gpu_argmax_id = mono27b_engine_argmax(&state, logits.logits, MONO27B_TARGET_VOCAB);
+            }
+            // For sampling/trace, still need full logits on CPU
+            if (!args.greedy || trace) {
+                logits_host.resize(MONO27B_TARGET_VOCAB);
+                cudaMemcpy(logits_host.data(), logits.logits,
+                           MONO27B_TARGET_VOCAB * sizeof(float), cudaMemcpyDeviceToHost);
             }
             mono27b_engine_free_logits(&logits);
             pos++;
@@ -527,8 +532,11 @@ int main(int argc, char ** argv) {
         int chosen = -1;
         if (step < static_cast<int>(replay_tokens.size())) {
             chosen = replay_tokens[static_cast<size_t>(step)];
-            best = argmax_from_logits(logits_host, &best);
+            if (!logits_host.empty()) best = argmax_from_logits(logits_host, &best);
             std::fprintf(stderr, "[replay] step %d forcing token %d\n", step, chosen);
+        } else if (gpu_argmax_id >= 0) {
+            chosen = gpu_argmax_id;
+            best = gpu_argmax_id;
         } else if (args.greedy) {
             chosen = argmax_from_logits(logits_host, &best);
         } else {
@@ -540,7 +548,11 @@ int main(int argc, char ** argv) {
             trace.flush();
         }
 
-        if (!quiet) std::fprintf(stderr, "[step %d] top1=%d max=%.4f chosen=%d\n", step, best, logits_host[best], chosen);
+        if (!quiet) {
+            float bv = 0.0f;
+            if (!logits_host.empty() && best >= 0 && best < (int)logits_host.size()) bv = logits_host[best];
+            std::fprintf(stderr, "[step %d] top1=%d max=%.4f chosen=%d\n", step, best, bv, chosen);
+        }
 
         if (quiet) {
             std::string piece = tokenizer.decode({chosen});
