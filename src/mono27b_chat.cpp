@@ -227,6 +227,7 @@ int main(int argc, char ** argv) {
         mono27b_print_chat_usage(argv[0]);
         return args.show_help ? 0 : 1;
     }
+    const bool quiet = args.quiet;
     std::mt19937 rng(args.seed);
     const int top_k = 20;
     const float top_p = 0.95f;
@@ -248,7 +249,7 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "gguf error: %s\n", gguf_error.c_str());
         return 1;
     }
-    if (!gguf.metadata.chat_template.empty()) {
+    if (!quiet && !gguf.metadata.chat_template.empty()) {
         std::fprintf(stderr, "[template] %s\n", gguf.metadata.chat_template.substr(0, 200).c_str());
     }
 
@@ -354,9 +355,11 @@ int main(int argc, char ** argv) {
         std::filesystem::remove(tmp_name);
     }
 
-    std::fprintf(stderr, "[state] vocab=%u merges=%u bos=%u eos=%u\n",
-                 tokenizer.vocab_size(), tokenizer.merges_count(),
-                 tokenizer.bos_id(), tokenizer.eos_id());
+    if (!quiet) {
+        std::fprintf(stderr, "[state] vocab=%u merges=%u bos=%u eos=%u\n",
+                     tokenizer.vocab_size(), tokenizer.merges_count(),
+                     tokenizer.bos_id(), tokenizer.eos_id());
+    }
 
     // Memory tracking
     // Initialize runtime state BEFORE loading weights to avoid fragmentation
@@ -382,7 +385,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
     cudaGetLastError();
-    std::fprintf(stderr, "[load] GPU weights ready\n");
+    if (!quiet) std::fprintf(stderr, "[load] GPU weights ready\n");
 
     // Raw completion mode: match llama.cpp --no-cnv behavior for plain prompts.
     std::string user_prompt = args.prompt;
@@ -405,9 +408,11 @@ int main(int argc, char ** argv) {
     if (gguf.metadata.add_bos_token) {
         prompt_ids.insert(prompt_ids.begin(), static_cast<int32_t>(tokenizer.bos_id()));
     }
-    std::fprintf(stderr, "[prompt] tokens=%zu ids=", prompt_ids.size());
-    for (size_t i = 0; i < prompt_ids.size(); ++i) fprintf(stderr, "%d ", prompt_ids[i]);
-    fprintf(stderr, "\n");
+    if (!quiet) {
+        std::fprintf(stderr, "[prompt] tokens=%zu ids=", prompt_ids.size());
+        for (size_t i = 0; i < prompt_ids.size(); ++i) fprintf(stderr, "%d ", prompt_ids[i]);
+        fprintf(stderr, "\n");
+    }
 
     char errbuf[512] = {};
     int pos = 0;
@@ -465,7 +470,8 @@ int main(int argc, char ** argv) {
                             prompt_ids[i], chosen, logits_host);
             trace.flush();
         }
-        std::fprintf(stderr, "[prompt %zu] top1=%d max=%.4f\n", i, best, logits_host[best]);
+        if (!quiet) std::fprintf(stderr, "[prompt %zu] top1=%d max=%.4f\n", i, best, logits_host[best]);
+        (void)best;
         if (i == prompt_ids.size() - 1) {
             last_prompt_logits = std::move(logits_host);
         }
@@ -517,7 +523,13 @@ int main(int argc, char ** argv) {
             trace.flush();
         }
 
-        std::fprintf(stderr, "[step %d] top1=%d max=%.4f chosen=%d\n", step, best, logits_host[best], chosen);
+        if (!quiet) std::fprintf(stderr, "[step %d] top1=%d max=%.4f chosen=%d\n", step, best, logits_host[best], chosen);
+
+        if (quiet) {
+            std::string piece = tokenizer.decode({chosen});
+            std::fwrite(piece.data(), 1, piece.size(), stdout);
+            std::fflush(stdout);
+        }
 
         if (tokenizer.is_terminal(chosen)) break;
 
@@ -526,11 +538,15 @@ int main(int argc, char ** argv) {
     }
 
     // Decode and output
-    if (!generated.empty()) {
+    if (quiet && !generated.empty()) {
+        // In quiet mode tokens were streamed live; just add a final newline
+        std::fwrite("\n", 1, 1, stdout);
+        std::fflush(stdout);
+    } else if (!generated.empty()) {
         std::string text = tokenizer.decode(generated);
         std::fprintf(stderr, "[generated] %s\n", sanitize_text(text).c_str());
         std::fprintf(stderr, "[assistant]\n%s\n", text.c_str());
-    } else {
+    } else if (!quiet) {
         std::fprintf(stderr, "[generated] (no tokens)\n");
     }
 

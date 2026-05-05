@@ -7,12 +7,9 @@
 
 void mono27b_print_chat_usage(const char * prog) {
     std::fprintf(stderr,
-        "usage: %s --blob model.m27b --prompt \"...\" [--ctx N] [--gen N] [--seed N] [--trace PATH] [--debug PATH] [--debug-pos N] [--replay-trace PATH]\n"
-        "       %s --blob model.m27b -p \"...\" [--ctx N] [--gen N] [--seed N] [--trace PATH] [--debug PATH] [--debug-pos N] [--replay-trace PATH]\n",
+        "usage: %s -m model.gguf -p \"...\" [--ctx N] [--gen N] [--seed N] [--greedy] [--chat] [--quiet]\n"
+        "       %s -m model.gguf -p \"...\" [--trace PATH] [--debug PATH] [--debug-pos N] [--replay-trace PATH]\n",
         prog,
-        prog);
-    std::fprintf(stderr,
-        "       %s -m target.gguf -p \"...\" [--ctx N] [--gen N] [--seed N] [--trace PATH] [--debug PATH] [--debug-pos N] [--replay-trace PATH]\n",
         prog);
 }
 
@@ -81,6 +78,10 @@ bool mono27b_parse_chat_args(int argc, char ** argv, Mono27BChatArgs & out) {
         }
         if (arg == "--chat") {
             out.chat = true;
+            continue;
+        }
+        if (arg == "--quiet" || arg == "-q") {
+            out.quiet = true;
             continue;
         }
         return false;

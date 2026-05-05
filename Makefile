@@ -4,19 +4,20 @@ MODEL_PATH ?= /mnt/mydata/projects2/mono27b/model/Qwen3.6-27B-UD-Q4_K_XL.gguf
 PROMPT ?= "give me 2 py example"
 GEN ?= 500
 CTX ?= 4096
+SEED ?= 944990222
 
 build:
 	cmake -S . -B build -DCMAKE_CXX_COMPILER=/usr/bin/g++ -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release
 	cmake --build build -j$(shell nproc)
 
 test: build
-	./build/mono27b_chat -m $(MODEL_PATH) -p $(PROMPT) --gen $(GEN) --ctx $(CTX)
+	./build/mono27b_chat -m $(MODEL_PATH) -p $(PROMPT) --gen $(GEN) --ctx $(CTX) --seed $(SEED) --quiet
 
 quick-test: build
-	./build/mono27b_chat -m $(MODEL_PATH) -p "The quick brown fox" --gen 5 --ctx 2048
+	./build/mono27b_chat -m $(MODEL_PATH) -p "The quick brown fox" --gen 5 --ctx 2048 --quiet
 
 large-test: build
-	./build/mono27b_chat -m $(MODEL_PATH) -p "Artificial intelligence is" --gen 20 --ctx 8192
+	./build/mono27b_chat -m $(MODEL_PATH) -p "Artificial intelligence is" --gen 20 --ctx 8192 --quiet
 
 verify: build
 	$(MAKE) -f debug/verify/Makefile verify GGUF=$(MODEL_PATH)

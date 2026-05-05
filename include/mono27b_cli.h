@@ -18,6 +18,7 @@ struct Mono27BChatArgs {
     bool show_help = false;
     bool greedy = false;
     bool chat = false;
+    bool quiet = false;
 };
 
 struct Mono27BPackArgs {
