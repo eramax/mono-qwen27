@@ -1,167 +1,174 @@
 # mono27b / llama.cpp Parity Tracking — CURRENT
 
-**Status:** Prompt-step verification shows our kernels are mathematically correct but produce different rounding than ggml. Correlation 0.414 is caused by ~0.2% per-operation differences compounding across 64 recurrent layers. Decision: port ggml reference kernels.
-**Current blocker:** Need to port `gated_delta_net.cu` kernel and `mul_mat_vec_q` Q8_1-based matmuls.
-**Latest finding:** The reference `llama-debug` output contains two complete forward passes. Using the last occurrence (matching our prompt step), 99% of elements match within 0.3%. The divergence is natural F32 rounding differences, not a bug.
+**Status:** Prompt-step verification shows 9/12 tensors PASS with <1% diff. Remaining 3 FAILs (`ffn_gate`, `ffn_up`, `layer_out`) show ~0.01 diff consistent with Q4_K quantization noise. E2E correlation is **0.4715** (was 0.414). Decision: investigate attention layers and stateful divergence; quantization drift is secondary.
+**Current blocker:** We are only comparing layer 0 (SSM). Attention layers (3,7,11,...) are unverified and likely the dominant source of E2E mismatch.
+**Latest finding:** After porting ggml `mmvq` Q4_K/Q5_K/Q6_K/Q8_1 kernels, SSM layer 0 is nearly exact (`deltanet` PASS, `final_output` PASS). The remaining ~0.01 diff on FFN tensors is within quantization tolerance. The 0.47 E2E correlation suggests a larger divergence in attention layers or stateful execution.
 
 ## What Was Verified
 
 | Component | Diff | Method |
 |-----------|------|--------|
-| **Embedding (Q4_K)** | ✓ exact | Python GGUF dequant matches GPU output |
-| **RMS norm (isolated)** | ✓ 1.2e-7 | 5120 elements CPU vs GPU |
-| **RMS norm (attn_norm-0 E2E)** | ✓ 5e-05 | Was comparing wrong ref occurrence; last occurrence matches |
-| **Q6_K matvec (wqkv)** | ✓ 3.0e-8 | Fixed Python dequant; CPU GGUF data matches GPU |
-| **Q5_K matvec (wqkv_gate)** | ✓ 2.6e-7 | Python GGUF data vs GPU — **but ref z-0 differs by 0.025** |
-| **Q6_K matvec (LM head)** | ✓ 1.3e-5 | GPU vs CPU re-dequant on 8 rows |
-| **Conv1d + SiLU** | ✓ exact | conv_raw output matches reference |
-| **DeltaNet formula** | ✓ | Matches reference kernel logic |
-| **DeltaNet dimensions** | ✓ | dr=48, hv=128, hk=128, ng=16, state shape [48][128][128] matches reference |
-| **Gate computation** | ✓ | softplus(ssm_alpha@h2 + dt_bias) * ssm_a matches reference |
-| **Beta computation** | ✓ | sigmoid(ssm_beta@h2) matches reference |
-| **L2 norm (q/k)** | ✓ | `rsqrtf(fmaxf(sum_sq, eps*eps))` matching reference |
-| **FFN residual formula** | ✓ | Reference code confirms: `output = FFN(RMS(residual)) + residual` (un-normed residual) — same as our code |
-| **Attention gate** | ✓ | Q projection produces Q+gate (12288 = Q_DIM*2), gate applied via sigmoid_mul |
-| **Q8_0 matvec (ssm_out)** | ✓ | Formula matches |
-| **Q4_K matvec (FFN/attention)** | ✓ | Dequant formula matches reference's `dequantize_row_q4_K` |
-| **compute-sanitizer** | ✓ | 0 memory errors across full 64-layer run |
-| **Softplus stability** | ✓ | `(z > 20.0f) ? z : logf(1.0f + expf(z))` matching ggml |
-| **GQA indexing (DeltaNet)** | ✓ | `r_idx / (dr / ng)` for repeating heads (fixed from `r_idx % ng`) |
-| **Norm accumulation** | ✓ | `double` precision parallel reduction for both `k_rms_norm_mulw` and `k_l2_norm_g` |
+| **Embedding (Q4_K)** | exact | Python GGUF dequant matches GPU output |
+| **RMS norm (isolated)** | 1.2e-7 | 5120 elements CPU vs GPU |
+| **RMS norm (attn_norm-0 E2E)** | 5e-05 | Matches reference exactly |
+| **Q6_K matvec (wqkv)** | 8.7e-03* | CPU F32 dequant vs GPU Q8_1+dp4a (tolerance too tight) |
+| **Q5_K matvec (wqkv_gate)** | 4.7e-03* | CPU F32 dequant vs GPU Q8_1+dp4a (tolerance too tight) |
+| **Q4_K matvec (FFN)** | 1.0e-02* | CPU F32 dequant vs GPU Q8_1+dp4a — expected Q4_K noise |
+| **Q6_K matvec (LM head)** | 1.3e-5 | GPU vs CPU re-dequant on 8 rows |
+| **Conv1d + SiLU** | exact | conv_raw output matches reference |
+| **DeltaNet formula** | exact | Matches reference kernel logic |
+| **DeltaNet group mapping** | exact | `g_idx = h_idx % ng` (fixed from `h_idx / (dr/ng)`) |
+| **Gate computation** | exact | softplus(ssm_alpha@h2 + dt_bias) * ssm_a matches reference |
+| **Beta computation** | exact | sigmoid(ssm_beta@h2) matches reference |
+| **L2 norm (q/k)** | exact | `rsqrtf(fmaxf(sum_sq, eps*eps))` matching reference |
+| **FFN residual formula** | exact | `output = FFN(RMS(residual)) + residual` |
+| **Attention gate** | exact | Q projection produces Q+gate (12288 = Q_DIM*2), gate applied via sigmoid_mul |
+| **Q8_0 matvec (ssm_out)** | exact | Formula matches |
+| **compute-sanitizer** | 0 errors | 0 memory errors across full 64-layer run |
+| **Softplus stability** | exact | `(z > 20.0f) ? z : logf(1.0f + expf(z))` matching ggml |
+| **Norm accumulation** | exact | `double` precision parallel reduction |
+| **Q8_1 block layout** | exact | `ds` as `__half2`, matching `block_q8_1` from ggml-common.h |
 
-## Critical Discovery: Reference Contains Two Forward Passes
+\* These diffs are CPU F32 dequant vs GPU Q8_1+dp4a. The GPU kernels are functionally correct — the CPU test is the "wrong" reference.
 
-The `llama-debug` output with `--tensor-filter` dumps **two complete forward passes** when processing a single token with batch size 1. This is because llama.cpp may evaluate the graph twice (once for KV cache update, once for output).
+## Baseline Verification Results (`make verify`)
 
-**This caused earlier confusion:** We were comparing our prompt-step output against the first reference occurrence, which was actually a different computational path (different hidden states, different L2 norms). The first occurrence has `model.input_embed = [-0.0039, -0.0096, ...]` while the second has `[0.0157, 0.0051, ...]` — the latter matches our embedding exactly.
+### Component Checks
 
-**Resolution:** Our `compare_intermediates_last.py` now uses the **last occurrence** of each tensor in the reference file, which correctly pairs with our prompt-step debug dump.
+| Check | Status | Detail |
+|-------|--------|--------|
+| Q6_K format sanity | PASS | d values in valid range |
+| RMS norm (5120 elem) | PASS | max diff=1.23e-07 |
+| Q5_K matvec (wqkv_gate) | PASS | diff=4.68e-03 |
+| Q6_K matvec (wqkv) | FAIL* | diff=8.66e-03 (CPU vs GPU quantization path) |
+| M-RoPE text rotation | PASS | worst_diff=0.00e+00 |
 
-## Updated Divergence Analysis (Using Correct Reference Pairing)
+\* Q6_K matvec is not actually broken — the CPU F32 reference differs from GPU Q8_1+dp4a by ~0.9%, which is expected. The `deltanet` tensor (which consumes `wqkv`) passes exactly, confirming the kernel is correct.
 
-After fixing the pairing, the divergence pattern is completely different from the earlier "massive divergence" report:
+### Tensor-by-Tensor Comparison (Layer 0, SSM only)
 
-| Tensor | N | MaxDiff | MeanDiff | RelDiff% | Status |
-|--------|---|---------|----------|----------|--------|
-| `embed` | 5120 | 5.0e-05 | 2.5e-05 | 0.10% | PASS |
-| `attn_norm` | 5120 | 5.0e-05 | 2.5e-05 | 0.00% | PASS |
-| `z` (wqkv_gate) | 6144 | 0.025 | 0.0047 | **0.19%** | PASS* |
-| `conv_raw` | 10240 | 0.012 | 0.00013 | **0.13%** | PASS |
-| `conv` (silu) | 10240 | 0.012 | 0.00008 | **0.13%** | PASS |
-| `q_conv_predelta` | 2048 | 0.0020 | 0.00012 | **0.22%** | PASS |
-| `k_conv_predelta` | 2048 | 0.0027 | 0.00015 | **0.29%** | PASS |
-| `deltanet` | 6144 | 0.184 | 0.00047 | **0.37%** | DIFF |
-| `final_output` | 6144 | 1.515 | 0.0035 | **63.66%** | DIFF |
-| `ffn_gate` | 17408 | 2.162 | 0.100 | **110.30%** | DIFF |
-| `ffn_up` | 17408 | 1.099 | 0.093 | **38.64%** | DIFF |
-| `layer_out` | 5120 | 4.496 | 0.039 | **29.35%** | DIFF |
+| Our Label | Ref Label | N | MaxDiff | RelMax | Status |
+|-----------|-----------|---|---------|--------|--------|
+| attn_norm | attn_norm-0 | 5120 | 0.000050 | 0.0137% | PASS |
+| conv | conv_output_silu-0 | 10240 | 0.000050 | 0.0055% | PASS |
+| conv_raw | conv_output_raw-0 | 10240 | 0.000050 | 0.0055% | PASS |
+| deltanet | attn_output-0 | 6144 | 0.000050 | 0.2166% | PASS |
+| **ffn_gate** | **ffn_gate-0** | **17408** | **0.010171** | **3.17%** | **FAIL** |
+| **ffn_up** | **ffn_up-0** | **17408** | **0.010143** | **2.31%** | **FAIL** |
+| final_output | final_output-0 | 6144 | 0.000050 | 0.0210% | PASS |
+| h | model.input_embed | 5120 | 0.000050 | 0.7169% | PASS |
+| k_conv_predelta | k_conv_predelta-0 | 2048 | 0.000050 | 0.0551% | PASS |
+| **layer_out** | **l_out-0** | **5120** | **0.013176** | **0.1402%** | **FAIL** |
+| q_conv_predelta | q_conv_predelta-0 | 2048 | 0.000050 | 0.0540% | PASS |
+| z | z-0 | 6144 | 0.000050 | 0.0037% | PASS |
 
-\* "PASS" here means <1% relative error; absolute max diff of 0.025 on values ~13 is 0.19%.
+### E2E Logits
 
-### Interpretation
+| Metric | Value |
+|--------|-------|
+| Top1 token (ref) | 728 |
+| Top1 token (ours) | 220 |
+| Top1 logit (ref) | 15.74 |
+| Top1 logit (ours) | 16.77 |
+| Correlation | **0.471522** |
+| MSE | **4.8989** |
 
-- **99% of elements match within 0.3% relative error** across all tensors.
-- The `z` tensor (wqkv_gate matvec) matches our CPU dequantization to 1e-7, but differs from the reference by 0.025. This strongly suggests the reference uses a **Q8_1-quantized input matmul** (`quantize_row_q8_1_cuda` + `__dp4a`), not F32 dequantization.
-- The `deltanet` output has a mean diff of only 0.00047 but a max diff of 0.184. The 99th percentile is 0.003 (0.6% relative), and only 49 out of 6144 elements exceed 0.01 absolute diff. This is consistent with **warp-level accumulation order differences** between our element-wise loops and ggml's warp-reduce kernel.
-- The `layer_out` (post-FFN residual) has mean diff 0.039 (0.8% relative), with only 210 elements >0.1 diff and 1 element >1.0 diff out of 5120. This is exactly what we'd expect from 0.2% per-operation differences compounding across ~100 ops/layer × 64 layers.
+---
 
-### Conclusion: This Is Not a Bug
+## Critical Findings
 
-**Our CUDA kernels are mathematically correct.** The divergence is caused by natural floating-point rounding differences:
+### Finding 1: The 0.01 FFN diff is quantization noise, not a logic bug
+- `ffn_gate`/`ffn_up` inputs (`post_norm`) match reference exactly (PASS, 5e-05).
+- The 0.01 diff appears **only after the Q4_K matvec**.
+- Our single-row CPU-vs-GPU test shows our Q4_K matvec differs from CPU by ~0.001; reference GPU differs from CPU by ~0.0003–0.004. Both are within Q4_K tolerance.
+- **Conclusion**: The Q4_K/Q5_K/Q6_K kernels are functionally correct. The 0.01 diff is natural quantization noise from Q8_1 rounding.
 
-1. **Matmul:** We dequantize weights to F32 and do F32 multiply-add. ggml quantizes the input vector to Q8_1 and uses `__dp4a` (integer dot product of 4 int8 values). These round differently.
-2. **DeltaNet:** We use per-rank element-wise loops with sequential accumulation. ggml uses warp-level primitives (`warp_reduce_sum`) with different associativity. These round differently.
-3. **FFN:** Same matmul rounding differences, compounded by SwiGLU element-wise ops.
+### Finding 2: We are not comparing attention layers at all
+- Our comparison pipeline (`compare_all.py`) only dumps layer 0 (SSM).
+- Attention layers are at indices **3, 7, 11, ...** (every 4th layer, `MONO27B_TARGET_FA_INTERVAL = 4`).
+- Attention layers use RoPE, softmax, KV-cache, and multi-head attention — any bug here would compound across all attention layers and dominate the final logits.
+- **This is the most likely source of the 0.47 E2E correlation.**
 
-With 64 recurrent layers, each layer's tiny rounding differences feed into the next layer's state. After 64 layers, the hidden states are correlated at 0.414 but not bit-identical.
+### Finding 3: We may be comparing the wrong token position
+- `llama-debug` evaluates the graph **twice** per run (two passes).
+- Our binary runs `--gen 1`, producing logits for **pos 0** (prompt) and **pos 1** (generated token).
+- `compare_all.py` uses the **last** reference occurrence, but it's unclear whether this is pos 0 or pos 1.
+- If the divergence is in **stateful update** (KV cache write, SSM state update, conv state shift), the pos-1 logits will diverge even if pos-0 is perfect.
 
-## Path to Parity: Port ggml Reference Kernels
+### Finding 4: Reference tensor naming mismatch
+- Reference uses `attn_post_norm-0` as the FFN input; our dump uses `post_norm`.
+- Reference `l_out-0` is `ADD(ffn_out-0, attn_residual-0)`; our `layer_out` is post-FFN add.
+- These are now correctly mapped in `compare_all.py`.
 
-The only way to achieve bit-exact parity is to use the **exact same kernels** as ggml. We will copy the reference CUDA kernels directly (no runtime dependency on llama.cpp), adapting them to our engine's data structures.
+---
 
-### What We Will Port (Minimal Set)
+## Plan to Fix Remaining Bugs
 
-| Kernel | Source File | Lines | Priority | Impact |
-|--------|-------------|-------|----------|--------|
-| **Q8_1 Quantizer** | `quantize.cu` | ~80 | P0 (needed by matmuls) | Enables `__dp4a` matmuls |
-| **Matmul (Q4_K, Q5_K, Q6_K, IQ4_XS)** | `mmvq.cu` | ~600 | P0 | Core of all projections |
-| **DeltaNet** | `gated_delta_net.cu` | ~150 | P1 | Highest-impact non-matmul |
-| **RMS / L2 Norm** | `norm.cu` | ~100 | P2 | Small but compounding |
-| **Conv1D** | `ssm-conv.cu` | ~50 | P3 | Already close, optional |
+We pursue **three independent investigative tracks** in parallel.
 
-**Total new code: ~980 lines of CUDA kernels + ~200 lines of adapter/wrapper layer.**
+### Track A: Check Attention Layers (Highest Priority)
+**Hypothesis**: Attention layers diverge, and since they account for ~25% of the model, they destroy E2E correlation.
 
-### What We Will Strip from ggml Code
+**Action**:
+1. Add debug dumps for **attention layer 3** (first attention layer) in our executor: `attn_norm`, `q_proj`, `k_proj`, `v_proj`, `attn_output`, `post_ffn`.
+2. Run `llama-debug` with a filter for layer-3 tensors.
+3. Compare with `compare_all.py`.
 
-- All `ggml_tensor*` dependencies → replace with raw `float*` + `int64_t ne[4]` + `size_t nb[4]`
-- All `ggml_backend_cuda_context` → replace with raw `cudaStream_t`
-- All ggml type-system enums → keep only our `MONO27B_GGML_TYPE_*` mapping
-- Graph execution, scheduling, buffer management → our engine already handles this
+**Expected outcome**: If attention tensors FAIL, we found the big divergence. If they PASS, the bug is elsewhere.
 
-### Adapter Layer
+### Track B: Isolate Stateful vs Stateless Divergence
+**Hypothesis**: The prompt pass (pos 0) is nearly correct, but the generated token (pos 1) diverges due to a state-update bug.
 
-We will add a minimal `GgmlTensorView` struct:
-```cpp
-struct GgmlTensorView {
-    void * data;
-    int64_t ne[4];
-    size_t  nb[4];
-    uint32_t type;  // maps to MONO27B_GGML_TYPE
-};
+**Action**:
+1. Modify `compare_e2e.py` to compare **only the prompt logits** (pos 0).
+2. Run our binary with `--gen 0` and compare with `llama-debug`.
+
+**Expected outcome**: If pos-0 correlation is >> 0.47 (e.g., >0.95), the bug is in KV-cache/SSM-state update. If pos-0 is still ~0.47, the bug is in the forward pass itself.
+
+### Track C: Eliminate Q8_1 Quantizer Drift
+**Hypothesis**: Our simple per-thread `k_quant_q8_1` produces 1-ULP different `d` values than ggml's warp-reduction version, causing ~0.01 diffs that compound across 64 layers.
+
+**Action**:
+1. Port ggml's exact `quantize_q8_1` kernel (with `warp_reduce_max` and `warp_reduce_sum`) from `quantize.cu`.
+2. Re-run `make verify`. If `ffn_gate`/`ffn_up` drop from 0.01 to <0.001, this was the issue.
+
+**Expected outcome**: If `ffn_gate` diff drops to ~0.001 and E2E correlation jumps significantly, quantization drift was the culprit.
+
+### Decision Tree
+
+```
+Track A result:
+  ├─ Attention FAIL → Fix attention kernel (RoPE, softmax, KV-cache, output projection)
+  └─ Attention PASS →
+        Track B result:
+          ├─ pos-0 correlation >> 0.47 → Bug is in stateful update (KV cache, SSM state, conv state)
+          └─ pos-0 correlation ~0.47 →
+                Track C result:
+                  ├─ ffn_gate diff drops → Q8_1 quantizer was the issue
+                  └─ ffn_gate diff stays → Unidentified forward-pass bug; need deeper layer-by-layer comparison
 ```
 
-Adapter functions will convert our `WeightView` + `float*` input vector → `GgmlTensorView` + launch parameters.
+---
 
-### Implementation Order
+## Previously Ported Kernels
 
-1. **~~Step 1: DeltaNet kernel~~ ✅ DONE** (smallest, highest impact per line)
-   - Copied `gated_delta_net_cuda` from `gated_delta_net.cu`
-   - Replaced `ggml_tensor` stride logic with our flat array indexing + grouped q/k indexing (`g_idx = h_idx / (dr / ng)`)
-   - Added `k_deltanet_ggml` kernel with warp-level `warp_reduce_sum<32>` primitives
-   - Added `k_deltanet_ggml_launch` wrapper dispatching `S_v=128, KDA=false`
-   - Standalone test passes: max_diff = 1.1e-08 against CPU reference
-   - Removed old `k_deltanet` element-wise kernel
+### DeltaNet kernel ✅
+- Copied `gated_delta_net_cuda` from `gated_delta_net.cu`
+- Replaced `ggml_tensor` stride logic with flat array indexing + grouped q/k indexing (`g_idx = h_idx % ng`)
+- Added `k_deltanet_ggml` kernel with warp-level `warp_reduce_sum<32>` primitives
+- Added `k_deltanet_ggml_launch` wrapper dispatching `S_v=128, KDA=false`
+- Standalone test passes: max_diff = 1.1e-08 against CPU reference
 
-2. **Step 2: Q8_1 quantizer + Q5_K matmul**
-   - Add `k_quant_q8_1` kernel (already have a version; replace with ggml's exact implementation)
-   - Add `ggml_cuda_op_mul_mat_vec_q` path for Q5_K
-   - Verify `z` tensor now matches reference
+### Q8_1 quantizer + K-quant matmuls ✅
+- Added `BlockQ8_1` with `__half2 ds` union matching `block_q8_1` from ggml-common.h
+- Added `k_quant_q8_1` kernel (per-thread, 1 thread/block)
+- Added `k_q4k_mv_q8_dp4a` matching `vec_dot_q4_K_q8_1` from `vecdotq.cuh`
+- Added `k_q5k_mv_q8` matching `vec_dot_q5_K_q8_1` from `vecdotq.cuh`
+- Added `k_q6k_mv_q8_dp4a` matching `vec_dot_q6_K_q8_1` from `vecdotq.cuh`
+- Added `k_iq4xs_mv_q8_dp4a` matching `vec_dot_iq4_xs_q8_1` from `vecdotq.cuh`
+- Modified `l_mv` to dispatch Q8_1 path when `g_q8_scratch` is available and `n_q8 <= 544`
 
-3. **Step 3: Remaining matmul types**
-   - Port Q4_K, Q6_K, IQ4_XS paths from `mmvq.cu`
-   - Verify end-to-end correlation
-
-4. **Step 4: Norm kernels**
-   - Port `rms_norm_f32` and `l2_norm_f32` from `norm.cu`
-   - Verify `attn_norm` and `q/k_norm` match
-
-### Why Start with DeltaNet?
-
-- **Smallest kernel** (~150 lines vs ~600 for matmul)
-- **Highest impact per line** — the DeltaNet state update is the core of the recurrent path where differences compound
-- **Easier to verify** — one kernel call per layer, easy to isolate
-
-### Expected Correlation Improvement
-
-| Step | Expected Correlation | Notes |
-|------|----------------------|-------|
-| Baseline (current) | 0.414 | F32 dequant + element-wise loops |
-| After DeltaNet | 0.65–0.75 | Same matmul rounding, but state update matches |
-| After Q8_1 matmuls | 0.90–0.95 | Core matmuls now use `__dp4a` |
-| After norm kernels | 0.95–0.99 | All ops match; only SwiGLU/element-wise remain |
-| Full parity | 1.00 | All kernels ported |
-
-## Previous Experiments (For Reference)
-
-### Q8_1 Intermediate for Q6_K (attempt 1 — shared memory, reverted)
-
-Replaced the Q6_K matvec kernel to quantize the F32 input to Q8_1 in shared memory, then compute dot product as `d6 * d8 * sc * qv * q8v`. Caused NaN at attention layer 3 (shared memory alignment issue). Correlation improved from 0.414288 to 0.414991 (+0.17%) before reverting.
-
-### Q8_1 Intermediate for Q4_K (attempt 2 — global buffer, committed)
-
-Added a `q8_scratch` global buffer (544 BlockQ8_1 = ~20KB) to the engine state, a `k_quant_q8_1` kernel for F32→Q8_1 quantization, and a `k_q4k_mv_q8` kernel using Q8_1 intermediate. Modified `l_mv` dispatch to use Q8_1 path for Q4_K weights.
-
-**Result:** Correlation 0.413485 — essentially unchanged (-0.19% from 0.414288 baseline). Confirms Q8_1 quantization of the input vector is NOT the source of divergence in isolation. The DeltaNet and norm kernels must also match.
+---
 
 ## Verification Infrastructure
 
@@ -169,31 +176,35 @@ Added a `q8_scratch` global buffer (544 BlockQ8_1 = ~20KB) to the engine state, 
 
 | File | Purpose |
 |------|---------|
-| `verify_q6k_full.py` | Fixed Q6_K dequant + matvec verification |
+| `verify_q6k_full.py` | Q6_K dequant + matvec verification |
 | `verify_q6k_wqkv.py` | Q6_K matvec vs GPU inline probe |
 | `test_q5k_matvec.py` | Q5_K matvec verification |
 | `verify_rms_norm.py` | RMS norm verification |
 | `verify_deltanet.py` | Python DeltaNet reference |
-| `compare_intermediates_last.py` | Compare GPU vs llama-debug output (uses LAST ref occurrence) |
-| `replay-trace` mode | Forces our generation stream to match a reference trace |
+| `compare_all.py` | Comprehensive tensor comparison (uses LAST ref occurrence) |
+| `run_all_checks.py` | Component checks (Q6_K, RMS norm, Q5_K, M-RoPE, E2E) |
+| `compare_e2e.py` | End-to-end logit comparison |
+| `extract_data.py` | Extracts embed_full.txt and attn_norm_full.txt from debug TSV |
 | `ref_logits.bin` | Reference logits (from `--save-logits`) |
 | `our_logits.bin` | Our logits binary |
 
 ### Key Reference Commands
 
 ```bash
-# Save reference logits to binary file
-llama-debug -m model.gguf -p "give" -n 1 -c 4096 --seed 944990222 \
-    --save-logits --logits-output-dir /tmp/ref_logits
+# Full verify (build + gen ref + gen ours + compare)
+make verify
 
-# Capture intermediate tensors (batch_size=1 gives 2 forward passes)
-llama-debug -m model.gguf -p "give" -c 4096 -b 1 -ub 1 \
-    --tensor-filter "attn_norm-0|z-0|conv_output_raw-0|conv_output_silu-0|q_conv_predelta-0|k_conv_predelta-0|attn_output-0|final_output-0|l_out-0"
+# Only comparisons on existing data
+make verify-only
 
-# Our code with debug dump
-mono27b_chat -m model.gguf -p "give" --gen 1 --ctx 4096 --seed 944990222 \
-    --trace /dev/null --debug /tmp/mono_verify.debug.tsv
+# End-to-end logit comparison only
+make e2e
+
+# Comprehensive tensor comparison
+make compare-all
 ```
+
+---
 
 ## Quick Reference: Key Dimensions
 
@@ -206,12 +217,16 @@ mono27b_chat -m model.gguf -p "give" --gen 1 --ctx 4096 --seed 944990222 \
 | HEAD_K / HEAD_V | 128 | SSM state dimension |
 | D_CONV | 4 | Conv1d kernel size |
 | CONV_CH | 10240 | Conv channels = D_INNER + 2*QK_DIM |
+| FFN_DIM | 17408 | FFN intermediate dimension |
 | LAYERS | 64 | Total layers |
 | FA_INTERVAL | 4 | Attention layer every 4th |
 
 ## Changelog
 
-- **2026-05-04**: Discovered reference output contains two forward passes. Fixed comparison to use last occurrence. Confirmed 99% of elements match within 0.3%. Decision to port ggml kernels.
+- **2026-05-05**: Fixed `BlockQ8_1` layout to match ggml exactly (`__half2 ds` union). Fixed Q8_1 member accesses in Q4_K and Q6_K kernels. Rebuilt and re-ran `make verify`: 9/12 PASS, E2E correlation 0.4715.
+- **2026-05-05**: Identified that we are only comparing layer 0 (SSM). Attention layers (3,7,11,...) are completely unverified and likely the dominant E2E divergence source.
+- **2026-05-05**: Identified potential stateful divergence: our binary generates pos 0 and pos 1; reference may evaluate twice. Need to isolate pos-0 correlation.
+- **2026-05-04**: Discovered reference output contains two forward passes. Fixed comparison to use last occurrence.
 - **2026-05-04**: Fixed `k_l2_norm_g` bug (was `1/sqrt(sum_sq + eps)`, should be `rsqrtf(fmaxf(sum_sq, eps*eps))`).
 - **2026-05-04**: Fixed SSM gated norm buffer overflow (was using `h2` (5120 floats), now uses `kb` (17408 floats)).
 - **2026-05-04**: Fixed Python GQA indexing bug (`r_idx % ng` → `r_idx // (dr // ng)`).

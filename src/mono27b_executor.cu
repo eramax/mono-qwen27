@@ -60,8 +60,10 @@ struct BlockQ6K {
 
 // Q8_1 block for intermediate matvec quantization (32 elements per block)
 struct BlockQ8_1 {
-    __half d;
-    __half s;
+    union {
+        struct { __half d; __half s; } ds_alias;
+        __half2 ds;
+    };
     int8_t qs[32];
 };
 
@@ -83,8 +85,7 @@ __global__ static void k_quant_q8_1(const float * x, BlockQ8_1 * y, int n) {
         y[b].qs[j] = (int8_t)qi;
         sum_ += (float)qi;
     }
-    y[b].d = __float2half(d);
-    y[b].s = __float2half(d * sum_);
+    y[b].ds = make_half2(d, d * sum_);
 }
 
 // ─── dp4a helper (from ggml common.cuh) ─────────────────────────────────────
@@ -183,7 +184,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
 
     for (int i = 0; i < MONO27B_QR4_K; ++i) {
         const BlockQ8_1 * bq8i = bq8_1 + bq8_offset + i;
-        d8[i] = __half2float(bq8i->d);
+        d8[i] = __low2float(bq8i->ds);
 
         const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
         u[2*i+0] = q8[0];
@@ -281,7 +282,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
 #pragma unroll
     for (int i = 0; i < MONO27B_QR5_K; ++i) {
         const BlockQ8_1 * bq8i = bq8_1 + bq8_offset + i;
-        d8[i] = __half2float(bq8i->d);
+        d8[i] = __low2float(bq8i->ds);
 
         const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
         u[2*i+0] = q8[0];
@@ -353,7 +354,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
 #pragma unroll
     for (int i = 0; i < MONO27B_QR6_K; ++i) {
         u[i]  = get_int_b4(bq8_1[bq8_offset + 2*i].qs, iqs % MONO27B_QI8_1);
-        d8[i] = __half2float(bq8_1[bq8_offset + 2*i].d);
+        d8[i] = __half2float(bq8_1[bq8_offset + 2*i].ds_alias.d);
     }
 
     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, __half2float(bq6_K->d), d8);
@@ -402,7 +403,7 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
     const int ls = ((bq4->scales_l[iqs/8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs/2)) & 0x03) << 4);
     sumi *= ls - 32;
 
-    const float d = __half2float(bq4->d) * __half2float(bq8_1[iqs/4].d);
+      const float d = __half2float(bq4->d) * __half2float(bq8_1[iqs/4].ds_alias.d);
     return d * sumi;
 }
 
@@ -1885,7 +1886,7 @@ extern "C" bool mono27b_engine_decode_step(
                     if (!check_finite_device(lbl, h2, MONO27B_TARGET_HIDDEN, error, error_cap)) goto cleanup;
                 }
                 if (dump_step && il < MONO27B_TARGET_LAYERS) {
-                    debug_dump_vec(debug_fp, "ssm", il, pos, tok, "layer_out", h2, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
+                    // layer_out will be dumped after FFN below
                 }
             } else {
                 if (st->conv_state[ssm_i]) {
@@ -1933,7 +1934,7 @@ extern "C" bool mono27b_engine_decode_step(
             }
             k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h, h2, MONO27B_TARGET_HIDDEN);
             if (dump_step && il < 3) {
-                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "post_ffn", h, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
+                debug_dump_vec(debug_fp, "ssm", il, pos, tok, "layer_out", h, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
             }
             ssm_i++;
         }

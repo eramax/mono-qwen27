@@ -112,6 +112,9 @@ OUR_TO_REF = {
     ('ssm', 'post_ffn'): None,
     ('out', 'logits'): None,  # handled separately
     ('out', 'output_norm'): None,
+    ('attn', 'attn_norm'): 'attn_norm-{layer}',
+    ('attn', 'attn_out'): 'attn_output-{layer}',
+    ('attn', 'post_ffn'): 'l_out-{layer}',
     ('attn', 'q_proj'): None,
     ('attn', 'k_norm'): None,
     ('attn', 'q_norm'): None,
@@ -119,7 +122,6 @@ OUR_TO_REF = {
     ('attn', 'k_rope'): None,
     ('attn', 'v_proj'): None,
     ('attn', 'attn_raw'): None,
-    ('attn', 'attn_out'): None,
     ('attn', 'attn_gated'): None,
     ('attn', 'gate_src'): None,
     ('attn', 'post_ffn'): None,
