@@ -34,8 +34,10 @@ struct SamplingConfig {
 };
 
 struct ChatTemplateConfig {
-    std::string prefix;
-    std::string suffix;
+    std::string prefix;       // tokenized as part of input prompt
+    std::string suffix;       // tokenized as part of input prompt (control tokens)
+    std::string visible_tail; // appended to suffix in tokenization AND echoed to stdout
+                              // so the user sees the assistant prefix (e.g. "<think>\n")
 };
 
 struct Mono27BConfig {
@@ -98,6 +100,7 @@ static Mono27BConfig load_config(const std::string &path) {
     cfg.sampling.temperature = get_json_value(json, "temperature", 0.8f);
     cfg.chat_template.prefix = get_json_value(json, "system_prefix", std::string("<|im_start|>user\n"));
     cfg.chat_template.suffix = get_json_value(json, "system_suffix", std::string("<|im_end|>\n<|im_start|>assistant\n"));
+    cfg.chat_template.visible_tail = get_json_value(json, "assistant_visible_tail", std::string("<think>\n"));
 
     auto samp_pos = json.find("\"sampling\"");
     auto banned_pos = (samp_pos != std::string::npos) ? json.find("banned_tokens", samp_pos) : std::string::npos;
@@ -368,8 +371,10 @@ int main(int argc, char **argv) {
     while (!prompt.empty() && (prompt.back() == '\n' || prompt.back() == '\r' ||
                                 prompt.back() == '\t' || prompt.back() == ' '))
         prompt.pop_back();
-    if (args.chat)
-        prompt = cfg.chat_template.prefix + prompt + cfg.chat_template.suffix;
+    // Always apply the llama.cpp-style chat template. The visible tail
+    // (e.g. "<think>\n") is part of the prompt context AND echoed to stdout
+    // so the user sees the full assistant turn including <think>...</think>.
+    prompt = cfg.chat_template.prefix + prompt + cfg.chat_template.suffix + cfg.chat_template.visible_tail;
 
     std::vector<int32_t> prompt_ids = tokenizer.encode(prompt);
     if (gguf.metadata.add_bos_token)
@@ -402,6 +407,14 @@ int main(int argc, char **argv) {
     t1 = clock::now();
 
     if (ok) {
+        // Echo the visible assistant prefix so the user sees the full conversation
+        // (e.g. the leading "<think>\n"). The model will continue from this point
+        // and output its own </think> + answer.
+        if (!cfg.chat_template.visible_tail.empty()) {
+            fwrite(cfg.chat_template.visible_tail.data(), 1,
+                   cfg.chat_template.visible_tail.size(), stdout);
+            fflush(stdout);
+        }
         t2 = clock::now();
         for (int step = 0; step < std::max(1, args.max_gen); step++) {
             std::vector<float> cur;
