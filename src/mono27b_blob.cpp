@@ -1,41 +1,30 @@
 #include "mono27b_format.h"
+#include "mono27b_utils.h"
 
 #include <cstring>
 #include <cstdio>
 #include <filesystem>
 
+using namespace Mono27BUtils;
+
 namespace {
 
-static bool header_strings_match(const Mono27BBlobHeader & header,
-                                 const char * expected,
-                                 const char * actual) {
+inline bool header_strings_match(const char *expected, const char *actual) {
     return std::strncmp(expected, actual, 15) == 0;
-}
-
-static bool read_at(std::FILE * fp, void * out, size_t bytes, uint64_t off) {
-    if (std::fseek(fp, static_cast<long>(off), SEEK_SET) != 0) {
-        return false;
-    }
-    return std::fread(out, bytes, 1, fp) == 1;
 }
 
 } // namespace
 
-bool mono27b_read_blob_header(const std::string & path, Mono27BBlobHeader & header, std::string & error) {
-    std::FILE * fp = std::fopen(path.c_str(), "rb");
+bool mono27b_read_blob_header(const std::string &path, Mono27BBlobHeader &header, std::string &error) {
+    FILE *fp = std::fopen(path.c_str(), "rb");
     if (!fp) {
         error = "missing blob: " + path;
         return false;
     }
-
-    if (std::fread(&header, sizeof(header), 1, fp) != 1) {
-        std::fclose(fp);
-        error = "invalid blob header: " + path;
-        return false;
-    }
-
+    bool ok = read_pod(fp, header, error);
     std::fclose(fp);
-    return true;
+    if (!ok) error = "invalid blob header: " + path;
+    return ok;
 }
 
 bool mono27b_validate_blob_file(const std::string & path, std::string & error) {
@@ -75,14 +64,14 @@ bool mono27b_validate_blob_file(const std::string & path, std::string & error) {
         return false;
     }
 
-    if (!header_strings_match(header, MONO27B_TARGET_ARCH, header.target_arch) ||
-        !header_strings_match(header, MONO27B_DRAFT_ARCH, header.draft_arch)) {
+    if (!header_strings_match(MONO27B_TARGET_ARCH, header.target_arch) ||
+        !header_strings_match(MONO27B_DRAFT_ARCH, header.draft_arch)) {
         error = "invalid blob architecture tags: " + path;
         return false;
     }
 
-    if (!header_strings_match(header, MONO27B_TARGET_QUANT, header.target_quant) ||
-        !header_strings_match(header, MONO27B_DRAFT_QUANT, header.draft_quant)) {
+    if (!header_strings_match(MONO27B_TARGET_QUANT, header.target_quant) ||
+        !header_strings_match(MONO27B_DRAFT_QUANT, header.draft_quant)) {
         error = "invalid blob quant tags: " + path;
         return false;
     }
@@ -144,66 +133,49 @@ bool mono27b_validate_blob_file(const std::string & path, std::string & error) {
     return true;
 }
 
-bool mono27b_read_blob_sections(const std::string & path,
-                                Mono27BBlobSection * sections,
-                                size_t section_cap,
-                                std::string & error) {
+bool mono27b_read_blob_sections(const std::string &path, Mono27BBlobSection *sections,
+                                size_t section_cap, std::string &error) {
     if (!sections || section_cap == 0) {
         error = "invalid blob section buffer";
         return false;
     }
     Mono27BBlobHeader header{};
-    if (!mono27b_read_blob_header(path, header, error)) {
-        return false;
-    }
+    if (!mono27b_read_blob_header(path, header, error)) return false;
     if (header.section_count > section_cap) {
         error = "insufficient blob section buffer: " + path;
         return false;
     }
-    std::FILE * fp = std::fopen(path.c_str(), "rb");
+    FILE *fp = std::fopen(path.c_str(), "rb");
     if (!fp) {
         error = "missing blob: " + path;
         return false;
     }
-    const size_t bytes = static_cast<size_t>(header.section_count) * sizeof(Mono27BBlobSection);
-    const bool ok = read_at(fp, sections, bytes, header.section_table_offset);
+    bool ok = (std::fseek(fp, (long)header.section_table_offset, SEEK_SET) == 0) &&
+              (std::fread(sections, sizeof(Mono27BBlobSection), header.section_count, fp) == header.section_count);
     std::fclose(fp);
-    if (!ok) {
-        error = "invalid blob section table read: " + path;
-        return false;
-    }
-    return true;
+    if (!ok) error = "invalid blob section table read: " + path;
+    return ok;
 }
 
-bool mono27b_read_tokenizer_section(const std::string & path, Mono27BTokenizerSection & section, std::string & error) {
+bool mono27b_read_tokenizer_section(const std::string &path, Mono27BTokenizerSection &section, std::string &error) {
     Mono27BBlobHeader header{};
-    if (!mono27b_read_blob_header(path, header, error)) {
-        return false;
-    }
-    std::FILE * fp = std::fopen(path.c_str(), "rb");
+    if (!mono27b_read_blob_header(path, header, error)) return false;
+    FILE *fp = std::fopen(path.c_str(), "rb");
     if (!fp) {
         error = "missing blob: " + path;
         return false;
     }
-    const bool ok = read_at(fp, &section, sizeof(section), header.tokenizer_offset);
+    bool ok = read_at(fp, section, header.tokenizer_offset, error);
     std::fclose(fp);
     if (!ok) {
         error = "invalid tokenizer section read: " + path;
         return false;
     }
-    if (section.magic != MONO27B_TOKENIZER_MAGIC) {
-        error = "invalid tokenizer section magic: " + path;
-        return false;
-    }
-    if (section.version != 1U) {
-        error = "invalid tokenizer section version: " + path;
-        return false;
-    }
-    if (section.vocab_size == 0) {
-        error = "invalid tokenizer vocab size: " + path;
-        return false;
-    }
-    return true;
+    if (section.magic != MONO27B_TOKENIZER_MAGIC) error = "invalid tokenizer magic";
+    else if (section.version != 1U) error = "invalid tokenizer version";
+    else if (section.vocab_size == 0) error = "invalid tokenizer vocab size";
+    else return true;
+    return false;
 }
 
 bool mono27b_read_weights_section(const std::string & path,
@@ -237,7 +209,8 @@ bool mono27b_read_weights_section(const std::string & path,
         error = "missing blob: " + path;
         return false;
     }
-    if (!read_at(fp, &section, sizeof(section), weights_blob.offset)) {
+    if ((std::fseek(fp, (long)weights_blob.offset, SEEK_SET) != 0) ||
+        (std::fread(&section, sizeof(section), 1, fp) != 1)) {
         std::fclose(fp);
         error = "invalid weights section read: " + path;
         return false;
@@ -257,8 +230,8 @@ bool mono27b_read_weights_section(const std::string & path,
         : 0U;
     const uint64_t entries_off = weights_blob.offset + sizeof(Mono27BWeightsSection);
     if (to_read > 0) {
-        const size_t entries_bytes = static_cast<size_t>(to_read) * sizeof(Mono27BWeightEntry);
-        if (!read_at(fp, entries, entries_bytes, entries_off)) {
+        if ((std::fseek(fp, (long)entries_off, SEEK_SET) != 0) ||
+            (std::fread(entries, sizeof(Mono27BWeightEntry), to_read, fp) != to_read)) {
             std::fclose(fp);
             error = "invalid weights entries read: " + path;
             return false;
@@ -296,8 +269,8 @@ static bool find_weights_section_offset(const std::string & path, uint64_t & wei
         error = "missing blob: " + path;
         return false;
     }
-    const size_t bytes = static_cast<size_t>(n) * sizeof(Mono27BBlobSection);
-    const bool ok = read_at(fp, sections, bytes, header.section_table_offset);
+    const bool ok = (std::fseek(fp, (long)header.section_table_offset, SEEK_SET) == 0) &&
+                    (std::fread(sections, sizeof(Mono27BBlobSection), n, fp) == n);
     std::fclose(fp);
     if (!ok) {
         error = "invalid blob section table: " + path;
@@ -327,10 +300,10 @@ bool mono27b_scan_weight_entry_by_role(const std::string & path,
         return false;
     }
     Mono27BWeightsSection section{};
-    if (!read_at(fp, &section, sizeof(section), weights_off) ||
+    if ((std::fseek(fp, (long)weights_off, SEEK_SET) != 0) || !read_pod(fp, section, error) ||
         section.magic != MONO27B_WEIGHTS_MAGIC || section.entry_count == 0) {
         std::fclose(fp);
-        error = "invalid weights section: " + path;
+        if (error.empty()) error = "invalid weights section: " + path;
         return false;
     }
     const uint64_t entries_off = weights_off + sizeof(Mono27BWeightsSection);
@@ -372,10 +345,10 @@ bool mono27b_scan_weight_entry_by_source_type(const std::string & path,
         return false;
     }
     Mono27BWeightsSection section{};
-    if (!read_at(fp, &section, sizeof(section), weights_off) ||
+    if ((std::fseek(fp, (long)weights_off, SEEK_SET) != 0) || !read_pod(fp, section, error) ||
         section.magic != MONO27B_WEIGHTS_MAGIC || section.entry_count == 0) {
         std::fclose(fp);
-        error = "invalid weights section: " + path;
+        if (error.empty()) error = "invalid weights section: " + path;
         return false;
     }
     const uint64_t entries_off = weights_off + sizeof(Mono27BWeightsSection);

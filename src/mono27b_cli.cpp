@@ -19,17 +19,20 @@ void mono27b_print_usage(const char * prog) {
         prog);
 }
 
-bool mono27b_parse_args(int argc, char ** argv, Mono27BChatArgs & out) {
-    for (int i = 1; i < argc; ++i) {
+bool mono27b_parse_args(int argc, char **argv, Mono27BChatArgs &out) {
+    auto match = [](const std::string &arg, const char *opt1, const char *opt2) {
+        return arg == opt1 || (opt2 && arg == opt2);
+    };
+    for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
-        if (arg == "-h" || arg == "--help") { out.show_help = true; return true; }
-        if ((arg == "-m" || arg == "--model") && i + 1 < argc) { out.model = argv[++i]; continue; }
-        if ((arg == "-p" || arg == "--prompt") && i + 1 < argc) { out.prompt = argv[++i]; continue; }
+        if (match(arg, "-h", "--help")) { out.show_help = true; return true; }
+        if (match(arg, "-m", "--model") && i + 1 < argc) { out.model = argv[++i]; continue; }
+        if (match(arg, "-p", "--prompt") && i + 1 < argc) { out.prompt = argv[++i]; continue; }
         if (arg == "--ctx" && i + 1 < argc) { out.max_ctx = std::atoi(argv[++i]); continue; }
         if (arg == "--gen" && i + 1 < argc) { out.max_gen = std::atoi(argv[++i]); continue; }
-        if (arg == "--seed" && i + 1 < argc) { out.seed = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10)); continue; }
+        if (arg == "--seed" && i + 1 < argc) { out.seed = std::strtoul(argv[++i], nullptr, 10); continue; }
         if (arg == "--chat") { out.chat = true; continue; }
-        if (arg == "-v" || arg == "--verbose") { out.verbose = true; continue; }
+        if (match(arg, "-v", "--verbose")) { out.verbose = true; continue; }
         std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
         return false;
     }
