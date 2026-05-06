@@ -2102,6 +2102,8 @@ extern "C" bool mono27b_engine_decode_step(
 
             l_rms(h2, h, WV(L.attn_norm), MONO27B_TARGET_HIDDEN);
             MV_PAIR(L.wqkv, L.wqkv_gate, h2, sb, gb);
+            // Save wqkv_gate before deltanet overwrites gb (using fb as temporary storage)
+            cudaMemcpyAsync(fb, gb, MONO27B_SSM_D_INNER * sizeof(float), cudaMemcpyDeviceToDevice);
             if (dump_step && il == 0) {
                 // Dump FULL wqkv_gate (6144) for Python comparison
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "wqkv_gate", gb, MONO27B_SSM_D_INNER, MONO27B_SSM_D_INNER);
@@ -2193,8 +2195,8 @@ extern "C" bool mono27b_engine_decode_step(
                     }
                 }
 
-                // Gate: wqkv_gate @ h2 → siLU → mul with rms_norm(ssm_out)
-                MV(L.wqkv_gate, h2, fb); TRACE("re-g");
+                // Gate: reuse saved wqkv_gate from fb (avoid redundant matvec)
+                TRACE("re-g");
                 k_elem_silu<<<(MONO27B_SSM_D_INNER + 255) / 256, 256>>>(fb, MONO27B_SSM_D_INNER); TRACE("g_silu");
                 // Fused batched RMS norm for all 48 SSM heads in one kernel launch
                 // (was 48 individual launches — massive launch overhead)
