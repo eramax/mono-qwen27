@@ -267,19 +267,47 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, *(const __half2 *)&bq4_K->d, d8);
 }
 
-// Optimized Q4_K matvec
+// Optimized Q4_K matvec kernel
 __global__ static void k_q4k_mv_q8_dp4a(const BlockQ4K * W, const BlockQ8_1 * q8, float * y, int rb, int rc) {
     int row = blockIdx.x;
     if (row >= rc) return;
+
     float sum = 0.0f;
     const BlockQ4K * wp = W + (size_t)row * rb;
+
+    // Optimized: process all vec_dots for this row with best memory access pattern
     for (int idx = threadIdx.x; idx < rb * 16; idx += 128) {
         int b = idx / 16;
         int iqs = (idx % 16) * 2;
         sum += vec_dot_q4_K_q8_1(wp, q8 + b * 8, b, iqs);
     }
+
     sum = block_reduce_sum<128>(sum);
     if (threadIdx.x == 0) y[row] = sum;
+}
+
+// Alternative: 2-row-per-block version for reducing launch overhead
+// Only use this if profiling shows launch overhead is critical for ssmo
+__global__ static void k_q4k_mv_q8_dp4a_2row(const BlockQ4K * W, const BlockQ8_1 * q8, float * y, int rb, int rc) {
+    int row_base = blockIdx.x * 2;
+    int wid = threadIdx.x / 64;  // 2 warps per row
+    int tid = threadIdx.x % 64;
+
+    if (row_base + wid >= rc) return;
+
+    int row = row_base + wid;
+    float sum = 0.0f;
+    const BlockQ4K * wp = W + (size_t)row * rb;
+
+    // Each warp (64 threads) handles one row
+    for (int idx = tid; idx < rb * 16; idx += 64) {
+        int b = idx / 16;
+        int iqs = (idx % 16) * 2;
+        sum += vec_dot_q4_K_q8_1(wp, q8 + b * 8, b, iqs);
+    }
+
+    sum = block_reduce_sum<64>(sum);
+    if (tid == 0) y[row] = sum;
 }
 
 // ─── Q5_K vec_dot (from vecdotq.cuh, vmmq path) ─────────────────────────────
