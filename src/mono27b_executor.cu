@@ -267,12 +267,12 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, *(const __half2 *)&bq4_K->d, d8);
 }
 
+// Optimized Q4_K matvec
 __global__ static void k_q4k_mv_q8_dp4a(const BlockQ4K * W, const BlockQ8_1 * q8, float * y, int rb, int rc) {
     int row = blockIdx.x;
     if (row >= rc) return;
     float sum = 0.0f;
     const BlockQ4K * wp = W + (size_t)row * rb;
-    // Optimized loop with better latency hiding through multiple accumulators
     for (int idx = threadIdx.x; idx < rb * 16; idx += 128) {
         int b = idx / 16;
         int iqs = (idx % 16) * 2;
@@ -528,6 +528,32 @@ __global__ static void k_rms_norm_mulw_batched(
     double scale = 1.0 / sqrt(total / (double)row_len + (double)eps);
     for (int i = threadIdx.x; i < row_len; i += 256)
         yr[i] = (float)((double)xr[i] * scale * (double)(w ? w[i] : 1.0f));
+}
+
+// Batched fused kernel: RMS norm + element-wise multiply in one launch
+// Takes normalized input, applies RMS norm with weight, then multiplies by gate
+// Reduces from 2 kernels to 1
+__global__ static void k_rms_norm_mulw_mul_batched(
+    const float * __restrict__ x, const float * __restrict__ w, const float * __restrict__ gate,
+    float * __restrict__ y, int row_len, int n_rows, float eps)
+{
+    int row = blockIdx.x;
+    if (row >= n_rows) return;
+    const float * xr = x + (size_t)row * row_len;
+    const float * gr = gate + (size_t)row * row_len;
+    float * yr = y + (size_t)row * row_len;
+
+    __shared__ double sh[256];
+    double sum = 0.0;
+    for (int i = threadIdx.x; i < row_len; i += 256) sum += (double)xr[i] * (double)xr[i];
+    sh[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) { if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s]; __syncthreads(); }
+    double total = sh[0];
+    double scale = 1.0 / sqrt(total / (double)row_len + (double)eps);
+
+    for (int i = threadIdx.x; i < row_len; i += 256)
+        yr[i] = ((float)((double)xr[i] * scale * (double)w[i])) * gr[i];
 }
 
 // ─── Elementwise kernels ─────────────────────────────────────────────────────
@@ -2205,15 +2231,13 @@ extern "C" bool mono27b_engine_decode_step(
                 // Gate: reuse saved wqkv_gate from fb (avoid redundant matvec)
                 TRACE("re-g");
                 k_elem_silu<<<(MONO27B_SSM_D_INNER + 255) / 256, 256>>>(fb, MONO27B_SSM_D_INNER); TRACE("g_silu");
-                // Fused batched RMS norm for all 48 SSM heads in one kernel launch
-                // (was 48 individual launches — massive launch overhead)
+                // Fused batched RMS norm + multiply: combines 2 kernels into 1
                 {
                     const float * w_norm = WV(L.ssm_norm);
-                    k_rms_norm_mulw_batched<<<MONO27B_SSM_DT_RANK, 256>>>(
-                        gb, w_norm, kb, MONO27B_SSM_HEAD_V, MONO27B_SSM_DT_RANK, MONO27B_RMS_EPS);
+                    k_rms_norm_mulw_mul_batched<<<MONO27B_SSM_DT_RANK, 256>>>(
+                        gb, w_norm, fb, kb, MONO27B_SSM_HEAD_V, MONO27B_SSM_DT_RANK, MONO27B_RMS_EPS);
                 }
-                TRACE("grms");
-                k_elem_mul<<<(MONO27B_SSM_D_INNER + 255) / 256, 256>>>(kb, fb, MONO27B_SSM_D_INNER); TRACE("gmul2");
+                TRACE("grms+gmul2");
                 if (dump_step && il < 4) {
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "final_output", kb, MONO27B_SSM_D_INNER, MONO27B_SSM_D_INNER);
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "q_conv_predelta", qr, MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K);
