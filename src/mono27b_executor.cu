@@ -1205,6 +1205,57 @@ __global__ static void k_mrope(
     }
 }
 
+__global__ static void k_mrope_and_cache(
+    const float * __restrict__ kb,
+    float * __restrict__ kv_k,
+    float * __restrict__ kv_v,
+    int n_kvh, int hd,
+    int sec0, int sec1, int sec2, int sec3,
+    int n_rot_dims)
+{
+    int hh = blockIdx.x;
+    int d  = threadIdx.x;
+    if (hh >= n_kvh || d >= hd) return;
+
+    (void) sec3;
+
+    const int pos = g_kv_pos;
+    const size_t off = ((size_t)pos * n_kvh + hh) * hd + d;
+    const float * kh = kb + (size_t)hh * hd;
+    const float * vh = kb + (size_t)n_kvh * hd + (size_t)hh * hd;
+
+    kv_v[off] = vh[d];
+
+    const int sec01 = sec0 + sec1;
+    const int sec012 = sec01 + sec2;
+    const int n_rot_pairs = n_rot_dims / 2;
+    const int half = n_rot_pairs;
+
+    if (d < n_rot_pairs) {
+        const int d0 = d;
+        const int d1 = d + half;
+        if (d1 >= hd) return;
+
+        int pos_stream = 0;
+        if (d < sec0) pos_stream = pos;
+        else if (d < sec01) pos_stream = pos;
+        else if (d < sec012) pos_stream = pos;
+
+        const float theta = powf(MONO27B_TARGET_ROPE_THETA, -2.0f * (float)d / (float)n_rot_dims);
+        const float c = cosf(theta * (float)pos_stream);
+        const float s = sinf(theta * (float)pos_stream);
+        const float v0 = kh[d0];
+        const float v1 = kh[d1];
+        kv_k[((size_t)pos * n_kvh + hh) * hd + d0] = v0 * c - v1 * s;
+        kv_k[((size_t)pos * n_kvh + hh) * hd + d1] = v0 * s + v1 * c;
+        return;
+    }
+
+    if (d >= n_rot_dims) {
+        kv_k[off] = kh[d];
+    }
+}
+
 // ─── Q4_K embedding gather (for single token) ────────────────────────────────
 
 __global__ static void k_q4k_embed(const BlockQ4K * T, float * out, int row_elems, int row_blocks) {
@@ -1314,20 +1365,6 @@ __global__ static void k_attn_parallel(
         out_val += sv * V[(size_t)p * pos_stride + (size_t)kvh * hd + t];
     }
     or_[t] = out_val;
-}
-
-// KV cache write kernel (replaces cudaMemcpyAsync for CUDA graph compatibility)
-__global__ static void k_write_kv_cache(
-    const float * __restrict__ kb, float * __restrict__ kv_k, float * __restrict__ kv_v,
-    int n_kvh, int hd)
-{
-    int hh = blockIdx.x;
-    int h  = threadIdx.x;
-    if (hh >= n_kvh || h >= hd) return;
-    int pos = g_kv_pos;
-    size_t off = ((size_t)pos * n_kvh + hh) * hd + h;
-    kv_k[off] = kb[hh * hd + h];
-    kv_v[off] = kb[n_kvh * hd + hh * hd + h];
 }
 
 // ─── SSM conv1d (1 thread per channel) ───────────────────────────────────────
@@ -2193,15 +2230,11 @@ extern "C" bool mono27b_engine_decode_step(
                 qb, MONO27B_TARGET_N_HEAD, MONO27B_TARGET_HEAD_DIM,
                 11, 11, 10, 0,
                 MONO27B_N_ROT_DIMS); TRACE("mq");
-            k_mrope<<<MONO27B_TARGET_N_KV_HEAD, 64>>>(
-                kb, MONO27B_TARGET_N_KV_HEAD, MONO27B_TARGET_HEAD_DIM,
+            k_mrope_and_cache<<<MONO27B_TARGET_N_KV_HEAD, MONO27B_TARGET_HEAD_DIM>>>(
+                kb, st->kv_cache_k[fa_i], st->kv_cache_v[fa_i],
+                MONO27B_TARGET_N_KV_HEAD, MONO27B_TARGET_HEAD_DIM,
                 11, 11, 10, 0,
                 MONO27B_N_ROT_DIMS); TRACE("mk");
-
-            // KV cache write (kernel for CUDA graph compatibility)
-            k_write_kv_cache<<<MONO27B_TARGET_N_KV_HEAD, MONO27B_TARGET_HEAD_DIM>>>(
-                kb, st->kv_cache_k[fa_i], st->kv_cache_v[fa_i],
-                MONO27B_TARGET_N_KV_HEAD, MONO27B_TARGET_HEAD_DIM);
             TRACE("kvc");
 
             // Attention: parallel cooperative kernel
