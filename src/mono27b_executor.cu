@@ -78,23 +78,32 @@ __device__ int g_tok_id = 0;  // token ID for embedding (graph-replay safe)
 
 // Quantize F32 vector to Q8_1 blocks in a global buffer
 // Matches ggml's quantize_q8_1 kernel exactly (roundf, no clamp, sequential per-thread)
-__global__ static void k_quant_q8_1(const float * x, BlockQ8_1 * y, int n) {
-    int b = blockIdx.x * blockDim.x + threadIdx.x;
-    int nb = n / 32;
-    if (b >= nb) return;
-    float amax = 0.0f;
-    for (int j = 0; j < 32; j++) {
-        float v = x[(size_t)b * 32 + j];
-        amax = fmaxf(amax, fabsf(v));
+// Parallel Q8_1 quantize matching llama.cpp's execution model: one warp per
+// 32-element Q8_1 block, with warp-level max+sum reductions.
+// Important: ds stores (d, sum_of_original_floats), not (d, d*sum_q).
+__launch_bounds__(32, 1)
+__global__ static void k_quant_q8_1(const float * __restrict__ x, BlockQ8_1 * __restrict__ y, int n) {
+    const int i0 = blockDim.x * blockIdx.x + threadIdx.x;
+    if (i0 >= n) return;
+
+    const int ib  = i0 >> 5;
+    const int iqs = i0 & 31;
+
+    const float xi = x[i0];
+    float amax = fabsf(xi);
+    float sum  = xi;
+
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+        sum  += __shfl_xor_sync(0xffffffff, sum, o);
     }
-    float d = amax / 127.0f;
-    float sum_ = 0.0f;
-    for (int j = 0; j < 32; j++) {
-        int qi = (amax == 0.0f) ? 0 : (int)(roundf(x[(size_t)b * 32 + j] / d));
-        y[b].qs[j] = (int8_t)qi;
-        sum_ += (float)qi;
+
+    const float d = amax / 127.0f;
+    y[ib].qs[iqs] = (amax == 0.0f) ? 0 : (int8_t)roundf(xi / d);
+    if (iqs == 0) {
+        y[ib].ds = make_half2(d, sum);
     }
-    y[b].ds = make_half2(d, d * sum_);
 }
 
 // ─── dp4a helper (from ggml common.cuh) ─────────────────────────────────────
@@ -1772,8 +1781,7 @@ static inline int l_n_q8_for(uint32_t t, int rb) {
 static int l_quant_q8_n(const float * x, int n_q8) {
     if (g_q8_scratch && n_q8 <= g_kernel_cfg.q8_scratch_max_blocks) {
         if (g_q8_cached_input == x && g_q8_cached_rb == n_q8) return n_q8;
-        k_quant_q8_1<<<(n_q8 + g_kernel_cfg.quant_threads - 1) / g_kernel_cfg.quant_threads,
-                      g_kernel_cfg.quant_threads>>>(x, g_q8_scratch, n_q8 * 32);
+        k_quant_q8_1<<<n_q8, 32>>>(x, g_q8_scratch, n_q8 * 32);
         g_q8_cached_input = x;
         g_q8_cached_rb = n_q8;
     }
@@ -2265,8 +2273,7 @@ extern "C" bool mono27b_engine_decode_step(
         auto * base = (const BlockQ6K *)we->lm_head.ptr;
         int n_q8 = rb * 8;
         if (g_q8_scratch && n_q8 <= g_kernel_cfg.q8_scratch_max_blocks) {
-            k_quant_q8_1<<<(n_q8 + g_kernel_cfg.quant_threads - 1) / g_kernel_cfg.quant_threads,
-                          g_kernel_cfg.quant_threads>>>(h2, g_q8_scratch, MONO27B_TARGET_HIDDEN);
+            k_quant_q8_1<<<n_q8, 32>>>(h2, g_q8_scratch, MONO27B_TARGET_HIDDEN);
             k_q6k_mv_q8_dp4a<<<total, dim3(32, 4)>>>(base, g_q8_scratch, out->logits, rb, total);
         } else {
             int chunk = g_kernel_cfg.lm_head_chunk_rows;
