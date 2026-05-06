@@ -106,6 +106,37 @@ __global__ static void k_quant_q8_1(const float * __restrict__ x, BlockQ8_1 * __
     }
 }
 
+__launch_bounds__(32, 1)
+__global__ static void k_quant_q8_1_fused_gate(
+    const float * __restrict__ x,
+    const float * __restrict__ gate,
+    BlockQ8_1 * __restrict__ y,
+    int n)
+{
+    const int i0 = blockDim.x * blockIdx.x + threadIdx.x;
+    if (i0 >= n) return;
+
+    const int ib  = i0 >> 5;
+    const int iqs = i0 & 31;
+
+    const float sig = 1.0f / (1.0f + __expf(-gate[i0]));
+    const float xi = x[i0] * sig;
+    float amax = fabsf(xi);
+    float sum  = xi;
+
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+        sum  += __shfl_xor_sync(0xffffffff, sum, o);
+    }
+
+    const float d = amax / 127.0f;
+    y[ib].qs[iqs] = (amax == 0.0f) ? 0 : (int8_t)roundf(xi / d);
+    if (iqs == 0) {
+        y[ib].ds = make_half2(d, sum);
+    }
+}
+
 // ─── dp4a helper (from ggml common.cuh) ─────────────────────────────────────
 
 static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, int c) {
@@ -287,7 +318,12 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
 // Grid: rc blocks (one per output row)
 // Block: (32, 4) = 128 threads total (4 warps)
 __launch_bounds__(128, 1)
-__global__ static void k_q4k_mv_q8_dp4a(const BlockQ4K * __restrict__ W, const BlockQ8_1 * __restrict__ q8, float * __restrict__ y, int rb, int rc) {
+__global__ static void k_q4k_mv_q8_dp4a(
+    const BlockQ4K * __restrict__ W,
+    const BlockQ8_1 * __restrict__ q8,
+    float * __restrict__ y,
+    const float * __restrict__ residual,
+    int rb, int rc) {
     constexpr int VDR = 2;       // Vector Dot Ratio
     constexpr int QI = 32;       // Q4_K quant dimension
     constexpr int NWARPS = 4;    // Warps per block
@@ -323,7 +359,7 @@ __global__ static void k_q4k_mv_q8_dp4a(const BlockQ4K * __restrict__ W, const B
         sum = smem[threadIdx.x];
         #pragma unroll
         for (int offset = NWARPS / 2; offset > 0; offset >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, offset);
-        if (threadIdx.x == 0) y[row] = sum;
+        if (threadIdx.x == 0) y[row] = sum + (residual ? residual[row] : 0.0f);
     }
 }
 
@@ -730,25 +766,76 @@ __global__ static void k_rms_norm_mulw_mul_batched(
 // ─── Elementwise kernels ─────────────────────────────────────────────────────
 
 __global__ static void k_elem_add(float * a, const float * b, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) a[i] += b[i];
+    int limit = n / 4;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < limit; i += gridDim.x * blockDim.x) {
+        float4 * va_ptr = reinterpret_cast<float4 *>(&a[i * 4]);
+        const float4 * vb_ptr = reinterpret_cast<const float4 *>(&b[i * 4]);
+        float4 va = *va_ptr;
+        const float4 vb = *vb_ptr;
+        va.x += vb.x; va.y += vb.y; va.z += vb.z; va.w += vb.w;
+        *va_ptr = va;
+    }
+    for (int i = limit * 4 + blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        a[i] += b[i];
+    }
 }
 
 // Fused copy + residual: out[i] = src[i] + res[i]
 __global__ static void k_elem_copy_add(const float * src, const float * res, float * out, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+    int limit = n / 4;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < limit; i += gridDim.x * blockDim.x) {
+        const float4 * vsrc = reinterpret_cast<const float4 *>(&src[i * 4]);
+        const float4 * vres = reinterpret_cast<const float4 *>(&res[i * 4]);
+        float4 * vout = reinterpret_cast<float4 *>(&out[i * 4]);
+        float4 s = *vsrc;
+        const float4 r = *vres;
+        s.x += r.x; s.y += r.y; s.z += r.z; s.w += r.w;
+        *vout = s;
+    }
+    for (int i = limit * 4 + blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
         out[i] = src[i] + res[i];
+    }
 }
 
 __global__ static void k_elem_mul(float * a, const float * b, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) a[i] *= b[i];
+    int limit = n / 4;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < limit; i += gridDim.x * blockDim.x) {
+        float4 * va_ptr = reinterpret_cast<float4 *>(&a[i * 4]);
+        const float4 * vb_ptr = reinterpret_cast<const float4 *>(&b[i * 4]);
+        float4 va = *va_ptr;
+        const float4 vb = *vb_ptr;
+        va.x *= vb.x; va.y *= vb.y; va.z *= vb.z; va.w *= vb.w;
+        *va_ptr = va;
+    }
+    for (int i = limit * 4 + blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        a[i] *= b[i];
+    }
 }
 
 __global__ static void k_elem_copy(float * d, const float * s, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) d[i] = s[i];
+    int limit = n / 4;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < limit; i += gridDim.x * blockDim.x) {
+        float4 * vd_ptr = reinterpret_cast<float4 *>(&d[i * 4]);
+        const float4 * vs_ptr = reinterpret_cast<const float4 *>(&s[i * 4]);
+        *vd_ptr = *vs_ptr;
+    }
+    for (int i = limit * 4 + blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        d[i] = s[i];
+    }
 }
 
 __global__ static void k_elem_silu(float * x, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+    int limit = n / 4;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < limit; i += gridDim.x * blockDim.x) {
+        float4 * vx_ptr = reinterpret_cast<float4 *>(&x[i * 4]);
+        float4 v = *vx_ptr;
+        v.x = v.x / (1.0f + expf(-v.x));
+        v.y = v.y / (1.0f + expf(-v.y));
+        v.z = v.z / (1.0f + expf(-v.z));
+        v.w = v.w / (1.0f + expf(-v.w));
+        *vx_ptr = v;
+    }
+    for (int i = limit * 4 + blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
         float v = x[i];
         x[i] = v / (1.0f + expf(-v));
     }
@@ -1780,7 +1867,8 @@ static void l_mv_quant(void * W, uint32_t ggml_type, int rb, int rc, const float
 
 // Matvec using ALREADY QUANTIZED Q8_1 data in g_q8_scratch
 // stream = 0 for default stream, or a custom CUDA stream for concurrency
-static void l_mv_q8_on(void * W, uint32_t ggml_type, int rb, int rc, float * y, cudaStream_t stream) {
+static void l_mv_q8_on(void * W, uint32_t ggml_type, int rb, int rc, float * y,
+                       const float * residual, cudaStream_t stream) {
     if (rc == 0 || !W) return;
     if (!g_q8_scratch) return;
     int n_q8 = l_n_q8_for(ggml_type, rb);
@@ -1789,26 +1877,29 @@ static void l_mv_q8_on(void * W, uint32_t ggml_type, int rb, int rc, float * y, 
         case MONO27B_GGML_TYPE_Q4_K:
             k_q4k_mv_q8_dp4a<<<rc, dim3(32, g_kernel_cfg.q4k_q8_warp_count),
                 32 * (size_t)g_kernel_cfg.q4k_q8_smem_per_warp * sizeof(float), stream>>>(
-                (const BlockQ4K *)W, g_q8_scratch, y, rb, rc);
+                (const BlockQ4K *)W, g_q8_scratch, y, residual, rb, rc);
             return;
         case MONO27B_GGML_TYPE_Q5_K:
             k_q5k_mv_q8<<<rc, dim3(32, 4), 0, stream>>>((const BlockQ5K *)W, g_q8_scratch, y, rb, rc);
-            return;
+            break;
         case MONO27B_GGML_TYPE_Q6_K:
             k_q6k_mv_q8_dp4a<<<rc, 128, 0, stream>>>((const BlockQ6K *)W, g_q8_scratch, y, rb, rc);
-            return;
+            break;
         case MONO27B_GGML_TYPE_Q8_0:
             k_q80_mv_q8_dp4a<<<rc, dim3(32, 4), 0, stream>>>((const BlockQ8 *)W, g_q8_scratch, y, rb, rc);
-            return;
+            break;
         case 23:
             k_iq4xs_mv_q8_dp4a<<<rc, g_kernel_cfg.q4k_q8_threads, 0, stream>>>((const BlockIQ4XS *)W, g_q8_scratch, y, rb, rc);
-            return;
+            break;
         default: break;
+    }
+    if (residual) {
+        k_elem_add<<<(rc + 255) / 256, 256, 0, stream>>>(y, residual, rc);
     }
 }
 
 static void l_mv_q8(void * W, uint32_t ggml_type, int rb, int rc, float * y) {
-    l_mv_q8_on(W, ggml_type, rb, rc, y, 0);
+    l_mv_q8_on(W, ggml_type, rb, rc, y, nullptr, 0);
 }
 
 // Launch two matvecs concurrently on the same Q8_1 input.
@@ -1824,8 +1915,8 @@ static void l_mv_pair(void * w1, uint32_t t1, int rb1, int rc1, float * y1,
     int n_q8 = std::max(n_q8_1, n_q8_2);  // both pair members must operate on the same input
     if (g_q8_scratch && n_q8 <= g_kernel_cfg.q8_scratch_max_blocks && n_q8_1 == n_q8_2) {
         l_quant_q8_n(x, n_q8);
-        l_mv_q8_on(w1, t1, rb1, rc1, y1, 0);
-        l_mv_q8_on(w2, t2, rb2, rc2, y2, 0);
+        l_mv_q8_on(w1, t1, rb1, rc1, y1, nullptr, 0);
+        l_mv_q8_on(w2, t2, rb2, rc2, y2, nullptr, 0);
         return;
     }
     // Fallback: sequential on stream 0
@@ -2123,11 +2214,28 @@ extern "C" bool mono27b_engine_decode_step(
                     MONO27B_TARGET_HEAD_DIM, max_ctx, 1.0f / sqrtf(MONO27B_TARGET_HEAD_DIM));
             }
             // Gate: sigmoid(gate_q) * attn_output
-            k_elem_sigmoid_mul<<<(MONO27B_TARGET_Q_DIM + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(
-                qb, qb + MONO27B_TARGET_Q_DIM, qb, MONO27B_TARGET_Q_DIM); TRACE("gt");
-
-            MV(L.wo, qb, h2); TRACE("wo");
-            k_elem_add<<<(MONO27B_TARGET_HIDDEN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(h2, h, MONO27B_TARGET_HIDDEN); TRACE("res1");
+            int n_q8_wo = l_n_q8_for(L.wo.ggml_type, (int)L.wo.row_blocks);
+            bool fused_gate_wo = g_q8_scratch && n_q8_wo <= g_kernel_cfg.q8_scratch_max_blocks &&
+                (L.wo.ggml_type == MONO27B_GGML_TYPE_Q4_K ||
+                 L.wo.ggml_type == MONO27B_GGML_TYPE_Q5_K ||
+                 L.wo.ggml_type == MONO27B_GGML_TYPE_Q6_K ||
+                 L.wo.ggml_type == MONO27B_GGML_TYPE_Q8_0 ||
+                 L.wo.ggml_type == 23);
+            if (fused_gate_wo) {
+                k_quant_q8_1_fused_gate<<<n_q8_wo, 32>>>(
+                    qb, qb + MONO27B_TARGET_Q_DIM, g_q8_scratch, MONO27B_TARGET_Q_DIM);
+                g_q8_cached_input = nullptr;
+                g_q8_cached_rb = 0;
+                l_mv_q8_on(L.wo.ptr, L.wo.ggml_type, L.wo.row_blocks, L.wo.row_count, h2, h, 0);
+                TRACE("gt");
+                TRACE("wo");
+                TRACE("res1");
+            } else {
+                k_elem_sigmoid_mul<<<(MONO27B_TARGET_Q_DIM + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(
+                    qb, qb + MONO27B_TARGET_Q_DIM, qb, MONO27B_TARGET_Q_DIM); TRACE("gt");
+                MV(L.wo, qb, h2); TRACE("wo");
+                k_elem_add<<<(MONO27B_TARGET_HIDDEN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(h2, h, MONO27B_TARGET_HIDDEN); TRACE("res1");
+            }
 
             l_rms(h, h2, WV(L.post_norm), MONO27B_TARGET_HIDDEN); TRACE("porm");
             l_ffn_gate_up_swiglu(L.ffn_gate, L.ffn_up, h, fb, kb); TRACE("fg+fu+swi");
