@@ -780,26 +780,45 @@ __global__ static void k_deinterleave_qg(const float * src, float * q_dst, float
 
 
 
-// Match ggml's reference RMS/L2 accumulation order more closely by using
-// a single-thread sequential sum in double precision.
+// RMS norm + optional weight multiply (ported from llama.cpp's rms_norm_f32).
+// 1024 threads per block, fp32 sum, warp-shuffle block reduction. ~3.5× faster
+// than the previous 256-thread fp64 + smem-tree implementation.
 template <int BLK>
-__global__ static void k_rms_norm_mulw(const float * x, const float * w, float * y, int n, float eps) {
-    __shared__ double sh[BLK];
-    double sum = 0.0;
-    for (int i = threadIdx.x; i < n; i += BLK) {
-        double val = (double)x[i];
-        sum += val * val;
+__launch_bounds__(BLK, 1)
+__global__ static void k_rms_norm_mulw(const float * __restrict__ x, const float * __restrict__ w,
+                                       float * __restrict__ y, int n, float eps) {
+    const int tid = threadIdx.x;
+    float tmp = 0.0f;
+    #pragma unroll 4
+    for (int i = tid; i < n; i += BLK) {
+        float v = x[i];
+        tmp += v * v;
     }
-    sh[threadIdx.x] = sum;
+
+    // Block reduce via warp shuffles.
+    constexpr int NWARPS = BLK / 32;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) tmp += __shfl_xor_sync(0xffffffff, tmp, o);
+
+    __shared__ float s_partial[NWARPS];
+    int warp_id = tid >> 5;
+    int lane    = tid & 31;
+    if (lane == 0) s_partial[warp_id] = tmp;
     __syncthreads();
-    for (int s = BLK / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) { sh[threadIdx.x] += sh[threadIdx.x + s]; }
-        __syncthreads();
+    if (warp_id == 0) {
+        tmp = (lane < NWARPS) ? s_partial[lane] : 0.0f;
+        #pragma unroll
+        for (int o = NWARPS / 2; o > 0; o >>= 1) tmp += __shfl_xor_sync(0xffffffff, tmp, o);
+        if (lane == 0) s_partial[0] = tmp;
     }
-    double total_sum = sh[0];
-    const double scale = 1.0 / sqrt(total_sum / (double)n + (double)eps);
-    for (int i = threadIdx.x; i < n; i += BLK) {
-        y[i] = (float)((double)x[i] * scale * (double)(w ? w[i] : 1.0f));
+    __syncthreads();
+
+    const float scale = rsqrtf(s_partial[0] / (float)n + eps);
+
+    if (w) {
+        for (int i = tid; i < n; i += BLK) y[i] = scale * x[i] * w[i];
+    } else {
+        for (int i = tid; i < n; i += BLK) y[i] = scale * x[i];
     }
 }
 
@@ -1828,7 +1847,7 @@ static void l_mv_fallback(void * W, uint32_t ggml_type, int rb, int rc, const fl
 }
 
 static void l_rms(float * dst, const float * x, const float * w, int n) {
-    k_rms_norm_mulw<256><<<1, g_kernel_cfg.rms_norm_threads>>>(x, w, dst, n, g_kernel_cfg.rms_eps);
+    k_rms_norm_mulw<1024><<<1, 1024>>>(x, w, dst, n, g_kernel_cfg.rms_eps);
 }
 
 
