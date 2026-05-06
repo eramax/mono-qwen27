@@ -104,6 +104,10 @@ struct Mono27BExecutorState {
     size_t work_buf_size;
     void * q8_scratch;  // Q8_1 buffer for matvec (544 blocks × 36 bytes)
     int * argmax_result;  // GPU-side argmax output (single int)
+    // CUDA graph capture for decode_step
+    void * cuda_graph;       // cudaGraph_t
+    void * cuda_graph_exec;  // cudaGraphExec_t
+    int graph_captured;
     int max_ctx;
     int kv_len;
     // Concurrent streams for paired matvec execution

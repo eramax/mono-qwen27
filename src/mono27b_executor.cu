@@ -69,6 +69,11 @@ struct BlockQ8_1 {
     int8_t qs[32];
 };
 
+// Device-side position variables for CUDA graph replay.
+// Updated via cudaMemcpyToSymbol before each graph replay.
+__device__ int g_mrope_pos = 0;
+__device__ int g_kv_pos = 0;
+
 // Quantize F32 vector to Q8_1 blocks in a global buffer
 // Matches ggml's quantize_q8_1 kernel exactly (roundf, no clamp, sequential per-thread)
 __global__ static void k_quant_q8_1(const float * x, BlockQ8_1 * y, int n) {
@@ -925,7 +930,6 @@ __global__ static void k_l2_norm_g(float * d, int gs, int ng) {
 
 __global__ static void k_mrope(
     float * buf, int n_heads, int head_dim,
-    int pos_t, int pos_h, int pos_w, int pos_x,
     int sec0, int sec1, int sec2, int sec3,
     int n_rot_dims)
 {
@@ -937,19 +941,20 @@ __global__ static void k_mrope(
     const int sec012 = sec01 + sec2;
     const int n_rot_pairs = n_rot_dims / 2;
     const int half = n_rot_pairs;
+    int pos = g_mrope_pos;  // read from device memory for graph replay
 
     for (int p = threadIdx.x; p < n_rot_pairs; p += blockDim.x) {
         int d0 = p;
         int d1 = p + half;
         if (d1 >= head_dim) break;
 
-        int pos = pos_x;
-        if (p < sec0) pos = pos_t;
-        else if (p < sec01) pos = pos_h;
-        else if (p < sec012) pos = pos_w;
+        int pos_stream = 0;
+        if (p < sec0) pos_stream = pos;
+        else if (p < sec01) pos_stream = pos;
+        else if (p < sec012) pos_stream = pos;
 
         float theta = powf(MONO27B_TARGET_ROPE_THETA, -2.0f * (float)p / (float)n_rot_dims);
-        float c = cosf(theta * (float)pos), s = sinf(theta * (float)pos);
+        float c = cosf(theta * (float)pos_stream), s = sinf(theta * (float)pos_stream);
         float v0 = hd[d0], v1 = hd[d1];
         hd[d0] = v0 * c - v1 * s;
         hd[d1] = v0 * s + v1 * c;
@@ -1032,7 +1037,7 @@ static bool q4k_embed_host(const BlockQ4K * rows_dev, int tok, float * hidden,
 __global__ static void k_attn_parallel(
     const float * __restrict__ Q, const float * __restrict__ K,
     const float * __restrict__ V, float * __restrict__ O,
-    int kv_len, int n_h, int n_kvh, int hd, int max_ctx, float scale) {
+    int n_h, int n_kvh, int hd, int max_ctx, float scale) {
 
     int qh = blockIdx.x;
     if (qh >= n_h) return;
@@ -1041,10 +1046,11 @@ __global__ static void k_attn_parallel(
     float * or_ = O + (size_t)qh * hd;
     size_t pos_stride = (size_t)n_kvh * hd;
     int t = threadIdx.x;
-    // Shared memory: scores[kv_len] + max_val[1] + sum_exp[1] + scratch[256]
+    int kv_len = g_kv_pos + 1;  // dynamic per-step
+    // Shared memory: scores[max_ctx] + max_val[1] + sum_exp[1] + scratch[256]
     extern __shared__ float smem[];
     float * scores  = smem;
-    float * s_max   = smem + kv_len;
+    float * s_max   = smem + max_ctx;
     float * s_sum   = s_max + 1;
     float * scratch = s_sum + 1;
 
@@ -1105,6 +1111,20 @@ __global__ static void k_attn_parallel(
         out_val += sv * V[(size_t)p * pos_stride + (size_t)kvh * hd + t];
     }
     or_[t] = out_val;
+}
+
+// KV cache write kernel (replaces cudaMemcpyAsync for CUDA graph compatibility)
+__global__ static void k_write_kv_cache(
+    const float * __restrict__ kb, float * __restrict__ kv_k, float * __restrict__ kv_v,
+    int n_kvh, int hd)
+{
+    int hh = blockIdx.x;
+    int h  = threadIdx.x;
+    if (hh >= n_kvh || h >= hd) return;
+    int pos = g_kv_pos;
+    size_t off = ((size_t)pos * n_kvh + hh) * hd + h;
+    kv_k[off] = kb[hh * hd + h];
+    kv_v[off] = kb[n_kvh * hd + hh * hd + h];
 }
 
 // ─── SSM conv1d (1 thread per channel) ───────────────────────────────────────
@@ -1548,6 +1568,11 @@ extern "C" bool mono27b_engine_init_state(int max_ctx, Mono27BExecutorState * st
     state->argmax_result = nullptr;
     cudaMalloc(&state->argmax_result, sizeof(int));
 
+    // CUDA graph capture
+    state->cuda_graph = nullptr;
+    state->cuda_graph_exec = nullptr;
+    state->graph_captured = 0;
+
     return true;
 fail:
     if (error[0] == '\0')
@@ -1567,6 +1592,8 @@ extern "C" void mono27b_engine_free_state(Mono27BExecutorState * state) {
     cudaFree(state->work_buf);
     if (state->q8_scratch) cudaFree(state->q8_scratch);
     if (state->argmax_result) { cudaFree(state->argmax_result); state->argmax_result = nullptr; }
+    if (state->cuda_graph_exec) { cudaGraphExecDestroy((cudaGraphExec_t)state->cuda_graph_exec); state->cuda_graph_exec = nullptr; }
+    if (state->cuda_graph) { cudaGraphDestroy((cudaGraph_t)state->cuda_graph); state->cuda_graph = nullptr; }
     if (state->stream1) { cudaStreamDestroy((cudaStream_t)state->stream1); state->stream1 = nullptr; }
     if (state->sync_event) { cudaEventDestroy((cudaEvent_t)state->sync_event); state->sync_event = nullptr; }
     std::memset(state, 0, sizeof(*state));
@@ -1588,6 +1615,9 @@ static void l_q6k(const BlockQ6K * W, int rb, int rc, const float * x, float * y
 
 // File-scope pointer to Q8_1 scratch buffer (set by engine before decode step)
 static BlockQ8_1 * g_q8_scratch = nullptr;
+// Cache tracking: skip re-quantize when same input is used by multiple matvecs
+static const float * g_q8_cached_input = nullptr;
+static int g_q8_cached_rb = 0;
 
 // Device-side parameters for CUDA graph replay. Updated via cudaMemcpyToSymbol
 // before each decode_step. Kernels read these to override scalar parameters.
@@ -1599,7 +1629,13 @@ static void l_mv_fallback(void * W, uint32_t ggml_type, int rb, int rc, const fl
 static int l_quant_q8(const float * x, int rb) {
     int n_q8 = rb * 8;
     if (g_q8_scratch && n_q8 <= 544) {
+        // Skip if this exact input+rb was already quantized (common within a layer)
+        if (g_q8_cached_input == x && g_q8_cached_rb == rb) {
+            return n_q8;
+        }
         k_quant_q8_1<<<(n_q8 + 127) / 128, 128>>>(x, g_q8_scratch, n_q8 * 32);
+        g_q8_cached_input = x;
+        g_q8_cached_rb = rb;
     }
     return n_q8;
 }
@@ -1655,15 +1691,14 @@ static void l_mv_pair(void * w1, uint32_t t1, int rb1, int rc1, float * y1,
                       const float * x, int rb, cudaStream_t stream1, cudaEvent_t sync_ev) {
     if (rc1 == 0 || !w1) { l_mv_quant(w2, t2, rb2, rc2, x, y2); return; }
     if (rc2 == 0 || !w2) { l_mv_quant(w1, t1, rb1, rc1, x, y1); return; }
-    // Both need Q8_1 path — quantize once, then run both matvecs on same stream.
-    // No cudaStreamSynchronize needed since both are on stream 0.
+    // Both need Q8_1 path — quantize once, then run both on stream 0
     if (g_q8_scratch && rb * 8 <= 544) {
         l_quant_q8(x, rb);
         l_mv_q8_on(w1, t1, rb1, rc1, y1, 0);
         l_mv_q8_on(w2, t2, rb2, rc2, y2, 0);
         return;
     }
-    // Fallback: sequential
+    // Fallback: sequential on stream 0
     l_mv_quant(w1, t1, rb1, rc1, x, y1);
     l_mv_quant(w2, t2, rb2, rc2, x, y2);
 }
@@ -1774,6 +1809,8 @@ extern "C" bool mono27b_engine_decode_step(
 {
     // Set Q8_1 scratch pointer for matvec quantization
     g_q8_scratch = (BlockQ8_1 *)st->q8_scratch;
+    g_q8_cached_input = nullptr;  // invalidate cache at start of each step
+    g_q8_cached_rb = 0;
     size_t sh = MONO27B_TARGET_HIDDEN * sizeof(float);
     size_t sq = MONO27B_TARGET_Q_DIM * sizeof(float);
     size_t sv = MONO27B_TARGET_KV_DIM * sizeof(float);
@@ -1812,6 +1849,20 @@ extern "C" bool mono27b_engine_decode_step(
 
     int fa_i = 0, ssm_i = 0, il = 0; cudaError_t sync_err = cudaSuccess;
     const bool dump_step = debug_fp && (debug_pos == -1 || pos == debug_pos);
+
+    // CUDA graph: update device pos variables before replay/capture
+    cudaMemcpyToSymbol(g_mrope_pos, &pos, sizeof(int));
+    cudaMemcpyToSymbol(g_kv_pos, &pos, sizeof(int));
+
+    // If graph already captured and no debug, just replay
+    if (st->graph_captured && !debug_fp) {
+        cudaGraphLaunch((cudaGraphExec_t)st->cuda_graph_exec, 0);
+        st->kv_len = pos + 1;
+        return error[0] == '\0';
+    }
+
+    bool do_capture = !st->graph_captured && !debug_fp && !dump_step;
+    if (do_capture) cudaStreamBeginCapture(0, cudaStreamCaptureModeGlobal);
 
     mono27b_engine_embed(we, tok, h, error, error_cap);
     if (dump_step) {
@@ -1875,12 +1926,10 @@ extern "C" bool mono27b_engine_decode_step(
             // three position streams and 0 for the 4th stream.
             k_mrope<<<MONO27B_TARGET_N_HEAD, 64>>>(
                 qb, MONO27B_TARGET_N_HEAD, MONO27B_TARGET_HEAD_DIM,
-                pos, pos, pos, 0,
                 11, 11, 10, 0,
                 MONO27B_N_ROT_DIMS); TRACE("mq");
             k_mrope<<<MONO27B_TARGET_N_KV_HEAD, 64>>>(
                 kb, MONO27B_TARGET_N_KV_HEAD, MONO27B_TARGET_HEAD_DIM,
-                pos, pos, pos, 0,
                 11, 11, 10, 0,
                 MONO27B_N_ROT_DIMS); TRACE("mk");
             if (dump_step && il < 4) {
@@ -1888,25 +1937,19 @@ extern "C" bool mono27b_engine_decode_step(
                 debug_dump_vec(debug_fp, "attn", il, pos, tok, "k_rope", kb, MONO27B_TARGET_KV_DIM, 64);
             }
 
-            for (int hh = 0; hh < MONO27B_TARGET_N_KV_HEAD; ++hh) {
-                size_t off = ((size_t)pos * MONO27B_TARGET_N_KV_HEAD + hh) * MONO27B_TARGET_HEAD_DIM;
-                cudaMemcpyAsync(st->kv_cache_k[fa_i] + off, kb + hh * MONO27B_TARGET_HEAD_DIM,
-                    MONO27B_TARGET_HEAD_DIM * sizeof(float), cudaMemcpyDeviceToDevice);
-                cudaMemcpyAsync(st->kv_cache_v[fa_i] + off,
-                    kb + MONO27B_TARGET_KV_DIM + hh * MONO27B_TARGET_HEAD_DIM,
-                    MONO27B_TARGET_HEAD_DIM * sizeof(float), cudaMemcpyDeviceToDevice);
-            }
+            // KV cache write (kernel for CUDA graph compatibility)
+            k_write_kv_cache<<<MONO27B_TARGET_N_KV_HEAD, MONO27B_TARGET_HEAD_DIM>>>(
+                kb, st->kv_cache_k[fa_i], st->kv_cache_v[fa_i],
+                MONO27B_TARGET_N_KV_HEAD, MONO27B_TARGET_HEAD_DIM);
             TRACE("kvc");
 
             // Attention: parallel cooperative kernel
             {
-                int kvl = pos + 1;
-                // Use max_ctx shared memory always for graph capture compatibility
-                int smem_kvl = max_ctx > 0 ? max_ctx : kvl;
+                int smem_kvl = max_ctx > 0 ? max_ctx : 8192;
                 size_t smem_sz = ((size_t)smem_kvl + 2 + MONO27B_TARGET_HEAD_DIM) * sizeof(float);
                 k_attn_parallel<<<MONO27B_TARGET_N_HEAD, MONO27B_TARGET_HEAD_DIM, smem_sz>>>(
                     qb, st->kv_cache_k[fa_i], st->kv_cache_v[fa_i], qb,
-                    kvl, MONO27B_TARGET_N_HEAD, MONO27B_TARGET_N_KV_HEAD,
+                    MONO27B_TARGET_N_HEAD, MONO27B_TARGET_N_KV_HEAD,
                     MONO27B_TARGET_HEAD_DIM, max_ctx, 1.0f / sqrtf(MONO27B_TARGET_HEAD_DIM));
             }
             if (dump_step && il < 4) {
@@ -2183,7 +2226,30 @@ extern "C" bool mono27b_engine_decode_step(
 
     st->kv_len = pos + 1;
 
+    // End CUDA graph capture on first successful call
+    if (do_capture) {
+        cudaGraph_t graph;
+        cudaError_t cap_err = cudaStreamEndCapture(0, &graph);
+        if (cap_err == cudaSuccess && graph != nullptr) {
+            cudaGraphExec_t graphExec;
+            if (cudaGraphInstantiate(&graphExec, graph, NULL, NULL, 0) == cudaSuccess) {
+                st->cuda_graph = graph;
+                st->cuda_graph_exec = graphExec;
+                st->graph_captured = 1;
+            } else {
+                cudaGraphDestroy(graph);
+            }
+        }
+        do_capture = false;
+    }
+
 cleanup:
+    // Ensure graph capture is ended even on error path
+    if (do_capture) {
+        cudaGraph_t graph;
+        cudaStreamEndCapture(0, &graph);
+        do_capture = false;
+    }
     return error[0] == '\0';
 }
 
@@ -2222,18 +2288,8 @@ extern "C" bool mono27b_engine_embed(
             hidden,
             MONO27B_TARGET_HIDDEN,
             (int)we->tok_embd.row_blocks);
-        cudaError_t e = cudaDeviceSynchronize();
-        if (e == cudaSuccess) {
-            return true;
-        }
-        // Keep the old host-side path as a fallback so tokenization still works
-        // if the device launch fails on a particular runtime.
-        if (q4k_embed_host((const BlockQ4K *)we->tok_embd.ptr, token_id, hidden,
-                           MONO27B_TARGET_HIDDEN, (int)we->tok_embd.row_blocks)) {
-            return true;
-        }
-        std::snprintf(error, error_cap, "q4k embed failed: %s", cudaGetErrorString(e));
-        return false;
+        // No cudaDeviceSynchronize — kernel is on stream 0, ordered with rest of graph
+        return true;
     }
     std::snprintf(error, error_cap, "unsupported token embedding type %u", we->tok_embd.ggml_type);
     return false;
