@@ -14,6 +14,7 @@ void mono27b_print_usage(const char * prog) {
         "  --gen N            tokens to generate (default: 512)\n"
         "  --seed N           rng seed (default: 944990222)\n"
         "  --chat             apply chat template\n"
+        "  --trace-gen        print per-token generation timing to stderr\n"
         "  --quiet            suppress stats output\n"
         "  -v, --verbose      verbose logging\n"
         "  -h, --help         show this help\n",
@@ -33,6 +34,7 @@ bool mono27b_parse_args(int argc, char **argv, Mono27BChatArgs &out) {
         if (arg == "--gen" && i + 1 < argc) { out.max_gen = std::atoi(argv[++i]); continue; }
         if (arg == "--seed" && i + 1 < argc) { out.seed = std::strtoul(argv[++i], nullptr, 10); continue; }
         if (arg == "--chat") { out.chat = true; continue; }
+        if (arg == "--trace-gen") { out.trace_gen = true; continue; }
         if (arg == "--quiet") { out.quiet = true; continue; }
         if (match(arg, "-v", "--verbose")) { out.verbose = true; continue; }
         std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());

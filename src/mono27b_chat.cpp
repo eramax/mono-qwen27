@@ -411,12 +411,19 @@ int main(int argc, char **argv) {
         }
         t2 = clock::now();
         for (int step = 0; step < std::max(1, args.max_gen); step++) {
+            auto step_start = clock::now();
+            double decode_ms = 0.0;
+            int cur_pos = pos - 1;
             std::vector<float> cur;
             auto *lp = &last_logits;
             if (step > 0 || last_logits.empty()) {
+                auto decode_start = clock::now();
                 cur = decode(generated.empty() ? prompt_ids.back() : generated.back(), pos++);
+                auto decode_end = clock::now();
+                decode_ms = std::chrono::duration<double, std::milli>(decode_end - decode_start).count();
                 if (cur.empty()) { ok = false; break; }
                 lp = &cur;
+                cur_pos = pos - 1;
             }
 
             int chosen = sample(*lp, gguf, rng, cfg.sampling);
@@ -427,6 +434,14 @@ int main(int argc, char **argv) {
                 std::string piece = tokenizer.decode({chosen});
                 fwrite(piece.data(), 1, piece.size(), stdout);
                 fflush(stdout);
+            }
+            auto step_end = clock::now();
+            if (args.trace_gen) {
+                double step_ms = std::chrono::duration<double, std::milli>(step_end - step_start).count();
+                double tok_s = step_ms > 0.0 ? 1000.0 / step_ms : 0.0;
+                fprintf(stderr,
+                        "[gen %d] pos=%d token=%d decode_ms=%.3f step_ms=%.3f tok/s=%.2f\n",
+                        step, cur_pos, chosen, decode_ms, step_ms, tok_s);
             }
 
             if (tokenizer.is_terminal(chosen)) break;
