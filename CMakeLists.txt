@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.18)
 project(mono27b LANGUAGES CXX CUDA)
 
+option(MONO27B_TIMING "Enable per-step CUDA timing instrumentation" OFF)
+
 find_package(CUDAToolkit REQUIRED)
 
 add_executable(mono27b_chat
@@ -23,6 +25,10 @@ add_executable(mono27b_pack
 
 target_compile_features(mono27b_chat PRIVATE cxx_std_17)
 target_compile_features(mono27b_pack PRIVATE cxx_std_17)
+
+if(MONO27B_TIMING)
+    target_compile_definitions(mono27b_chat PRIVATE MONO27B_TIMING)
+endif()
 
 target_include_directories(mono27b_chat PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"

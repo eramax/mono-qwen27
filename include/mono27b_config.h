@@ -113,6 +113,21 @@ struct Mono27BExecutorState {
     // Concurrent streams for paired matvec execution
     void * stream1;  // cudaStream_t, for concurrent matvec
     void * sync_event;  // cudaEvent_t, for cross-stream sync
+
+#ifdef MONO27B_TIMING
+    // Timing infrastructure (opaque to avoid cuda_runtime.h in C++ files)
+    static constexpr int MAX_TIMING_EVENTS = 65536;
+    static constexpr int MAX_TIMING_LABELS = 64;
+    void * timing_events[MAX_TIMING_EVENTS];  // cast to cudaEvent_t in executor
+    int timing_event_count;
+    int timing_event_capacity;
+    const char * timing_labels[MAX_TIMING_EVENTS];
+    float timing_acc_ms[MAX_TIMING_LABELS];
+    int timing_acc_count[MAX_TIMING_LABELS];
+    const char * timing_acc_label[MAX_TIMING_LABELS];
+    int timing_acc_entries;
+    int timing_tokens;
+#endif
 };
 
 struct Mono27BLogitsOutput {
@@ -195,3 +210,4 @@ extern "C" void mono27b_engine_free_logits(Mono27BLogitsOutput * output);
 
 // GPU-side argmax: avoids 1MB D2H logits copy. Returns the token id.
 extern "C" int mono27b_engine_argmax(Mono27BExecutorState * st, const float * logits, int n);
+extern "C" void mono27b_engine_print_timing(Mono27BExecutorState * st);

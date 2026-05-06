@@ -37,19 +37,43 @@ e2e-text-all: build
 clean:
 	rm -rf build
 
+compare-perf:
+	@echo "Building timing-enabled binary..."
+	@rm -f build/CMakeCache.txt
+	@cmake -S . -B build -DCMAKE_CXX_COMPILER=/usr/bin/g++ -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release -DMONO27B_TIMING=ON
+	@cmake --build build -j$(shell nproc)
+	@echo "Running mono27b with timing instrumentation (gen 30)..."
+	@./build/mono27b_chat -m $(MODEL_PATH) -p "The quick brown fox" --gen 30 --ctx $(CTX) --seed $(SEED) --quiet > /tmp/mono27b_timing.txt 2>&1
+	@echo "Running llama-bench for reference..."
+	@/mnt/data1/projects/llm/llama.cpp/build/bin/llama-bench -m $(MODEL_PATH) -p 4 -n 30 > /tmp/llama_bench.txt 2>&1
+	@python3 scripts/compare_perf.py /tmp/mono27b_timing.txt $(MODEL_PATH)
+
+build-timing:
+	@rm -f build/CMakeCache.txt
+	cmake -S . -B build -DCMAKE_CXX_COMPILER=/usr/bin/g++ -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release -DMONO27B_TIMING=ON
+	cmake --build build -j$(shell nproc)
+
+build-fast:
+	@rm -f build/CMakeCache.txt
+	cmake -S . -B build -DCMAKE_CXX_COMPILER=/usr/bin/g++ -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release -DMONO27B_TIMING=OFF
+	cmake --build build -j$(shell nproc)
+
 help:
 	@echo "Usage: make [target] [VAR=value]"
 	@echo ""
 	@echo "Targets:"
-	@echo "  build       - Configure and build mono27b_chat"
-	@echo "  test        - Run chat with custom parameters"
-	@echo "  quick-test  - Run quick 5-token generation"
-	@echo "  large-test  - Run 20-token generation"
-	@echo "  verify      - Run all verification scripts (generates data first)"
-	@echo "  verify-all  - Rebuild, generate data, run all verifications (incl. text)"
-	@echo "  e2e         - End-to-end logit comparison (single token)"
-	@echo "  e2e-text    - End-to-end text comparison (50 tokens, --chat mode)"
-	@echo "  clean       - Remove build directory"
+	@echo "  build        - Configure and build mono27b_chat"
+	@echo "  build-fast   - Build without timing instrumentation"
+	@echo "  build-timing - Build with per-step CUDA timing"
+	@echo "  test         - Run chat with custom parameters"
+	@echo "  quick-test   - Run quick 5-token generation"
+	@echo "  large-test   - Run 20-token generation"
+	@echo "  compare-perf - Run timing comparison vs llama.cpp"
+	@echo "  verify       - Run all verification scripts (generates data first)"
+	@echo "  verify-all   - Rebuild, generate data, run all verifications (incl. text)"
+	@echo "  e2e          - End-to-end logit comparison (single token)"
+	@echo "  e2e-text     - End-to-end text comparison (50 tokens, --chat mode)"
+	@echo "  clean        - Remove build directory"
 	@echo ""
 	@echo "Variables:"
 	@echo "  MODEL_PATH  - Path to target GGUF model"
@@ -66,4 +90,5 @@ help:
 	@echo "Examples:"
 	@echo "  make test PROMPT='Hello world' GEN=15 CTX=2048"
 	@echo "  make quick-test"
+	@echo "  make compare-perf"
 	@echo "  make verify"

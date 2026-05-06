@@ -641,6 +641,10 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "\n");
     }
 
+#ifdef MONO27B_TIMING
+    mono27b_engine_print_timing(&state);
+#endif
+
 cleanup:
     if (debug_fp) std::fclose(debug_fp);
     mono27b_engine_free_state(&state);

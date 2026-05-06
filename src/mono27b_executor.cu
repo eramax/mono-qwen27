@@ -1573,6 +1573,23 @@ extern "C" bool mono27b_engine_init_state(int max_ctx, Mono27BExecutorState * st
     state->cuda_graph_exec = nullptr;
     state->graph_captured = 0;
 
+#ifdef MONO27B_TIMING
+    state->timing_event_count = 0;
+    state->timing_event_capacity = Mono27BExecutorState::MAX_TIMING_EVENTS;
+    for (int i = 0; i < state->timing_event_capacity; ++i) {
+        cudaEvent_t ev = nullptr;
+        cudaEventCreate(&ev);
+        state->timing_events[i] = (void*)ev;
+    }
+    state->timing_acc_entries = 0;
+    state->timing_tokens = 0;
+    for (int i = 0; i < Mono27BExecutorState::MAX_TIMING_LABELS; ++i) {
+        state->timing_acc_ms[i] = 0.0f;
+        state->timing_acc_count[i] = 0;
+        state->timing_acc_label[i] = nullptr;
+    }
+#endif
+
     return true;
 fail:
     if (error[0] == '\0')
@@ -1596,6 +1613,11 @@ extern "C" void mono27b_engine_free_state(Mono27BExecutorState * state) {
     if (state->cuda_graph) { cudaGraphDestroy((cudaGraph_t)state->cuda_graph); state->cuda_graph = nullptr; }
     if (state->stream1) { cudaStreamDestroy((cudaStream_t)state->stream1); state->stream1 = nullptr; }
     if (state->sync_event) { cudaEventDestroy((cudaEvent_t)state->sync_event); state->sync_event = nullptr; }
+#ifdef MONO27B_TIMING
+    for (int i = 0; i < state->timing_event_capacity; ++i) {
+        if (state->timing_events[i]) cudaEventDestroy((cudaEvent_t)state->timing_events[i]);
+    }
+#endif
     std::memset(state, 0, sizeof(*state));
 }
 
@@ -1775,7 +1797,75 @@ static void debug_dump_vec(FILE * fp, const char * phase, int step, int pos, int
 #define MV(wv, x, y) l_mv_quant((wv).ptr, (wv).ggml_type, (wv).row_blocks, (wv).row_count, x, y)
 #define MV_Q8(wv, y) l_mv_q8((wv).ptr, (wv).ggml_type, (wv).row_blocks, (wv).row_count, y)
 #define WV(wv) ((const float *)(wv).ptr)
+
+#ifdef MONO27B_TIMING
+static inline void timing_reset(Mono27BExecutorState * st) {
+    st->timing_event_count = 0;
+}
+static inline void timing_record(Mono27BExecutorState * st, const char * label) {
+    if (st->timing_event_count < st->timing_event_capacity) {
+        st->timing_labels[st->timing_event_count] = label;
+        cudaEventRecord((cudaEvent_t)st->timing_events[st->timing_event_count], 0);
+        st->timing_event_count++;
+    }
+}
+static inline void timing_start(Mono27BExecutorState * st) {
+    timing_reset(st);
+    timing_record(st, "start");
+}
+static void timing_commit(Mono27BExecutorState * st) {
+    if (st->timing_event_count < 2) return;
+    cudaEventSynchronize((cudaEvent_t)st->timing_events[st->timing_event_count - 1]);
+    for (int i = 1; i < st->timing_event_count; ++i) {
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, (cudaEvent_t)st->timing_events[i-1], (cudaEvent_t)st->timing_events[i]);
+        const char * lbl = st->timing_labels[i];
+        int idx = -1;
+        for (int j = 0; j < st->timing_acc_entries; ++j) {
+            if (st->timing_acc_label[j] && std::strcmp(st->timing_acc_label[j], lbl) == 0) {
+                idx = j; break;
+            }
+        }
+        if (idx < 0 && st->timing_acc_entries < Mono27BExecutorState::MAX_TIMING_LABELS) {
+            idx = st->timing_acc_entries++;
+            st->timing_acc_label[idx] = lbl;
+            st->timing_acc_ms[idx] = 0.0f;
+            st->timing_acc_count[idx] = 0;
+        }
+        if (idx >= 0) {
+            st->timing_acc_ms[idx] += ms;
+            st->timing_acc_count[idx]++;
+        }
+    }
+    st->timing_tokens++;
+}
+extern "C" void mono27b_engine_print_timing(Mono27BExecutorState * st) {
+    if (!st || st->timing_tokens == 0) return;
+    float total = 0.0f;
+    for (int i = 0; i < st->timing_acc_entries; ++i) total += st->timing_acc_ms[i];
+    std::fprintf(stderr, "\n=== Timing breakdown (%d tokens, total %.2f ms/tok) ===\n", st->timing_tokens, total / st->timing_tokens);
+    std::fprintf(stderr, "%-20s %10s %10s %8s\n", "Label", "ms/tok", "%", "calls");
+    struct Entry { const char * lbl; float ms; int cnt; };
+    Entry entries[Mono27BExecutorState::MAX_TIMING_LABELS];
+    for (int i = 0; i < st->timing_acc_entries; ++i) {
+        entries[i] = { st->timing_acc_label[i], st->timing_acc_ms[i], st->timing_acc_count[i] };
+    }
+    for (int i = 0; i < st->timing_acc_entries; ++i) {
+        for (int j = i+1; j < st->timing_acc_entries; ++j) {
+            if (entries[j].ms > entries[i].ms) { Entry t = entries[i]; entries[i] = entries[j]; entries[j] = t; }
+        }
+    }
+    for (int i = 0; i < st->timing_acc_entries; ++i) {
+        float avg = entries[i].ms / st->timing_tokens;
+        float pct = total > 0 ? (entries[i].ms / total) * 100.0f : 0.0f;
+        std::fprintf(stderr, "%-20s %10.3f %10.1f%% %8d\n", entries[i].lbl, avg, pct, entries[i].cnt / st->timing_tokens);
+    }
+    std::fprintf(stderr, "=========================================\n");
+}
+#define TRACE(lbl) timing_record(st, lbl)
+#else
 #define TRACE(lbl) ((void)0)
+#endif
 
 // Concurrent matvec pair: quantize shared input once, run two matvecs in parallel
 #define MV_PAIR(w1, w2, x, y1, y2) l_mv_pair( \
@@ -1850,6 +1940,10 @@ extern "C" bool mono27b_engine_decode_step(
     int fa_i = 0, ssm_i = 0, il = 0; cudaError_t sync_err = cudaSuccess;
     const bool dump_step = debug_fp && (debug_pos == -1 || pos == debug_pos);
 
+#ifdef MONO27B_TIMING
+    timing_start(st);
+#endif
+
     // CUDA graph: update device pos variables before replay/capture
     cudaMemcpyToSymbol(g_mrope_pos, &pos, sizeof(int));
     cudaMemcpyToSymbol(g_kv_pos, &pos, sizeof(int));
@@ -1858,10 +1952,17 @@ extern "C" bool mono27b_engine_decode_step(
     if (st->graph_captured && !debug_fp) {
         cudaGraphLaunch((cudaGraphExec_t)st->cuda_graph_exec, 0);
         st->kv_len = pos + 1;
+#ifdef MONO27B_TIMING
+        timing_commit(st);
+#endif
         return error[0] == '\0';
     }
 
+#ifdef MONO27B_TIMING
+    bool do_capture = false;  // disable graph capture when timing
+#else
     bool do_capture = !st->graph_captured && !debug_fp && !dump_step;
+#endif
     if (do_capture) cudaStreamBeginCapture(0, cudaStreamCaptureModeGlobal);
 
     mono27b_engine_embed(we, tok, h, error, error_cap);
@@ -2250,6 +2351,9 @@ cleanup:
         cudaStreamEndCapture(0, &graph);
         do_capture = false;
     }
+#ifdef MONO27B_TIMING
+    timing_commit(st);
+#endif
     return error[0] == '\0';
 }
 
