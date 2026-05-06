@@ -1550,7 +1550,7 @@ extern "C" bool mono27b_engine_init_state(int max_ctx, Mono27BExecutorState * st
     state->work_buf_size = ws;
 
     // Allocate Q8_1 scratch buffer for matvec quantization
-    { size_t q8_sz = 544 * sizeof(BlockQ8_1);
+    { size_t q8_sz = 2048 * sizeof(BlockQ8_1);
       state->q8_scratch = nullptr;
       cudaError_t eq = cudaMalloc(&state->q8_scratch, q8_sz);
       if (eq != cudaSuccess) { state->q8_scratch = nullptr; } }
@@ -1650,7 +1650,7 @@ static void l_mv_fallback(void * W, uint32_t ggml_type, int rb, int rc, const fl
 // Quantize x to Q8_1 in the global scratch buffer; returns n_q8 blocks used
 static int l_quant_q8(const float * x, int rb) {
     int n_q8 = rb * 8;
-    if (g_q8_scratch && n_q8 <= 544) {
+    if (g_q8_scratch && n_q8 <= 2048) {
         // Skip if this exact input+rb was already quantized (common within a layer)
         if (g_q8_cached_input == x && g_q8_cached_rb == rb) {
             return n_q8;
@@ -1665,7 +1665,7 @@ static int l_quant_q8(const float * x, int rb) {
 // Single matvec: quantizes input, launches matvec (convenience wrapper)
 static void l_mv_quant(void * W, uint32_t ggml_type, int rb, int rc, const float * x, float * y) {
     if (rc == 0 || !W) return;
-    if (g_q8_scratch && rb * 8 <= 544) {
+    if (g_q8_scratch && rb * 8 <= 2048) {
         switch (ggml_type) {
             case MONO27B_GGML_TYPE_Q4_K:
             case MONO27B_GGML_TYPE_Q5_K:
@@ -1714,7 +1714,7 @@ static void l_mv_pair(void * w1, uint32_t t1, int rb1, int rc1, float * y1,
     if (rc1 == 0 || !w1) { l_mv_quant(w2, t2, rb2, rc2, x, y2); return; }
     if (rc2 == 0 || !w2) { l_mv_quant(w1, t1, rb1, rc1, x, y1); return; }
     // Both need Q8_1 path — quantize once, then run both on stream 0
-    if (g_q8_scratch && rb * 8 <= 544) {
+    if (g_q8_scratch && rb * 8 <= 2048) {
         l_quant_q8(x, rb);
         l_mv_q8_on(w1, t1, rb1, rc1, y1, 0);
         l_mv_q8_on(w2, t2, rb2, rc2, y2, 0);
@@ -2295,7 +2295,7 @@ extern "C" bool mono27b_engine_decode_step(
         int rb = (int)we->lm_head.row_blocks;
         auto * base = (const BlockQ6K *)we->lm_head.ptr;
         int n_q8 = rb * 8;
-        if (g_q8_scratch && n_q8 <= 544) {
+        if (g_q8_scratch && n_q8 <= 2048) {
             k_quant_q8_1<<<(n_q8 + 127) / 128, 128>>>(h2, g_q8_scratch, MONO27B_TARGET_HIDDEN);
             // No sync needed — quantize and matvec are on same stream, already ordered
             k_q6k_mv_q8_dp4a<<<total, 128>>>(base, g_q8_scratch, out->logits, rb, total);
