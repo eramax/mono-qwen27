@@ -2240,26 +2240,26 @@ extern "C" bool mono27b_engine_decode_step(
             }
 
         ssm_ffn:
-            l_rms(h, h2, WV(L.post_norm), MONO27B_TARGET_HIDDEN);
+            l_rms(h, h2, WV(L.post_norm), MONO27B_TARGET_HIDDEN); TRACE("porm");
             if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "post_norm", h, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
             }
-            MV_PAIR(L.ffn_gate, L.ffn_up, h, fb, kb);
+            MV_PAIR(L.ffn_gate, L.ffn_up, h, fb, kb); TRACE("fg+fu");
             if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ffn_gate", fb, MONO27B_TARGET_FFN, MONO27B_TARGET_FFN);
             }
             if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ffn_up", kb, MONO27B_TARGET_FFN, MONO27B_TARGET_FFN);
             }
-            k_elem_swiglu<<<(MONO27B_TARGET_FFN + 255) / 256, 256>>>(fb, kb, MONO27B_TARGET_FFN);
+            k_elem_swiglu<<<(MONO27B_TARGET_FFN + 255) / 256, 256>>>(fb, kb, MONO27B_TARGET_FFN); TRACE("mul");
             if (dump_step && il < 4) {
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ffn_mul", fb, MONO27B_TARGET_FFN, MONO27B_TARGET_FFN);
             }
-            MV(L.ffn_down, fb, h);
+            MV(L.ffn_down, fb, h); TRACE("fd");
             if (dump_step && il < 3) {
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ffn_down", h, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
             }
-            k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h, h2, MONO27B_TARGET_HIDDEN);
+            k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h, h2, MONO27B_TARGET_HIDDEN); TRACE("res1");
             if (dump_step && il < 3) {
                 debug_dump_vec(debug_fp, "ssm", il, pos, tok, "layer_out", h, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
             }

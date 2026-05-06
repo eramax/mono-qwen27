@@ -1,0 +1,88 @@
+{
+  "model": "Qwen3.6-27B-UD-Q4_K_XL",
+  "baseline_perf": {
+    "tok_per_sec": 25.2,
+    "ms_per_tok": 37.97,
+    "llama_cpp_tok_per_sec": 39.0,
+    "gap_ratio": 1.55
+  },
+  "target": {
+    "tok_per_sec": 60.0,
+    "ms_per_tok": 16.67,
+    "speedup_needed": 2.28,
+    "improvements_needed_ms_per_tok": 21.30
+  },
+  "bottlenecks": [
+    {
+      "name": "SSM output matvec (ssmo)",
+      "time_ms_per_tok": 11.65,
+      "percent": 30.7,
+      "calls_per_token": 48,
+      "description": "Large matvec: 6144 hidden dim input × 5120 output rows",
+      "optimization_ideas": [
+        "Use tensor cores (wmma) if possible",
+        "Improve memory access patterns",
+        "Fuse with element-wise operations"
+      ]
+    },
+    {
+      "name": "FFN gate+up (fg+fu)",
+      "time_ms_per_tok": 8.27,
+      "percent": 21.8,
+      "calls_per_token": 64,
+      "description": "Concurrent matvecs: 5120→17408 (16 attn + 48 SSM layers)",
+      "optimization_ideas": [
+        "Fuse with subsequent SWiGLU",
+        "Better memory layout",
+        "Optimize for larger output dimension"
+      ]
+    },
+    {
+      "name": "SSM wqkv_gate (re-g)",
+      "time_ms_per_tok": 7.45,
+      "percent": 19.6,
+      "calls_per_token": 48,
+      "description": "Matvec: 5120 hidden → 6144 SSM hidden, computed twice per layer",
+      "optimization_ideas": [
+        "Avoid redundant computation (save buffer before deltanet overwrites it)",
+        "Use quantization cache more effectively",
+        "Combine with subsequent operations"
+      ]
+    },
+    {
+      "name": "FFN down (fd)",
+      "time_ms_per_tok": 5.30,
+      "percent": 14.0,
+      "calls_per_token": 64,
+      "description": "Matvec: 17408→5120 (16 attn + 48 SSM)",
+      "optimization_ideas": [
+        "Optimize for large input dimension",
+        "Better cache utilization",
+        "Fuse with residual addition"
+      ]
+    }
+  ],
+  "completed_optimizations": [
+    {
+      "name": "Add tracing for SSM FFN operations",
+      "impact": "Revealed that 'pre' was hiding 8.27ms of SSM FFN work",
+      "status": "done",
+      "details": "SSM FFN (porm, fg+fu, mul, fd, res1) was not traced, making it look like loop overhead"
+    }
+  ],
+  "attempted_optimizations": [
+    {
+      "name": "Extra buffer for redundant wqkv_gate computation",
+      "impact": "Would save ~3.7ms (10% improvement) by avoiding recomputation",
+      "status": "reverted - caused buffer layout corruption",
+      "details": "Added extra sg buffer for ssm_gate_saved, but caused logits copy errors. Buffer layout change had unintended side effects."
+    }
+  ],
+  "next_steps": [
+    "Investigate tensor core usage possibilities",
+    "Profile memory bandwidth utilization with nsys",
+    "Consider kernel fusion strategies",
+    "Evaluate CUDA graph effectiveness",
+    "Check register pressure in matvec kernels"
+  ]
+}
