@@ -4,7 +4,7 @@
     "top_p": 0.95,
     "min_p": 0.05,
     "temperature": 0.8,
-    "banned_tokens": ["", "<|im_end|>", "<|fim_pad|>", "<|repo_name|>", "<|file_sep|>", "<|vision_pad|>"]
+    "banned_tokens": ["<|fim_pad|>", "<|repo_name|>", "<|file_sep|>", "<|vision_pad|>"]
   },
   "defaults": {
     "seed": 944990222,
@@ -29,6 +29,6 @@
   },
   "chat_template": {
     "system_prefix": "<|im_start|>user\n",
-    "system_suffix": "<|im_end|>\n<|im_start|>assistant\n༚\n"
+    "system_suffix": "<|im_end|>\n<|im_start|>assistant\n<think)\n"
   }
 }

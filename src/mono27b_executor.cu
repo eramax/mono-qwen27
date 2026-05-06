@@ -1855,22 +1855,8 @@ extern "C" bool mono27b_engine_decode_step(
     cudaMemcpyToSymbol(g_mrope_pos, &pos, sizeof(int));
     cudaMemcpyToSymbol(g_kv_pos, &pos, sizeof(int));
 
-    // If graph already captured and no debug, just replay
-    if (st->graph_captured) {
-        cudaGraphLaunch((cudaGraphExec_t)st->cuda_graph_exec, 0);
-        st->kv_len = pos + 1;
-#ifdef MONO27B_TIMING
-        timing_commit(st);
-#endif
-        return error[0] == '\0';
-    }
-
-#ifdef MONO27B_TIMING
-    bool do_capture = false;  // disable graph capture when timing
-#else
-    bool do_capture = !st->graph_captured;
-#endif
-    if (do_capture) cudaStreamBeginCapture(0, cudaStreamCaptureModeGlobal);
+    // CUDA graph capture disabled — tok is a kernel argument that changes
+    // every step, so graph replay would always embed the same first token.
 
     mono27b_engine_embed(we, tok, h, error, error_cap);
     TRACE("emb");
@@ -2089,30 +2075,7 @@ extern "C" bool mono27b_engine_decode_step(
 
     st->kv_len = pos + 1;
 
-    // End CUDA graph capture on first successful call
-    if (do_capture) {
-        cudaGraph_t graph;
-        cudaError_t cap_err = cudaStreamEndCapture(0, &graph);
-        if (cap_err == cudaSuccess && graph != nullptr) {
-            cudaGraphExec_t graphExec;
-            if (cudaGraphInstantiate(&graphExec, graph, NULL, NULL, 0) == cudaSuccess) {
-                st->cuda_graph = graph;
-                st->cuda_graph_exec = graphExec;
-                st->graph_captured = 1;
-            } else {
-                cudaGraphDestroy(graph);
-            }
-        }
-        do_capture = false;
-    }
-
 cleanup:
-    // Ensure graph capture is ended even on error path
-    if (do_capture) {
-        cudaGraph_t graph;
-        cudaStreamEndCapture(0, &graph);
-        do_capture = false;
-    }
 #ifdef MONO27B_TIMING
     timing_commit(st);
 #endif

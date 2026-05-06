@@ -32,8 +32,8 @@ struct SamplingConfig {
     float top_p       = 0.95f;
     float min_p       = 0.05f;
     float temperature = 0.8f;
-    std::vector<std::string> banned_tokens = {"", "<|im_end|>", "<|fim_pad|>",
-                                               "<|repo_name|>", "<|file_sep|>", "<|vision_pad|>"};
+    std::vector<std::string> banned_tokens = {"<|fim_pad|>", "<|repo_name|>",
+                                               "<|file_sep|>", "<|vision_pad|>"};
 };
 
 struct ChatTemplateConfig {

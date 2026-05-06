@@ -3,15 +3,18 @@
 MODEL_PATH ?= /mnt/mydata/projects2/mono27b/model/Qwen3.6-27B-UD-Q4_K_XL.gguf
 PROMPT ?= "give me 2 py example"
 GEN ?= 500
-CTX ?= 4096
+CTX ?= 8192
 SEED ?= 944990222
 
 build:
-	cmake -S . -B build -DCMAKE_CXX_COMPILER=/usr/bin/g++ -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release
+	cmake -S . -B build -DCMAKE_CXX_COMPILER=/usr/bin/g++ -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release -DMONO27B_TIMING=OFF
 	cmake --build build -j$(shell nproc)
 
 test: build
 	./build/mono27b_chat -m $(MODEL_PATH) -p $(PROMPT) --gen $(GEN) --ctx $(CTX) --seed $(SEED)
+
+run: build
+	./build/mono27b_chat -m $(MODEL_PATH) -p "$(PROMPT)" --chat --ctx 8192 --gen 8192
 
 quick-test: build
 	./build/mono27b_chat -m $(MODEL_PATH) -p "The quick brown fox" --gen 5 --ctx 2048
@@ -66,6 +69,7 @@ help:
 	@echo "  build-fast   - Build without timing instrumentation"
 	@echo "  build-timing - Build with per-step CUDA timing"
 	@echo "  test         - Run chat with custom parameters"
+	@echo "  run          - Run with a prompt (ctx=128k, default sampling)"
 	@echo "  quick-test   - Run quick 5-token generation"
 	@echo "  large-test   - Run 20-token generation"
 	@echo "  compare-perf - Run timing comparison vs llama.cpp"
@@ -88,6 +92,8 @@ help:
 	@echo "  verify_deltanet.py    - Python DeltaNet reference impl"
 	@echo ""
 	@echo "Examples:"
+	@echo "  make run PROMPT='Hello world'"
+	@echo "  make run PROMPT='Explain quantum computing' GEN=200"
 	@echo "  make test PROMPT='Hello world' GEN=15 CTX=2048"
 	@echo "  make quick-test"
 	@echo "  make compare-perf"
