@@ -1284,11 +1284,13 @@ __global__ static void k_q4k_embed(const BlockQ4K * T, float * out, int row_elem
 
 // ─── Single-token attention (1 thread, sequential) ──────────────────────────
 
-// ─── Parallel attention: cooperative dot product, softmax, weighted sum ─────
-// Each block handles one query head. All 256 threads cooperate on dot products,
-// softmax reduction, and output accumulation. This replaces the old single-thread
-// kernel which was both slow and numerically different from flash attention.
-__global__ static void k_attn_parallel(
+// ─── Decode attention: online softmax over the KV cache ─────────────────────
+// One block handles one query head. This keeps the exact causal decode behavior
+// while avoiding the old 3-pass scores buffer (dot pass + softmax pass + V pass).
+// It is structurally closer to llama.cpp's flash-attention decode path: stream
+// through K/V once, maintain a running max/sum, and renormalize the output
+// accumulator online.
+__global__ static void k_attn_decode_online(
     const float * __restrict__ Q, const float * __restrict__ K,
     const float * __restrict__ V, float * __restrict__ O,
     int n_h, int n_kvh, int hd, int max_ctx, float scale) {
@@ -1301,70 +1303,66 @@ __global__ static void k_attn_parallel(
     size_t pos_stride = (size_t)n_kvh * hd;
     int t = threadIdx.x;
     int kv_len = g_kv_pos + 1;  // dynamic per-step
-    // Shared memory: scores[max_ctx] + max_val[1] + sum_exp[1] + scratch[256]
-    extern __shared__ float smem[];
-    float * scores  = smem;
-    float * s_max   = smem + max_ctx;
-    float * s_sum   = s_max + 1;
-    float * scratch = s_sum + 1;
+    __shared__ float s_partials[8];
+    __shared__ float s_m_prev;
+    __shared__ float s_l_prev;
+    __shared__ float s_alpha;
+    __shared__ float s_beta;
+    __shared__ float s_inv_l;
 
-    // Each thread loads one element of Q (reused across all positions)
-    float q_elem = qr[t];
+    float out_acc = 0.0f;
+    float m_prev = -1e30f;
+    float l_prev = 0.0f;
 
-    // Phase 1: compute dot products and find max
-    float maxv = -1e30f;
     for (int p = 0; p < kv_len; ++p) {
         const float * kr = K + (size_t)p * pos_stride + (size_t)kvh * hd;
-        float d = q_elem * kr[t];
-        scratch[t] = d;
-        // Block reduction (tree) to sum all partial dots
-        for (int s = hd / 2; s > 0; s >>= 1) {
-            __syncthreads();
-            if (t < s) scratch[t] += scratch[t + s];
+        float dot_local = 0.0f;
+        for (int i = t; i < hd; i += blockDim.x) {
+            dot_local += qr[i] * kr[i];
+        }
+
+        const int lane = t & 31;
+        const int wid  = t >> 5;
+        dot_local = warp_reduce_sum<32>(dot_local);
+        if (lane == 0) s_partials[wid] = dot_local;
+        __syncthreads();
+
+        if (wid == 0) {
+            float v = (lane < (blockDim.x >> 5)) ? s_partials[lane] : 0.0f;
+            v = warp_reduce_sum<32>(v);
+            if (lane == 0) {
+                float dot = v * scale;
+                if (dot > 64.0f) dot = 64.0f;
+                float m_new = fmaxf(m_prev, dot);
+                s_alpha = expf(m_prev - m_new);
+                s_beta  = expf(fmaxf(dot - m_new, -64.0f));
+                s_m_prev = m_new;
+                s_l_prev = l_prev * s_alpha + s_beta;
+                s_inv_l = 1.0f / (s_l_prev + 1e-10f);
+            }
         }
         __syncthreads();
-        if (t == 0) {
-            float dot = scratch[0] * scale;
-            scores[p] = dot;
-            if (dot > maxv) maxv = dot;
+
+        const float * vr = V + (size_t)p * pos_stride + (size_t)kvh * hd;
+        const float alpha = s_alpha;
+        const float beta = s_beta;
+        for (int i = t; i < hd; i += blockDim.x) {
+            float prev = (i == t) ? out_acc : 0.0f;
+            float next = prev * alpha + beta * vr[i];
+            if (i == t) out_acc = next;
         }
+
+        m_prev = s_m_prev;
+        l_prev = s_l_prev;
         __syncthreads();
     }
-    __syncthreads();
 
-    // Broadcast max to all threads via shared memory
-    if (t == 0) {
-        if (maxv > 64.0f) maxv = 64.0f;
-        s_max[0] = maxv;
+    const float inv_l = s_inv_l;
+    for (int i = t; i < hd; i += blockDim.x) {
+        if (i == t) {
+            or_[i] = out_acc * inv_l;
+        }
     }
-    __syncthreads();
-    maxv = s_max[0];
-
-    // Phase 2: softmax — compute exp(s - max) and sum
-    float local_sum = 0.0f;
-    for (int p = t; p < kv_len; p += blockDim.x) {
-        float v = expf(fmaxf(scores[p] - maxv, -64.0f));
-        scores[p] = v;
-        local_sum += v;
-    }
-    // Reduce partial sums
-    scratch[t] = local_sum;
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        __syncthreads();
-        if (t < s) scratch[t] += scratch[t + s];
-    }
-    __syncthreads();
-    if (t == 0) s_sum[0] = scratch[0];
-    __syncthreads();
-    float inv_sum = 1.0f / (s_sum[0] + 1e-10f);
-
-    // Phase 3: weighted sum of V values
-    float out_val = 0.0f;
-    for (int p = 0; p < kv_len; ++p) {
-        float sv = scores[p] * inv_sum;
-        out_val += sv * V[(size_t)p * pos_stride + (size_t)kvh * hd + t];
-    }
-    or_[t] = out_val;
 }
 
 // ─── SSM conv1d (1 thread per channel) ───────────────────────────────────────
@@ -2280,9 +2278,7 @@ extern "C" bool mono27b_engine_decode_step(
 
             // Attention: parallel cooperative kernel
             {
-                int smem_kvl = max_ctx > 0 ? max_ctx : 8192;
-                size_t smem_sz = ((size_t)smem_kvl + 2 + MONO27B_TARGET_HEAD_DIM) * sizeof(float);
-                k_attn_parallel<<<MONO27B_TARGET_N_HEAD, MONO27B_TARGET_HEAD_DIM, smem_sz>>>(
+                k_attn_decode_online<<<MONO27B_TARGET_N_HEAD, MONO27B_TARGET_HEAD_DIM>>>(
                     qb, st->kv_cache_k[fa_i], st->kv_cache_v[fa_i], qb,
                     MONO27B_TARGET_N_HEAD, MONO27B_TARGET_N_KV_HEAD,
                     MONO27B_TARGET_HEAD_DIM, max_ctx, 1.0f / sqrtf(MONO27B_TARGET_HEAD_DIM));

@@ -24,6 +24,45 @@ static float cpu_softplus(float x) {
     return (x > 20.0f) ? x : logf(1.0f + expf(x));
 }
 
+template <int W>
+__device__ float warp_reduce_sum(float v) {
+    #pragma unroll
+    for (int s = W / 2; s > 0; s >>= 1) v += __shfl_xor_sync(0xFFFFFFFF, v, s);
+    return v;
+}
+
+static void attn_ref(const float * q, const float * k, const float * v, float * out,
+                     int n_h, int n_kvh, int hd, int kv_len, float scale) {
+    for (int qh = 0; qh < n_h; ++qh) {
+        int kvh = qh / (n_h / n_kvh);
+        const float * qr = q + (size_t) qh * hd;
+        std::vector<float> scores(kv_len);
+        float maxv = -1e30f;
+        for (int p = 0; p < kv_len; ++p) {
+            const float * kr = k + ((size_t) p * n_kvh + kvh) * hd;
+            float dot = 0.0f;
+            for (int i = 0; i < hd; ++i) dot += qr[i] * kr[i];
+            dot *= scale;
+            if (dot > 64.0f) dot = 64.0f;
+            scores[p] = dot;
+            maxv = std::max(maxv, dot);
+        }
+        float sum = 0.0f;
+        for (int p = 0; p < kv_len; ++p) {
+            scores[p] = expf(std::max(scores[p] - maxv, -64.0f));
+            sum += scores[p];
+        }
+        for (int i = 0; i < hd; ++i) {
+            float acc = 0.0f;
+            for (int p = 0; p < kv_len; ++p) {
+                const float * vr = v + ((size_t) p * n_kvh + kvh) * hd;
+                acc += scores[p] * vr[i];
+            }
+            out[(size_t) qh * hd + i] = acc / (sum + 1e-10f);
+        }
+    }
+}
+
 // ─── Reference L2 norm (matches ggml-cuda/norm.cu l2_norm_f32) ─────────────
 static void l2_norm_ref(const float * x, float * dst, int ncols, float eps) {
     double sum_sq = 0.0;
@@ -168,14 +207,72 @@ __global__ static void k_deltanet(
     out[(size_t)r_idx * hv + col] = attn * (1.0f / sqrtf((float)hv));
 }
 
-// ─── ggml-style warp-level DeltaNet (matches gated_delta_net.cu) ────────────
+__global__ static void k_attn_decode_online(
+    const float * __restrict__ Q, const float * __restrict__ K,
+    const float * __restrict__ V, float * __restrict__ O,
+    int n_h, int n_kvh, int hd, float scale, int kv_len) {
+    int qh = blockIdx.x;
+    if (qh >= n_h) return;
+    int kvh = qh / (n_h / n_kvh);
+    const float * qr = Q + (size_t) qh * hd;
+    float * or_ = O + (size_t) qh * hd;
+    const size_t pos_stride = (size_t) n_kvh * hd;
+    const int t = threadIdx.x;
 
-template <int W>
-__device__ float warp_reduce_sum(float v) {
-    #pragma unroll
-    for (int s = W / 2; s > 0; s >>= 1) v += __shfl_xor_sync(0xFFFFFFFF, v, s);
-    return v;
+    __shared__ float s_partials[8];
+    __shared__ float s_m_prev;
+    __shared__ float s_l_prev;
+    __shared__ float s_alpha;
+    __shared__ float s_beta;
+    __shared__ float s_inv_l;
+
+    float out_acc = 0.0f;
+    float m_prev = -1e30f;
+    float l_prev = 0.0f;
+
+    for (int p = 0; p < kv_len; ++p) {
+        const float * kr = K + (size_t) p * pos_stride + (size_t) kvh * hd;
+        float dot_local = 0.0f;
+        for (int i = t; i < hd; i += blockDim.x) dot_local += qr[i] * kr[i];
+
+        const int lane = t & 31;
+        const int wid  = t >> 5;
+        dot_local = warp_reduce_sum<32>(dot_local);
+        if (lane == 0) s_partials[wid] = dot_local;
+        __syncthreads();
+
+        if (wid == 0) {
+            float vv = (lane < (blockDim.x >> 5)) ? s_partials[lane] : 0.0f;
+            vv = warp_reduce_sum<32>(vv);
+            if (lane == 0) {
+                float dot = vv * scale;
+                if (dot > 64.0f) dot = 64.0f;
+                float m_new = fmaxf(m_prev, dot);
+                s_alpha = expf(m_prev - m_new);
+                s_beta  = expf(fmaxf(dot - m_new, -64.0f));
+                s_m_prev = m_new;
+                s_l_prev = l_prev * s_alpha + s_beta;
+                s_inv_l = 1.0f / (s_l_prev + 1e-10f);
+            }
+        }
+        __syncthreads();
+
+        const float * vr = V + (size_t) p * pos_stride + (size_t) kvh * hd;
+        const float alpha = s_alpha;
+        const float beta = s_beta;
+        if (t < hd) out_acc = out_acc * alpha + beta * vr[t];
+
+        m_prev = s_m_prev;
+        l_prev = s_l_prev;
+        __syncthreads();
+    }
+
+    if (t < hd) {
+        or_[t] = out_acc * s_inv_l;
+    }
 }
+
+// ─── ggml-style warp-level DeltaNet (matches gated_delta_net.cu) ────────────
 
 template <int S_v, bool KDA>
 __global__ void __launch_bounds__(128, 2)
@@ -478,6 +575,36 @@ static bool test_deltanet_ggml() {
     return max_diff < 1e-4;
 }
 
+static bool test_attn_decode_online() {
+    const int n_h = 24, n_kvh = 4, hd = 256, kv_len = 37;
+    const size_t q_sz = (size_t) n_h * hd;
+    const size_t kv_sz = (size_t) kv_len * n_kvh * hd;
+    std::vector<float> h_q(q_sz), h_k(kv_sz), h_v(kv_sz), h_ref(q_sz), h_gpu(q_sz);
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    for (auto & x : h_q) x = dist(rng);
+    for (auto & x : h_k) x = dist(rng);
+    for (auto & x : h_v) x = dist(rng);
+    attn_ref(h_q.data(), h_k.data(), h_v.data(), h_ref.data(), n_h, n_kvh, hd, kv_len, 1.0f / sqrtf((float) hd));
+
+    float *d_q, *d_k, *d_v, *d_o;
+    cudaMalloc(&d_q, q_sz * sizeof(float));
+    cudaMalloc(&d_k, kv_sz * sizeof(float));
+    cudaMalloc(&d_v, kv_sz * sizeof(float));
+    cudaMalloc(&d_o, q_sz * sizeof(float));
+    cudaMemcpy(d_q, h_q.data(), q_sz * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, h_k.data(), kv_sz * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, h_v.data(), kv_sz * sizeof(float), cudaMemcpyHostToDevice);
+    k_attn_decode_online<<<n_h, hd>>>(d_q, d_k, d_v, d_o, n_h, n_kvh, hd, 1.0f / sqrtf((float) hd), kv_len);
+    cudaMemcpy(h_gpu.data(), d_o, q_sz * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_o);
+
+    double max_diff = 0.0;
+    for (size_t i = 0; i < q_sz; ++i) max_diff = std::max(max_diff, (double) std::fabs(h_ref[i] - h_gpu[i]));
+    printf("Attn decode test: max_diff = %.9g %s\n", max_diff, max_diff < 1e-4 ? "PASS" : "FAIL");
+    return max_diff < 1e-4;
+}
+
 int main() {
     bool ok = true;
     ok &= test_l2_norm();
@@ -485,6 +612,7 @@ int main() {
     ok &= test_conv1d_silu();
     ok &= test_deltanet();
     ok &= test_deltanet_ggml();
+    ok &= test_attn_decode_online();
     printf("\n%s\n", ok ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return ok ? 0 : 1;
 }
