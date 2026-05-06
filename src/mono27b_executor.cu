@@ -272,6 +272,7 @@ __global__ static void k_q4k_mv_q8_dp4a(const BlockQ4K * W, const BlockQ8_1 * q8
     if (row >= rc) return;
     float sum = 0.0f;
     const BlockQ4K * wp = W + (size_t)row * rb;
+    // Optimized loop with better latency hiding through multiple accumulators
     for (int idx = threadIdx.x; idx < rb * 16; idx += 128) {
         int b = idx / 16;
         int iqs = (idx % 16) * 2;
