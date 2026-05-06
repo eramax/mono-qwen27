@@ -431,7 +431,7 @@ int main(int argc, char **argv) {
     fwrite("\n", 1, 1, stdout);
     fflush(stdout);
 
-    if (ok) {
+    if (ok && !args.quiet) {
         print_stats(args.model, pos, args.max_ctx, prompt_ids.size(), generated.size(),
                     std::chrono::duration<double, std::milli>(t1 - t0).count(),
                     std::chrono::duration<double, std::milli>(t3 - t2).count());

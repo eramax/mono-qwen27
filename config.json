@@ -30,7 +30,7 @@
   },
   "chat_template": {
     "system_prefix": "<|im_start|>user\n",
-    "system_suffix": "<|im_end|>\n<|im_start|>assistant\n"
+    "system_suffix": "<|im_end|>\n<|im_start|>assistant\n<think>\n"
   },
   "io": {
     "buffer_size": 8388608

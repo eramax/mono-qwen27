@@ -11,6 +11,7 @@ struct Mono27BChatArgs {
     int max_gen    = 512;
     bool chat      = false;
     bool verbose   = false;
+    bool quiet     = false;
     bool show_help = false;
 };
 
