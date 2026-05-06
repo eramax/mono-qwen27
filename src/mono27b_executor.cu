@@ -1728,18 +1728,6 @@ extern "C" void mono27b_engine_free_state(Mono27BExecutorState * state) {
 
 // ─── Launch helpers ──────────────────────────────────────────────────────────
 
-static void l_q4k(const BlockQ4K * W, int rb, int rc, const float * x, float * y) {
-    k_q4k_mv<128><<<rc, g_kernel_cfg.matvec_threads>>>(W, x, y, rb, rc);
-}
-
-static void l_q5k(const BlockQ5K * W, int rb, int rc, const float * x, float * y) {
-    k_q5k_mv<128><<<rc, g_kernel_cfg.matvec_threads>>>(W, x, y, rb, rc);
-}
-
-static void l_q6k(const BlockQ6K * W, int rb, int rc, const float * x, float * y) {
-    k_q6k_mt<<<rc, g_kernel_cfg.q6k_mt_threads>>>(W, x, y, rb, rc);
-}
-
 // File-scope pointer to Q8_1 scratch buffer (set by engine before decode step)
 static BlockQ8_1 * g_q8_scratch = nullptr;
 // Cache tracking: skip re-quantize when same input is used by multiple matvecs
@@ -1827,7 +1815,7 @@ static void l_mv_q8(void * W, uint32_t ggml_type, int rb, int rc, float * y) {
 // Quantize x once, then run w1→y1 on stream 0 and w2→y2 on stream 1.
 static void l_mv_pair(void * w1, uint32_t t1, int rb1, int rc1, float * y1,
                       void * w2, uint32_t t2, int rb2, int rc2, float * y2,
-                      const float * x, int rb, cudaStream_t stream1, cudaEvent_t sync_ev) {
+                      const float * x, int rb) {
     if (rc1 == 0 || !w1) { l_mv_quant(w2, t2, rb2, rc2, x, y2); return; }
     if (rc2 == 0 || !w2) { l_mv_quant(w1, t1, rb1, rc1, x, y1); return; }
     // Both need Q8_1 path — quantize once, then run both on stream 0
@@ -1848,9 +1836,9 @@ static void l_mv_pair(void * w1, uint32_t t1, int rb1, int rc1, float * y1,
 // Fallback path (F32 dequant)
 static void l_mv_fallback(void * W, uint32_t ggml_type, int rb, int rc, const float * x, float * y) {
     switch (ggml_type) {
-        case MONO27B_GGML_TYPE_Q4_K: l_q4k((const BlockQ4K *)W, rb, rc, x, y); break;
-        case MONO27B_GGML_TYPE_Q5_K: l_q5k((const BlockQ5K *)W, rb, rc, x, y); break;
-        case MONO27B_GGML_TYPE_Q6_K: l_q6k((const BlockQ6K *)W, rb, rc, x, y); break;
+        case MONO27B_GGML_TYPE_Q4_K: k_q4k_mv<128><<<rc, g_kernel_cfg.matvec_threads>>>((const BlockQ4K *)W, x, y, rb, rc); break;
+        case MONO27B_GGML_TYPE_Q5_K: k_q5k_mv<128><<<rc, g_kernel_cfg.matvec_threads>>>((const BlockQ5K *)W, x, y, rb, rc); break;
+        case MONO27B_GGML_TYPE_Q6_K: k_q6k_mt<<<rc, g_kernel_cfg.q6k_mt_threads>>>((const BlockQ6K *)W, x, y, rb, rc); break;
         case MONO27B_GGML_TYPE_F32:  k_f32_mv<128><<<rc, g_kernel_cfg.matvec_threads>>>((const float *)W, x, y, rb, rc); break;
         case MONO27B_GGML_TYPE_F16:  k_f16_mv<128><<<rc, g_kernel_cfg.matvec_threads>>>((const __half *)W, x, y, rb, rc); break;
         case MONO27B_GGML_TYPE_Q8_0: k_q80_mv<128><<<rc, g_kernel_cfg.matvec_threads>>>((const BlockQ8 *)W, x, y, rb, rc); break;
@@ -1943,7 +1931,7 @@ extern "C" void mono27b_engine_print_timing(Mono27BExecutorState * st) {
 #define MV_PAIR(w1, w2, x, y1, y2) l_mv_pair( \
     (w1).ptr, (w1).ggml_type, (w1).row_blocks, (w1).row_count, y1, \
     (w2).ptr, (w2).ggml_type, (w2).row_blocks, (w2).row_count, y2, \
-    x, (w1).row_blocks, (cudaStream_t)st->stream1, (cudaEvent_t)st->sync_event)
+    x, (w1).row_blocks)
 
 // Fused gate+up Q4_K matvec with SwiGLU. Falls back to MV_PAIR + k_elem_swiglu
 // if either weight is not Q4_K. Saves 2 launches and amortizes weight reads.
@@ -1966,7 +1954,7 @@ static inline void l_ffn_gate_up_swiglu(
     // Fallback: original gate+up + separate swiglu kernel.
     l_mv_pair(gate.ptr, gate.ggml_type, gate.row_blocks, gate.row_count, out_swiglu,
               up.ptr, up.ggml_type, up.row_blocks, up.row_count, tmp_up,
-              x, gate.row_blocks, nullptr, nullptr);
+              x, gate.row_blocks);
     k_elem_swiglu<<<(MONO27B_TARGET_FFN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads,
                     g_kernel_cfg.elementwise_threads>>>(out_swiglu, tmp_up, MONO27B_TARGET_FFN);
 }
