@@ -1870,6 +1870,19 @@ static inline int l_n_q8_for(uint32_t t, int rb) {
     return (t == MONO27B_GGML_TYPE_Q8_0) ? rb : rb * 8;
 }
 
+static inline bool l_can_use_q8_path(uint32_t ggml_type) {
+    switch (ggml_type) {
+        case MONO27B_GGML_TYPE_Q4_K:
+        case MONO27B_GGML_TYPE_Q5_K:
+        case MONO27B_GGML_TYPE_Q6_K:
+        case MONO27B_GGML_TYPE_Q8_0:
+        case 23:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // Quantize x to Q8_1 in the global scratch buffer; returns n_q8 blocks used.
 // n_q8 is the q8_1 block count (each block = 32 input elements).
 static int l_quant_q8_n(const float * x, int n_q8) {
@@ -2202,20 +2215,48 @@ extern "C" bool mono27b_engine_decode_step(
             int max_ctx = st->max_ctx > 0 ? st->max_ctx : 8192;
 
             l_rms(h2, h, WV(L.attn_norm), MONO27B_TARGET_HIDDEN); TRACE("rms");
-            MV(L.wq, h2, qb); TRACE("wq");
+            bool parallel_qkv = false;
+            if (st->stream1 && st->sync_event && g_q8_scratch &&
+                l_can_use_q8_path(L.wq.ggml_type) &&
+                l_can_use_q8_path(L.wk.ggml_type) &&
+                l_can_use_q8_path(L.wv.ggml_type)) {
+                int n_q8_q = l_n_q8_for(L.wq.ggml_type, (int)L.wq.row_blocks);
+                int n_q8_k = l_n_q8_for(L.wk.ggml_type, (int)L.wk.row_blocks);
+                int n_q8_v = l_n_q8_for(L.wv.ggml_type, (int)L.wv.row_blocks);
+                if (n_q8_q == n_q8_k && n_q8_q == n_q8_v &&
+                    n_q8_q <= g_kernel_cfg.q8_scratch_max_blocks) {
+                    l_quant_q8_n(h2, n_q8_q);
+                    cudaEventRecord((cudaEvent_t)st->sync_event, 0);
+                    cudaStreamWaitEvent((cudaStream_t)st->stream1, (cudaEvent_t)st->sync_event, 0);
+                    l_mv_q8_on(L.wq.ptr, L.wq.ggml_type, L.wq.row_blocks, L.wq.row_count, qb, nullptr, 0);
+                    l_mv_q8_on(L.wk.ptr, L.wk.ggml_type, L.wk.row_blocks, L.wk.row_count, kb, nullptr, (cudaStream_t)st->stream1);
+                    l_mv_q8_on(L.wv.ptr, L.wv.ggml_type, L.wv.row_blocks, L.wv.row_count, kb + MONO27B_TARGET_KV_DIM, nullptr, (cudaStream_t)st->stream1);
+                    cudaEventRecord((cudaEvent_t)st->sync_event, (cudaStream_t)st->stream1);
+                    cudaStreamWaitEvent(0, (cudaEvent_t)st->sync_event, 0);
+                    parallel_qkv = true;
+                }
+            }
+            if (!parallel_qkv) {
+                MV(L.wq, h2, qb);
+                MV(L.wk, h2, kb); TRACE("wk");
+                MV(L.wv, h2, kb + MONO27B_TARGET_KV_DIM); TRACE("wv");
+            }
+            TRACE("wq");
             // Qwen3Next: Q projection outputs interleaved Q+gate per head:
             // [Q0(256), G0(256), Q1(256), G1(256), ...]
             // Deinterleave to contiguous Q (6144) and gate (6144).
-            // Use kb as a temporary source buffer to avoid in-place race
+            // Use fb as a temporary source buffer to avoid in-place race
             // (head N overwrites src data that head 0..N-1 still need to read).
             {
-                cudaMemcpyAsync(kb, qb, MONO27B_TARGET_Q_DIM * 2 * sizeof(float), cudaMemcpyDeviceToDevice);
+                cudaMemcpyAsync(fb, qb, MONO27B_TARGET_Q_DIM * 2 * sizeof(float), cudaMemcpyDeviceToDevice);
                 int n_h = MONO27B_TARGET_N_HEAD;
                 int hd = MONO27B_TARGET_HEAD_DIM;
-                k_deinterleave_qg<<<n_h, hd>>>(kb, qb, qb + MONO27B_TARGET_Q_DIM, n_h, hd);
+                k_deinterleave_qg<<<n_h, hd>>>(fb, qb, qb + MONO27B_TARGET_Q_DIM, n_h, hd);
             }
-            MV(L.wk, h2, kb); TRACE("wk");
-            MV(L.wv, h2, kb + MONO27B_TARGET_KV_DIM); TRACE("wv");
+            if (parallel_qkv) {
+                TRACE("wk");
+                TRACE("wv");
+            }
             if (L.q_norm.ptr)
                 k_rms_norm_mulw_batched<<<MONO27B_TARGET_N_HEAD, g_kernel_cfg.rms_norm_threads>>>(
                     qb, WV(L.q_norm), qb, MONO27B_TARGET_HEAD_DIM, MONO27B_TARGET_N_HEAD, g_kernel_cfg.rms_eps);
