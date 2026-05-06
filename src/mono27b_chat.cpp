@@ -141,7 +141,8 @@ static Mono27BConfig load_config(const std::string &path) {
 static bool load_tokenizer(const Mono27BGgufFile &gguf, int max_ctx,
                             Mono27BTokenizer &tok, std::string &error) {
     char tmp_name[] = "/tmp/mono27b-tok-XXXXXX";
-    if (mkstemp(tmp_name) < 0) {
+    int tmp_fd = mkstemp(tmp_name);
+    if (tmp_fd < 0) {
         error = "mkstemp failed";
         return false;
     }
@@ -183,7 +184,8 @@ static bool load_tokenizer(const Mono27BGgufFile &gguf, int max_ctx,
         {MONO27B_SECTION_TOKENIZER, 0, bh.tokenizer_offset, bh.tokenizer_bytes},
         {MONO27B_SECTION_WEIGHTS, 0, 0, 0}
     };
-    FILE *fp = fdopen(mkstemp(tmp_name), "wb");
+
+    FILE *fp = fdopen(tmp_fd, "wb");
     fwrite(&bh, sizeof(bh), 1, fp);
     fwrite(secs, sizeof(secs), 1, fp);
     fwrite(&ts, sizeof(ts), 1, fp);
