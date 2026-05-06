@@ -267,47 +267,121 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, *(const __half2 *)&bq4_K->d, d8);
 }
 
-// Optimized Q4_K matvec kernel
+// Optimized Q4_K matvec kernel (aligned with llama.cpp approach)
+// Uses similar stride and memory access patterns to llama.cpp's implementation
+// Key: VDR (vec dot ratio) optimization - process multiple vec_dots per thread iteration
+// Optimized Q4_K matvec kernel (llama.cpp-style with multi-warp layout)
+// Uses VDR=2 for better instruction-level parallelism
+// Grid: rc blocks (one per output row)
+// Block: (32, nwarps) where nwarps = 4 for single-token inference on RTX 3090
 __global__ static void k_q4k_mv_q8_dp4a(const BlockQ4K * W, const BlockQ8_1 * q8, float * y, int rb, int rc) {
-    int row = blockIdx.x;
+    const int VDR = 2;      // Vector Dot Ratio
+    const int QI = 32;      // Quant size
+    const int nwarps = blockDim.y;
+    const int warp_size = blockDim.x;
+
+    // Global thread ID within block
+    const int tid = warp_size * threadIdx.y + threadIdx.x;
+    const int row = blockIdx.x;
+
     if (row >= rc) return;
 
-    float sum = 0.0f;
     const BlockQ4K * wp = W + (size_t)row * rb;
 
-    // Optimized: process all vec_dots for this row with best memory access pattern
-    for (int idx = threadIdx.x; idx < rb * 16; idx += 128) {
-        int b = idx / 16;
-        int iqs = (idx % 16) * 2;
-        sum += vec_dot_q4_K_q8_1(wp, q8 + b * 8, b, iqs);
+    // Number of blocks processed collectively per iteration
+    // All threads step through blocks at this stride
+    const int blocks_per_iter = VDR * nwarps * warp_size / QI;
+
+    float sum = 0.0f;
+
+    // Process blocks: thread layout determines which block to start at
+    for (int kbx = tid / (QI / VDR); kbx < rb; kbx += blocks_per_iter) {
+        // Which quant elements does this thread process (with VDR=2 spacing)
+        const int kqs = VDR * (tid % (QI / VDR));
+
+        // Q8_1 block index: Q4_K block maps to 8 Q8_1 blocks
+        const int kby = kbx * 8;
+
+        sum += vec_dot_q4_K_q8_1(wp, q8 + kby, kbx, kqs);
     }
 
-    sum = block_reduce_sum<128>(sum);
-    if (threadIdx.x == 0) y[row] = sum;
+    // Warp-level reduction (each warp sums its partial results)
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_xor_sync(0xffffffff, sum, offset);
+    }
+
+    // Store warp results in shared memory for cross-warp reduction
+    __shared__ float smem[8];
+    if (threadIdx.x == 0) {
+        smem[threadIdx.y] = sum;
+    }
+    __syncthreads();
+
+    // Cross-warp reduction: all threads in first warp participate
+    // Each thread reduces across its corresponding value from shared memory
+    if (threadIdx.y == 0) {
+        sum = smem[threadIdx.x];
+        // Binary tree reduction across shared memory values
+#pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            if (threadIdx.x < offset) {
+                sum += smem[threadIdx.x + offset];
+            }
+        }
+    }
+
+    // Write final result
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        y[row] = sum;
+    }
 }
 
-// Alternative: 2-row-per-block version for reducing launch overhead
-// Only use this if profiling shows launch overhead is critical for ssmo
+// 2-row-per-block variant (reduces kernel launch count by 2x)
+// Uses 2 pairs of warps: rows 0 and 1 processed in parallel
 __global__ static void k_q4k_mv_q8_dp4a_2row(const BlockQ4K * W, const BlockQ8_1 * q8, float * y, int rb, int rc) {
-    int row_base = blockIdx.x * 2;
-    int wid = threadIdx.x / 64;  // 2 warps per row
-    int tid = threadIdx.x % 64;
+    const int VDR = 2;
+    const int QI = 32;
+    const int rows_per_block = 2;
+    const int nwarps = blockDim.y;  // Should be 4
+    const int warp_size = blockDim.x;  // Should be 32
 
-    if (row_base + wid >= rc) return;
+    const int warp_id = threadIdx.y;
+    const int tid = threadIdx.x;
+    const int rows_per_pair = 1;  // Each warp pair handles 1 row
+    const int row0 = blockIdx.x * rows_per_block + (warp_id / 2);
 
-    int row = row_base + wid;
+    if (row0 >= rc) return;
+
+    const BlockQ4K * wp = W + (size_t)row0 * rb;
+    const int blocks_per_iter = VDR * 2 * warp_size / QI;  // 2 warps per row
+
     float sum = 0.0f;
-    const BlockQ4K * wp = W + (size_t)row * rb;
 
-    // Each warp (64 threads) handles one row
-    for (int idx = tid; idx < rb * 16; idx += 64) {
-        int b = idx / 16;
-        int iqs = (idx % 16) * 2;
-        sum += vec_dot_q4_K_q8_1(wp, q8 + b * 8, b, iqs);
+    // Each warp pair (2 warps) processes one row
+    for (int kbx = tid / (QI / VDR); kbx < rb; kbx += blocks_per_iter) {
+        const int kqs = VDR * (tid % (QI / VDR));
+        const int kby = kbx * 8;
+        sum += vec_dot_q4_K_q8_1(wp, q8 + kby, kbx, kqs);
     }
 
-    sum = block_reduce_sum<64>(sum);
-    if (tid == 0) y[row] = sum;
+    // Warp-level reduction
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_xor_sync(0xffffffff, sum, offset);
+    }
+
+    // Store results from each warp of the pair
+    __shared__ float smem[4];  // 2 rows * 2 warps per row, but we only need first warp of each pair
+    if (tid == 0 && (warp_id % 2) == 0) {
+        smem[warp_id / 2] = sum;
+    }
+    __syncthreads();
+
+    // Write results
+    if (warp_id < 2 && tid == 0) {
+        y[row0] = smem[warp_id / 2];
+    }
 }
 
 // ─── Q5_K vec_dot (from vecdotq.cuh, vmmq path) ─────────────────────────────
@@ -1748,7 +1822,9 @@ static void l_mv_q8_on(void * W, uint32_t ggml_type, int rb, int rc, float * y, 
     if (!g_q8_scratch || rb * 8 > 544) return;
     switch (ggml_type) {
         case MONO27B_GGML_TYPE_Q4_K:
-            k_q4k_mv_q8_dp4a<<<rc, 128, 0, stream>>>((const BlockQ4K *)W, g_q8_scratch, y, rb, rc);
+            // Use 2D block organization: (32, 4) = 128 threads, following llama.cpp pattern
+            // 4 warps per block provides good balance for RTX 3090
+            k_q4k_mv_q8_dp4a<<<rc, dim3(32, 4), 32 * 8 * sizeof(float), stream>>>((const BlockQ4K *)W, g_q8_scratch, y, rb, rc);
             return;
         case MONO27B_GGML_TYPE_Q5_K:
             k_q5k_mv_q8<<<rc, 128, 0, stream>>>((const BlockQ5K *)W, g_q8_scratch, y, rb, rc);
