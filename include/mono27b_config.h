@@ -6,6 +6,26 @@
 
 extern bool g_mono27b_verbose;
 
+// Runtime kernel tuning — set from config.json
+struct Mono27BKernelConfig {
+    int   matvec_threads        = 128;
+    int   q4k_q8_threads        = 128;
+    int   q4k_q8_warp_count     = 4;
+    int   q4k_q8_smem_per_warp  = 8;
+    int   q6k_mt_threads        = 256;
+    int   elementwise_threads   = 256;
+    int   rms_norm_threads      = 256;
+    int   quant_threads         = 128;
+    int   argmax_threads        = 512;
+    int   lm_head_chunk_rows    = 4096;
+    int   q8_scratch_max_blocks = 2048;
+    int   q8_dp4a_fallback      = 544;
+    float rms_eps               = 1e-6f;
+    float rope_theta            = 10000000.0f;
+};
+
+extern Mono27BKernelConfig g_kernel_cfg;
+
 // Model architecture constants — Qwen3.5-27B hybrid
 constexpr int MONO27B_TARGET_N_HEAD     = 24;
 constexpr int MONO27B_TARGET_N_KV_HEAD  = 4;

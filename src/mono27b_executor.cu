@@ -11,6 +11,7 @@
 #include <vector>
 
 extern bool g_mono27b_verbose;
+extern Mono27BKernelConfig g_kernel_cfg;
 
 // ─── Quant Block Layouts ─────────────────────────────────────────────────────
 
@@ -1490,7 +1491,7 @@ extern "C" bool mono27b_engine_init_state(int max_ctx, Mono27BExecutorState * st
     state->work_buf_size = ws;
 
     // Allocate Q8_1 scratch buffer for matvec quantization
-    { size_t q8_sz = 2048 * sizeof(BlockQ8_1);
+    { size_t q8_sz = (size_t)g_kernel_cfg.q8_scratch_max_blocks * sizeof(BlockQ8_1);
       state->q8_scratch = nullptr;
       cudaError_t eq = cudaMalloc(&state->q8_scratch, q8_sz);
       if (eq != cudaSuccess) { state->q8_scratch = nullptr; } }
@@ -1564,15 +1565,15 @@ extern "C" void mono27b_engine_free_state(Mono27BExecutorState * state) {
 // ─── Launch helpers ──────────────────────────────────────────────────────────
 
 static void l_q4k(const BlockQ4K * W, int rb, int rc, const float * x, float * y) {
-    k_q4k_mv<128><<<rc, 128>>>(W, x, y, rb, rc);
+    k_q4k_mv<128><<<rc, g_kernel_cfg.matvec_threads>>>(W, x, y, rb, rc);
 }
 
 static void l_q5k(const BlockQ5K * W, int rb, int rc, const float * x, float * y) {
-    k_q5k_mv<128><<<rc, 128>>>(W, x, y, rb, rc);
+    k_q5k_mv<128><<<rc, g_kernel_cfg.matvec_threads>>>(W, x, y, rb, rc);
 }
 
 static void l_q6k(const BlockQ6K * W, int rb, int rc, const float * x, float * y) {
-    k_q6k_mt<<<rc, 256>>>(W, x, y, rb, rc);
+    k_q6k_mt<<<rc, g_kernel_cfg.q6k_mt_threads>>>(W, x, y, rb, rc);
 }
 
 // File-scope pointer to Q8_1 scratch buffer (set by engine before decode step)
@@ -1590,12 +1591,12 @@ static void l_mv_fallback(void * W, uint32_t ggml_type, int rb, int rc, const fl
 // Quantize x to Q8_1 in the global scratch buffer; returns n_q8 blocks used
 static int l_quant_q8(const float * x, int rb) {
     int n_q8 = rb * 8;
-    if (g_q8_scratch && n_q8 <= 2048) {
+    if (g_q8_scratch && n_q8 <= g_kernel_cfg.q8_scratch_max_blocks) {
         // Skip if this exact input+rb was already quantized (common within a layer)
         if (g_q8_cached_input == x && g_q8_cached_rb == rb) {
             return n_q8;
         }
-        k_quant_q8_1<<<(n_q8 + 127) / 128, 128>>>(x, g_q8_scratch, n_q8 * 32);
+        k_quant_q8_1<<<(n_q8 + g_kernel_cfg.quant_threads - 1) / g_kernel_cfg.quant_threads, g_kernel_cfg.quant_threads>>>(x, g_q8_scratch, n_q8 * 32);
         g_q8_cached_input = x;
         g_q8_cached_rb = rb;
     }
@@ -1605,7 +1606,7 @@ static int l_quant_q8(const float * x, int rb) {
 // Single matvec: quantizes input, launches matvec (convenience wrapper)
 static void l_mv_quant(void * W, uint32_t ggml_type, int rb, int rc, const float * x, float * y) {
     if (rc == 0 || !W) return;
-    if (g_q8_scratch && rb * 8 <= 2048) {
+    if (g_q8_scratch && rb * 8 <= g_kernel_cfg.q8_scratch_max_blocks) {
         switch (ggml_type) {
             case MONO27B_GGML_TYPE_Q4_K:
             case MONO27B_GGML_TYPE_Q5_K:
@@ -1624,20 +1625,20 @@ static void l_mv_quant(void * W, uint32_t ggml_type, int rb, int rc, const float
 // stream = 0 for default stream, or a custom CUDA stream for concurrency
 static void l_mv_q8_on(void * W, uint32_t ggml_type, int rb, int rc, float * y, cudaStream_t stream) {
     if (rc == 0 || !W) return;
-    if (!g_q8_scratch || rb * 8 > 544) return;
+    if (!g_q8_scratch || rb * 8 > g_kernel_cfg.q8_dp4a_fallback) return;
     switch (ggml_type) {
         case MONO27B_GGML_TYPE_Q4_K:
             // 2D block (32, 4) = 128 threads; extra smem helps bandwidth utilization via reduced occupancy
-            k_q4k_mv_q8_dp4a<<<rc, dim3(32, 4), 32 * 8 * sizeof(float), stream>>>((const BlockQ4K *)W, g_q8_scratch, y, rb, rc);
+            k_q4k_mv_q8_dp4a<<<rc, dim3(32, g_kernel_cfg.q4k_q8_warp_count), 32 * (size_t)g_kernel_cfg.q4k_q8_smem_per_warp * sizeof(float), stream>>>((const BlockQ4K *)W, g_q8_scratch, y, rb, rc);
             return;
         case MONO27B_GGML_TYPE_Q5_K:
-            k_q5k_mv_q8<<<rc, 128, 0, stream>>>((const BlockQ5K *)W, g_q8_scratch, y, rb, rc);
+            k_q5k_mv_q8<<<rc, g_kernel_cfg.q4k_q8_threads, 0, stream>>>((const BlockQ5K *)W, g_q8_scratch, y, rb, rc);
             return;
         case MONO27B_GGML_TYPE_Q6_K:
-            k_q6k_mv_q8_dp4a<<<rc, 128, 0, stream>>>((const BlockQ6K *)W, g_q8_scratch, y, rb, rc);
+            k_q6k_mv_q8_dp4a<<<rc, g_kernel_cfg.q4k_q8_threads, 0, stream>>>((const BlockQ6K *)W, g_q8_scratch, y, rb, rc);
             return;
         case 23:
-            k_iq4xs_mv_q8_dp4a<<<rc, 128, 0, stream>>>((const BlockIQ4XS *)W, g_q8_scratch, y, rb, rc);
+            k_iq4xs_mv_q8_dp4a<<<rc, g_kernel_cfg.q4k_q8_threads, 0, stream>>>((const BlockIQ4XS *)W, g_q8_scratch, y, rb, rc);
             return;
         default: break;
     }
@@ -1655,7 +1656,7 @@ static void l_mv_pair(void * w1, uint32_t t1, int rb1, int rc1, float * y1,
     if (rc1 == 0 || !w1) { l_mv_quant(w2, t2, rb2, rc2, x, y2); return; }
     if (rc2 == 0 || !w2) { l_mv_quant(w1, t1, rb1, rc1, x, y1); return; }
     // Both need Q8_1 path — quantize once, then run both on stream 0
-    if (g_q8_scratch && rb * 8 <= 2048) {
+    if (g_q8_scratch && rb * 8 <= g_kernel_cfg.q8_scratch_max_blocks) {
         l_quant_q8(x, rb);
         l_mv_q8_on(w1, t1, rb1, rc1, y1, 0);
         l_mv_q8_on(w2, t2, rb2, rc2, y2, 0);
@@ -1672,15 +1673,15 @@ static void l_mv_fallback(void * W, uint32_t ggml_type, int rb, int rc, const fl
         case MONO27B_GGML_TYPE_Q4_K: l_q4k((const BlockQ4K *)W, rb, rc, x, y); break;
         case MONO27B_GGML_TYPE_Q5_K: l_q5k((const BlockQ5K *)W, rb, rc, x, y); break;
         case MONO27B_GGML_TYPE_Q6_K: l_q6k((const BlockQ6K *)W, rb, rc, x, y); break;
-        case MONO27B_GGML_TYPE_F32:  k_f32_mv<128><<<rc, 128>>>((const float *)W, x, y, rb, rc); break;
-        case MONO27B_GGML_TYPE_F16:  k_f16_mv<128><<<rc, 128>>>((const __half *)W, x, y, rb, rc); break;
-        case MONO27B_GGML_TYPE_Q8_0: k_q80_mv<128><<<rc, 128>>>((const BlockQ8 *)W, x, y, rb, rc); break;
-        case 23: k_iq4xs_mv<128><<<rc, 128>>>((const BlockIQ4XS *)W, x, y, rb, rc); break;
+        case MONO27B_GGML_TYPE_F32:  k_f32_mv<128><<<rc, g_kernel_cfg.matvec_threads>>>((const float *)W, x, y, rb, rc); break;
+        case MONO27B_GGML_TYPE_F16:  k_f16_mv<128><<<rc, g_kernel_cfg.matvec_threads>>>((const __half *)W, x, y, rb, rc); break;
+        case MONO27B_GGML_TYPE_Q8_0: k_q80_mv<128><<<rc, g_kernel_cfg.matvec_threads>>>((const BlockQ8 *)W, x, y, rb, rc); break;
+        case 23: k_iq4xs_mv<128><<<rc, g_kernel_cfg.matvec_threads>>>((const BlockIQ4XS *)W, x, y, rb, rc); break;
     }
 }
 
 static void l_rms(float * dst, const float * x, const float * w, int n) {
-    k_rms_norm_mulw<256><<<1, 256>>>(x, w, dst, n, MONO27B_RMS_EPS);
+    k_rms_norm_mulw<256><<<1, g_kernel_cfg.rms_norm_threads>>>(x, w, dst, n, g_kernel_cfg.rms_eps);
 }
 
 
@@ -1902,11 +1903,11 @@ extern "C" bool mono27b_engine_decode_step(
             MV(L.wk, h2, kb); TRACE("wk");
             MV(L.wv, h2, kb + MONO27B_TARGET_KV_DIM); TRACE("wv");
             if (L.q_norm.ptr)
-                k_rms_norm_mulw_batched<<<MONO27B_TARGET_N_HEAD, 256>>>(
-                    qb, WV(L.q_norm), qb, MONO27B_TARGET_HEAD_DIM, MONO27B_TARGET_N_HEAD, MONO27B_RMS_EPS);
+                k_rms_norm_mulw_batched<<<MONO27B_TARGET_N_HEAD, g_kernel_cfg.rms_norm_threads>>>(
+                    qb, WV(L.q_norm), qb, MONO27B_TARGET_HEAD_DIM, MONO27B_TARGET_N_HEAD, g_kernel_cfg.rms_eps);
             if (L.k_norm.ptr)
-                k_rms_norm_mulw_batched<<<MONO27B_TARGET_N_KV_HEAD, 256>>>(
-                    kb, WV(L.k_norm), kb, MONO27B_TARGET_HEAD_DIM, MONO27B_TARGET_N_KV_HEAD, MONO27B_RMS_EPS);
+                k_rms_norm_mulw_batched<<<MONO27B_TARGET_N_KV_HEAD, g_kernel_cfg.rms_norm_threads>>>(
+                    kb, WV(L.k_norm), kb, MONO27B_TARGET_HEAD_DIM, MONO27B_TARGET_N_KV_HEAD, g_kernel_cfg.rms_eps);
             TRACE("qkn");
 
             // M-RoPE: text tokens use the same token position for the first
@@ -1936,17 +1937,17 @@ extern "C" bool mono27b_engine_decode_step(
                     MONO27B_TARGET_HEAD_DIM, max_ctx, 1.0f / sqrtf(MONO27B_TARGET_HEAD_DIM));
             }
             // Gate: sigmoid(gate_q) * attn_output
-            k_elem_sigmoid_mul<<<(MONO27B_TARGET_Q_DIM + 255) / 256, 256>>>(
+            k_elem_sigmoid_mul<<<(MONO27B_TARGET_Q_DIM + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(
                 qb, qb + MONO27B_TARGET_Q_DIM, qb, MONO27B_TARGET_Q_DIM); TRACE("gt");
 
             MV(L.wo, qb, h2); TRACE("wo");
-            k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h2, h, MONO27B_TARGET_HIDDEN); TRACE("res1");
+            k_elem_add<<<(MONO27B_TARGET_HIDDEN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(h2, h, MONO27B_TARGET_HIDDEN); TRACE("res1");
 
             l_rms(h, h2, WV(L.post_norm), MONO27B_TARGET_HIDDEN); TRACE("porm");
             MV_PAIR(L.ffn_gate, L.ffn_up, h, fb, kb); TRACE("fg+fu");
-            k_elem_swiglu<<<(MONO27B_TARGET_FFN + 255) / 256, 256>>>(fb, kb, MONO27B_TARGET_FFN); TRACE("mul");
+            k_elem_swiglu<<<(MONO27B_TARGET_FFN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(fb, kb, MONO27B_TARGET_FFN); TRACE("mul");
             MV(L.ffn_down, fb, h); TRACE("fd");
-            k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h, h2, MONO27B_TARGET_HIDDEN);
+            k_elem_add<<<(MONO27B_TARGET_HIDDEN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(h, h2, MONO27B_TARGET_HIDDEN);
             CHECK_FINITE_FMT("attn layer %d output", il, h, MONO27B_TARGET_HIDDEN);
             fa_i++;
 
@@ -1954,7 +1955,7 @@ extern "C" bool mono27b_engine_decode_step(
             const auto & L = we->layers[il].ssm;
 
             if (!L.wqkv.ptr || !L.wqkv_gate.ptr) {
-                k_elem_copy<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h2, h, MONO27B_TARGET_HIDDEN);
+                k_elem_copy<<<(MONO27B_TARGET_HIDDEN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(h2, h, MONO27B_TARGET_HIDDEN);
                 goto ssm_ffn;
             }
 
@@ -1976,16 +1977,16 @@ extern "C" bool mono27b_engine_decode_step(
             // Conv1D
             if (st->conv_state[ssm_i]) {
                 if (L.ssm_conv1d.ggml_type == MONO27B_GGML_TYPE_F16) {
-                    k_ssm_conv1d_u_f16<<<(MONO27B_SSM_CONV_CH + 255) / 256, 256>>>(
+                    k_ssm_conv1d_u_f16<<<(MONO27B_SSM_CONV_CH + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(
                         sb, (const __half *)L.ssm_conv1d.ptr, st->conv_state[ssm_i], sb,
                         MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_KERN);
                 } else {
-                    k_ssm_conv1d_u<<<(MONO27B_SSM_CONV_CH + 255) / 256, 256>>>(
+                    k_ssm_conv1d_u<<<(MONO27B_SSM_CONV_CH + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(
                         sb, (const float *)L.ssm_conv1d.ptr, st->conv_state[ssm_i], sb,
                         MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_KERN);
                 }
             }
-                k_elem_silu<<<(MONO27B_SSM_CONV_CH + 255) / 256, 256>>>(sb, MONO27B_SSM_CONV_CH);
+                k_elem_silu<<<(MONO27B_SSM_CONV_CH + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(sb, MONO27B_SSM_CONV_CH);
                 CHECK_FINITE("ssm conv", sb, MONO27B_SSM_CONV_CH);
 
                 float * qr = sb;
@@ -2007,41 +2008,41 @@ extern "C" bool mono27b_engine_decode_step(
 
                 // Gate: reuse saved wqkv_gate from fb (avoid redundant matvec)
                 TRACE("re-g");
-                k_elem_silu<<<(MONO27B_SSM_D_INNER + 255) / 256, 256>>>(fb, MONO27B_SSM_D_INNER); TRACE("g_silu");
+                k_elem_silu<<<(MONO27B_SSM_D_INNER + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(fb, MONO27B_SSM_D_INNER); TRACE("g_silu");
                 // Fused batched RMS norm + multiply: combines 2 kernels into 1
                 {
                     const float * w_norm = WV(L.ssm_norm);
-                    k_rms_norm_mulw_mul_batched<<<MONO27B_SSM_DT_RANK, 256>>>(
-                        gb, w_norm, fb, kb, MONO27B_SSM_HEAD_V, MONO27B_SSM_DT_RANK, MONO27B_RMS_EPS);
+                    k_rms_norm_mulw_mul_batched<<<MONO27B_SSM_DT_RANK, g_kernel_cfg.rms_norm_threads>>>(
+                        gb, w_norm, fb, kb, MONO27B_SSM_HEAD_V, MONO27B_SSM_DT_RANK, g_kernel_cfg.rms_eps);
                 }
                 TRACE("grms+gmul2");
                 MV(L.ssm_out, kb, sb); TRACE("ssmo");
                 // Fused copy + residual add: h2 = sb + h
-                k_elem_copy_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(sb, h, h2, MONO27B_TARGET_HIDDEN); TRACE("scp+sadd");
+                k_elem_copy_add<<<(MONO27B_TARGET_HIDDEN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(sb, h, h2, MONO27B_TARGET_HIDDEN); TRACE("scp+sadd");
                 CHECK_FINITE_FMT("ssm layer %d output", il, h2, MONO27B_TARGET_HIDDEN);
             } else {
                 if (st->conv_state[ssm_i]) {
                     if (L.ssm_conv1d.ggml_type == MONO27B_GGML_TYPE_F16) {
-                        k_ssm_conv1d_u_f16<<<(MONO27B_SSM_CONV_CH + 255) / 256, 256>>>(
+                        k_ssm_conv1d_u_f16<<<(MONO27B_SSM_CONV_CH + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(
                             sb, (const __half *)L.ssm_conv1d.ptr, st->conv_state[ssm_i], sb,
                             MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_KERN);
                     } else {
-                        k_ssm_conv1d_u<<<(MONO27B_SSM_CONV_CH + 255) / 256, 256>>>(
+                        k_ssm_conv1d_u<<<(MONO27B_SSM_CONV_CH + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(
                             sb, (const float *)L.ssm_conv1d.ptr, st->conv_state[ssm_i], sb,
                             MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_KERN);
                     }
                 }
                 MV(L.ssm_out, sb, h2);
-                k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h2, h, MONO27B_TARGET_HIDDEN);
+                k_elem_add<<<(MONO27B_TARGET_HIDDEN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(h2, h, MONO27B_TARGET_HIDDEN);
                 CHECK_FINITE_FMT("ssm layer %d output", il, h2, MONO27B_TARGET_HIDDEN);
             }
 
         ssm_ffn:
             l_rms(h, h2, WV(L.post_norm), MONO27B_TARGET_HIDDEN); TRACE("porm");
             MV_PAIR(L.ffn_gate, L.ffn_up, h, fb, kb); TRACE("fg+fu");
-            k_elem_swiglu<<<(MONO27B_TARGET_FFN + 255) / 256, 256>>>(fb, kb, MONO27B_TARGET_FFN); TRACE("mul");
+            k_elem_swiglu<<<(MONO27B_TARGET_FFN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(fb, kb, MONO27B_TARGET_FFN); TRACE("mul");
             MV(L.ffn_down, fb, h); TRACE("fd");
-            k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h, h2, MONO27B_TARGET_HIDDEN); TRACE("res1");
+            k_elem_add<<<(MONO27B_TARGET_HIDDEN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(h, h2, MONO27B_TARGET_HIDDEN); TRACE("res1");
             ssm_i++;
         }
     }
@@ -2062,18 +2063,18 @@ extern "C" bool mono27b_engine_decode_step(
         int rb = (int)we->lm_head.row_blocks;
         auto * base = (const BlockQ6K *)we->lm_head.ptr;
         int n_q8 = rb * 8;
-        if (g_q8_scratch && n_q8 <= 2048) {
-            k_quant_q8_1<<<(n_q8 + 127) / 128, 128>>>(h2, g_q8_scratch, MONO27B_TARGET_HIDDEN);
+        if (g_q8_scratch && n_q8 <= g_kernel_cfg.q8_scratch_max_blocks) {
+            k_quant_q8_1<<<(n_q8 + g_kernel_cfg.quant_threads - 1) / g_kernel_cfg.quant_threads, g_kernel_cfg.quant_threads>>>(h2, g_q8_scratch, MONO27B_TARGET_HIDDEN);
             // No sync needed — quantize and matvec are on same stream, already ordered
-            k_q6k_mv_q8_dp4a<<<total, 128>>>(base, g_q8_scratch, out->logits, rb, total);
+            k_q6k_mv_q8_dp4a<<<total, g_kernel_cfg.q4k_q8_threads>>>(base, g_q8_scratch, out->logits, rb, total);
             sync_err = cudaDeviceSynchronize();
         }
-        if (!g_q8_scratch || n_q8 > 544 || sync_err != cudaSuccess) {
+        if (!g_q8_scratch || n_q8 > g_kernel_cfg.q8_dp4a_fallback || sync_err != cudaSuccess) {
             sync_err = cudaSuccess;
-            int chunk = 4096;
+            int chunk = g_kernel_cfg.lm_head_chunk_rows;
             for (int off = 0; off < total; off += chunk) {
                 int n = (off + chunk > total) ? total - off : chunk;
-                k_q6k_mt<<<n, 256>>>(base + (size_t)off * rb, h2, out->logits + off, rb, n);
+                k_q6k_mt<<<n, g_kernel_cfg.q6k_mt_threads>>>(base + (size_t)off * rb, h2, out->logits + off, rb, n);
             }
             sync_err = cudaDeviceSynchronize();
         }
@@ -2125,7 +2126,7 @@ extern "C" void mono27b_engine_free_logits(Mono27BLogitsOutput * out) {
 
 extern "C" int mono27b_engine_argmax(Mono27BExecutorState * st, const float * logits, int n) {
     if (!st->argmax_result || !logits || n <= 0) return 0;
-    k_argmax<<<1, 512>>>(logits, n, st->argmax_result);
+    k_argmax<<<1, g_kernel_cfg.argmax_threads>>>(logits, n, st->argmax_result);
     cudaDeviceSynchronize();
     int result = 0;
     cudaMemcpy(&result, st->argmax_result, sizeof(int), cudaMemcpyDeviceToHost);
@@ -2147,7 +2148,7 @@ extern "C" bool mono27b_engine_embed(
         return true;
     }
     if (we->tok_embd.ggml_type == MONO27B_GGML_TYPE_Q4_K) {
-        k_q4k_embed<<<1, 256>>>(
+        k_q4k_embed<<<1, g_kernel_cfg.elementwise_threads>>>(
             (const BlockQ4K *)we->tok_embd.ptr,
             token_id,
             hidden,

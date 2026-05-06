@@ -3,11 +3,32 @@
     "top_k": 40,
     "top_p": 0.95,
     "min_p": 0.05,
-    "temperature": 0.8
+    "temperature": 0.8,
+    "banned_tokens": ["", "<|im_end|>", "<|fim_pad|>", "<|repo_name|>", "<|file_sep|>", "<|vision_pad|>"]
   },
   "defaults": {
     "seed": 944990222,
     "max_ctx": 131072,
     "max_gen": 512
+  },
+  "kernels": {
+    "matvec_threads": 128,
+    "q4k_q8_threads": 128,
+    "q4k_q8_warp_count": 4,
+    "q4k_q8_smem_per_warp": 8,
+    "q6k_mt_threads": 256,
+    "elementwise_threads": 256,
+    "rms_norm_threads": 256,
+    "quant_threads": 128,
+    "argmax_threads": 512,
+    "lm_head_chunk_rows": 4096,
+    "q8_scratch_max_blocks": 2048,
+    "q8_dp4a_fallback_blocks": 544,
+    "rms_eps": 1e-6,
+    "rope_theta": 10000000.0
+  },
+  "chat_template": {
+    "system_prefix": "<|im_start|>user\n",
+    "system_suffix": "<|im_end|>\n<|im_start|>assistant\n༚\n"
   }
 }
