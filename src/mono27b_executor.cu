@@ -595,35 +595,17 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
 __launch_bounds__(128, 1)
 __global__ static void k_q6k_mv_q8_dp4a(const BlockQ6K * __restrict__ W, const BlockQ8_1 * __restrict__ q8,
                                         float * __restrict__ y, int rb, int rc) {
-    constexpr int NWARPS = 4;
-    constexpr int WARP_SZ = 32;
-    constexpr int IQS_PER_BLOCK = 32;
-
-    const int tid = WARP_SZ * threadIdx.y + threadIdx.x;
-    const int row = blockIdx.x;
+    int row = blockIdx.x;
     if (row >= rc) return;
-
-    const BlockQ6K * wp = W + (size_t)row * rb;
     float sum = 0.0f;
-
-    for (int idx = tid; idx < rb * IQS_PER_BLOCK; idx += NWARPS * WARP_SZ) {
-        int b   = idx / IQS_PER_BLOCK;
-        int iqs = idx % IQS_PER_BLOCK;
+    const BlockQ6K * wp = W + (size_t)row * rb;
+    for (int idx = threadIdx.x; idx < rb * 32; idx += 128) {
+        int b = idx / 32;
+        int iqs = idx % 32;
         sum += vec_dot_q6_K_q8_1(wp, q8 + b * 8, b, iqs);
     }
-
-    #pragma unroll
-    for (int o = WARP_SZ / 2; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, o);
-
-    __shared__ float smem[NWARPS];
-    if (threadIdx.x == 0) smem[threadIdx.y] = sum;
-    __syncthreads();
-    if (threadIdx.y == 0 && threadIdx.x < NWARPS) {
-        sum = smem[threadIdx.x];
-        #pragma unroll
-        for (int o = NWARPS / 2; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, o);
-        if (threadIdx.x == 0) y[row] = sum;
-    }
+    sum = block_reduce_sum<128>(sum);
+    if (threadIdx.x == 0) y[row] = sum;
 }
 
 // ─── IQ4_XS vec_dot (from vecdotq.cuh, mmvq path) ───────────────────────────
@@ -1825,7 +1807,7 @@ static void l_mv_q8_on(void * W, uint32_t ggml_type, int rb, int rc, float * y, 
             k_q5k_mv_q8<<<rc, dim3(32, 4), 0, stream>>>((const BlockQ5K *)W, g_q8_scratch, y, rb, rc);
             return;
         case MONO27B_GGML_TYPE_Q6_K:
-            k_q6k_mv_q8_dp4a<<<rc, dim3(32, 4), 0, stream>>>((const BlockQ6K *)W, g_q8_scratch, y, rb, rc);
+            k_q6k_mv_q8_dp4a<<<rc, 128, 0, stream>>>((const BlockQ6K *)W, g_q8_scratch, y, rb, rc);
             return;
         case MONO27B_GGML_TYPE_Q8_0:
             k_q80_mv_q8_dp4a<<<rc, dim3(32, 4), 0, stream>>>((const BlockQ8 *)W, g_q8_scratch, y, rb, rc);
@@ -2274,7 +2256,7 @@ extern "C" bool mono27b_engine_decode_step(
         int n_q8 = rb * 8;
         if (g_q8_scratch && n_q8 <= g_kernel_cfg.q8_scratch_max_blocks) {
             k_quant_q8_1<<<n_q8, 32>>>(h2, g_q8_scratch, MONO27B_TARGET_HIDDEN);
-            k_q6k_mv_q8_dp4a<<<total, dim3(32, 4)>>>(base, g_q8_scratch, out->logits, rb, total);
+            k_q6k_mv_q8_dp4a<<<total, 128>>>(base, g_q8_scratch, out->logits, rb, total);
         } else {
             int chunk = g_kernel_cfg.lm_head_chunk_rows;
             for (int off = 0; off < total; off += chunk) {
