@@ -536,6 +536,12 @@ __global__ static void k_elem_add(float * a, const float * b, int n) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) a[i] += b[i];
 }
 
+// Fused copy + residual: out[i] = src[i] + res[i]
+__global__ static void k_elem_copy_add(const float * src, const float * res, float * out, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+        out[i] = src[i] + res[i];
+}
+
 __global__ static void k_elem_mul(float * a, const float * b, int n) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) a[i] *= b[i];
 }
@@ -2219,8 +2225,8 @@ extern "C" bool mono27b_engine_decode_step(
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "rms_gated", h2, MONO27B_SSM_D_INNER, MONO27B_SSM_D_INNER);
                     debug_dump_vec(debug_fp, "ssm", il, pos, tok, "ssm_out", sb, MONO27B_TARGET_HIDDEN, MONO27B_TARGET_HIDDEN);
                 }
-                k_elem_copy<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h2, sb, MONO27B_TARGET_HIDDEN); TRACE("scp");
-                k_elem_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(h2, h, MONO27B_TARGET_HIDDEN); TRACE("sadd");
+                // Fused copy + residual add: h2 = sb + h
+                k_elem_copy_add<<<(MONO27B_TARGET_HIDDEN + 255) / 256, 256>>>(sb, h, h2, MONO27B_TARGET_HIDDEN); TRACE("scp+sadd");
                 CHECK_FINITE_FMT("ssm layer %d output", il, h2, MONO27B_TARGET_HIDDEN);
                 if (dump_step && il < MONO27B_TARGET_LAYERS) {
                     // layer_out will be dumped after FFN below
