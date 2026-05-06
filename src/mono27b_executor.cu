@@ -318,8 +318,58 @@ __global__ static void k_q4k_mv_q8_dp4a(const BlockQ4K * __restrict__ W, const B
     }
 }
 
-// 2-row-per-block variant (reduces kernel launch count by 2x)
-// Uses 2 pairs of warps: rows 0 and 1 processed in parallel
+// Fused gate+up Q4_K matvec with SwiGLU (silu(gate) * up). Replaces 3 launches
+// (gate matvec, up matvec, swiglu) with 1. Mirrors the has_fusion=true path
+// in llama.cpp's mul_mat_vec_q.
+__launch_bounds__(128, 1)
+__global__ static void k_q4k_q4k_swiglu_dp4a(
+    const BlockQ4K * __restrict__ Wg, const BlockQ4K * __restrict__ Wu,
+    const BlockQ8_1 * __restrict__ q8, float * __restrict__ y, int rb, int rc)
+{
+    constexpr int VDR = 2;
+    constexpr int QI = 32;
+    constexpr int NWARPS = 4;
+    constexpr int WARP_SZ = 32;
+    constexpr int blocks_per_iter = VDR * NWARPS * WARP_SZ / QI;  // 8
+
+    const int tid = WARP_SZ * threadIdx.y + threadIdx.x;
+    const int row = blockIdx.x;
+    if (row >= rc) return;
+
+    const BlockQ4K * gp = Wg + (size_t)row * rb;
+    const BlockQ4K * up = Wu + (size_t)row * rb;
+
+    float sum_g = 0.0f, sum_u = 0.0f;
+    for (int kbx = tid / (QI / VDR); kbx < rb; kbx += blocks_per_iter) {
+        const int kqs = VDR * (tid % (QI / VDR));
+        const int kby = kbx * 8;
+        sum_g += vec_dot_q4_K_q8_1(gp, q8 + kby, kbx, kqs);
+        sum_u += vec_dot_q4_K_q8_1(up, q8 + kby, kbx, kqs);
+    }
+
+    #pragma unroll
+    for (int offset = WARP_SZ / 2; offset > 0; offset >>= 1) {
+        sum_g += __shfl_xor_sync(0xffffffff, sum_g, offset);
+        sum_u += __shfl_xor_sync(0xffffffff, sum_u, offset);
+    }
+
+    __shared__ float smem_g[NWARPS], smem_u[NWARPS];
+    if (threadIdx.x == 0) { smem_g[threadIdx.y] = sum_g; smem_u[threadIdx.y] = sum_u; }
+    __syncthreads();
+    if (threadIdx.y == 0 && threadIdx.x < NWARPS) {
+        sum_g = smem_g[threadIdx.x];
+        sum_u = smem_u[threadIdx.x];
+        #pragma unroll
+        for (int offset = NWARPS / 2; offset > 0; offset >>= 1) {
+            sum_g += __shfl_xor_sync(0xffffffff, sum_g, offset);
+            sum_u += __shfl_xor_sync(0xffffffff, sum_u, offset);
+        }
+        if (threadIdx.x == 0) {
+            float silu = sum_g / (1.0f + __expf(-sum_g));
+            y[row] = silu * sum_u;
+        }
+    }
+}
 
 // ─── Q5_K vec_dot (from vecdotq.cuh, vmmq path) ─────────────────────────────
 
@@ -1864,6 +1914,32 @@ extern "C" void mono27b_engine_print_timing(Mono27BExecutorState * st) {
     (w2).ptr, (w2).ggml_type, (w2).row_blocks, (w2).row_count, y2, \
     x, (w1).row_blocks, (cudaStream_t)st->stream1, (cudaEvent_t)st->sync_event)
 
+// Fused gate+up Q4_K matvec with SwiGLU. Falls back to MV_PAIR + k_elem_swiglu
+// if either weight is not Q4_K. Saves 2 launches and amortizes weight reads.
+static inline void l_ffn_gate_up_swiglu(
+    const WeightView & gate, const WeightView & up,
+    const float * x, float * out_swiglu, float * tmp_up)
+{
+    if (gate.ggml_type == MONO27B_GGML_TYPE_Q4_K && up.ggml_type == MONO27B_GGML_TYPE_Q4_K
+        && gate.row_blocks == up.row_blocks && gate.row_count == up.row_count
+        && g_q8_scratch) {
+        int n_q8 = (int)gate.row_blocks * 8;
+        if (n_q8 <= g_kernel_cfg.q8_scratch_max_blocks) {
+            l_quant_q8_n(x, n_q8);
+            k_q4k_q4k_swiglu_dp4a<<<gate.row_count, dim3(32, 4)>>>(
+                (const BlockQ4K *)gate.ptr, (const BlockQ4K *)up.ptr,
+                g_q8_scratch, out_swiglu, (int)gate.row_blocks, (int)gate.row_count);
+            return;
+        }
+    }
+    // Fallback: original gate+up + separate swiglu kernel.
+    l_mv_pair(gate.ptr, gate.ggml_type, gate.row_blocks, gate.row_count, out_swiglu,
+              up.ptr, up.ggml_type, up.row_blocks, up.row_count, tmp_up,
+              x, gate.row_blocks, nullptr, nullptr);
+    k_elem_swiglu<<<(MONO27B_TARGET_FFN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads,
+                    g_kernel_cfg.elementwise_threads>>>(out_swiglu, tmp_up, MONO27B_TARGET_FFN);
+}
+
 // Production-performance CHECK_FINITE: skip finite checks for speed.
 // In debug mode, include them to catch NaN/Inf early.
 #ifdef MONO27B_DEBUG_FINITE
@@ -2035,8 +2111,8 @@ extern "C" bool mono27b_engine_decode_step(
             k_elem_add<<<(MONO27B_TARGET_HIDDEN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(h2, h, MONO27B_TARGET_HIDDEN); TRACE("res1");
 
             l_rms(h, h2, WV(L.post_norm), MONO27B_TARGET_HIDDEN); TRACE("porm");
-            MV_PAIR(L.ffn_gate, L.ffn_up, h, fb, kb); TRACE("fg+fu");
-            k_elem_swiglu<<<(MONO27B_TARGET_FFN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(fb, kb, MONO27B_TARGET_FFN); TRACE("mul");
+            l_ffn_gate_up_swiglu(L.ffn_gate, L.ffn_up, h, fb, kb); TRACE("fg+fu+swi");
+            /* fused into l_ffn_gate_up_swiglu */
             MV(L.ffn_down, fb, h); TRACE("fd");
             k_elem_add<<<(MONO27B_TARGET_HIDDEN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(h, h2, MONO27B_TARGET_HIDDEN);
             CHECK_FINITE_FMT("attn layer %d output", il, h, MONO27B_TARGET_HIDDEN);
@@ -2130,8 +2206,8 @@ extern "C" bool mono27b_engine_decode_step(
 
         ssm_ffn:
             l_rms(h, h2, WV(L.post_norm), MONO27B_TARGET_HIDDEN); TRACE("porm");
-            MV_PAIR(L.ffn_gate, L.ffn_up, h, fb, kb); TRACE("fg+fu");
-            k_elem_swiglu<<<(MONO27B_TARGET_FFN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(fb, kb, MONO27B_TARGET_FFN); TRACE("mul");
+            l_ffn_gate_up_swiglu(L.ffn_gate, L.ffn_up, h, fb, kb); TRACE("fg+fu+swi");
+            /* fused into l_ffn_gate_up_swiglu */
             MV(L.ffn_down, fb, h); TRACE("fd");
             k_elem_add<<<(MONO27B_TARGET_HIDDEN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(h, h2, MONO27B_TARGET_HIDDEN); TRACE("res1");
             ssm_i++;
