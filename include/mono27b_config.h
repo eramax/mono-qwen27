@@ -3,10 +3,8 @@
 #include "mono27b_format.h"
 
 #include <cstddef>
-#include <cstdio>
 
-// Global quiet flag — suppresses DBG messages from executor
-extern bool g_mono27b_quiet;
+extern bool g_mono27b_verbose;
 
 // Model architecture constants — Qwen3.5-27B hybrid
 constexpr int MONO27B_TARGET_N_HEAD     = 24;
@@ -30,10 +28,9 @@ constexpr int MONO27B_SSM_HEAD_V    = MONO27B_SSM_D_INNER / MONO27B_SSM_DT_RANK;
 constexpr int MONO27B_SSM_HEAD_K    = MONO27B_SSM_D_STATE;
 constexpr int MONO27B_SSM_CONV_CH   = MONO27B_SSM_D_INNER + 2 * MONO27B_SSM_N_GROUP * MONO27B_SSM_D_STATE;
 
-// M-RoPE: Qwen3.5 uses sections [text=11, height=11, width=10, extra=0] pairs = 64 total dims.
-// For text-only input, only the text section uses the token position.
-constexpr int MONO27B_N_ROT_DIMS = 64;
-constexpr int MONO27B_N_ROT_DIMS_S0 = 22; // section 0: 11 pairs * 2 = 22 dims
+// M-RoPE sections
+constexpr int MONO27B_N_ROT_DIMS    = 64;
+constexpr int MONO27B_N_ROT_DIMS_S0 = 22;
 
 struct Mono27BRuntimeLayout {
     size_t kv_bytes = 0;
@@ -102,23 +99,20 @@ struct Mono27BExecutorState {
     float * conv_state[MONO27B_TARGET_LAYERS - MONO27B_TARGET_FA_LAYERS];
     float * work_buf;
     size_t work_buf_size;
-    void * q8_scratch;  // Q8_1 buffer for matvec (544 blocks × 36 bytes)
-    int * argmax_result;  // GPU-side argmax output (single int)
-    // CUDA graph capture for decode_step
-    void * cuda_graph;       // cudaGraph_t
-    void * cuda_graph_exec;  // cudaGraphExec_t
+    void * q8_scratch;
+    int * argmax_result;
+    void * cuda_graph;
+    void * cuda_graph_exec;
     int graph_captured;
     int max_ctx;
     int kv_len;
-    // Concurrent streams for paired matvec execution
-    void * stream1;  // cudaStream_t, for concurrent matvec
-    void * sync_event;  // cudaEvent_t, for cross-stream sync
+    void * stream1;
+    void * sync_event;
 
 #ifdef MONO27B_TIMING
-    // Timing infrastructure (opaque to avoid cuda_runtime.h in C++ files)
     static constexpr int MAX_TIMING_EVENTS = 65536;
     static constexpr int MAX_TIMING_LABELS = 64;
-    void * timing_events[MAX_TIMING_EVENTS];  // cast to cudaEvent_t in executor
+    void * timing_events[MAX_TIMING_EVENTS];
     int timing_event_count;
     int timing_event_capacity;
     const char * timing_labels[MAX_TIMING_EVENTS];
@@ -134,51 +128,6 @@ struct Mono27BLogitsOutput {
     float * logits;
 };
 
-extern "C" bool mono27b_executor_init(const Mono27BBlobHeader * header,
-                                       int max_ctx,
-                                       Mono27BRuntimeLayout * layout,
-                                       char * error, size_t error_cap);
-
-extern "C" bool mono27b_executor_load_weights(
-    const unsigned char * target_host, size_t target_bytes,
-    uint32_t target_row_elems, uint32_t target_row_count,
-    const unsigned char * draft_host, size_t draft_bytes,
-    uint32_t draft_row_elems, uint32_t draft_row_count,
-    const unsigned char * head_host, size_t head_bytes,
-    uint32_t head_row_elems, uint32_t head_row_count,
-    Mono27BExecutorWeights * out,
-    char * error, size_t error_cap);
-
-extern "C" void mono27b_executor_free_weights(Mono27BExecutorWeights * w);
-
-extern "C" bool mono27b_executor_set_norm_scale(
-    Mono27BExecutorWeights * w,
-    const float * scale_host, uint32_t elems,
-    char * error, size_t error_cap);
-
-extern "C" bool mono27b_executor_run_step(
-    const Mono27BExecutorWeights * w,
-    const int32_t * token_ids, size_t token_count,
-    int32_t * generated_ids, size_t generated_cap,
-    size_t * generated_count,
-    char * diag, size_t diag_cap,
-    char * error, size_t error_cap);
-
-extern "C" bool mono27b_executor_run_prompt(
-    const char * prompt,
-    const int32_t * prompt_ids, size_t prompt_id_count,
-    const unsigned char * target_tensor, size_t target_tensor_bytes,
-    uint32_t target_row_elems, uint32_t target_row_count,
-    const unsigned char * draft_tensor, size_t draft_tensor_bytes,
-    uint32_t draft_row_elems, uint32_t draft_row_count,
-    const unsigned char * output_head_tensor, size_t output_head_tensor_bytes,
-    uint32_t output_head_row_elems, uint32_t output_head_row_count,
-    int32_t * generated_ids, size_t generated_cap,
-    size_t * generated_count,
-    char * output, size_t output_cap,
-    char * error, size_t error_cap);
-
-// New engine API
 extern "C" bool mono27b_engine_load_weights(
     const unsigned char * gguf_data, uint64_t data_offset,
     const struct Mono27BGgufTensorInfo * tensors, size_t tensor_count,
@@ -202,12 +151,9 @@ extern "C" bool mono27b_engine_decode_step(
     Mono27BExecutorState * state,
     int token_id, int position,
     Mono27BLogitsOutput * output,
-    FILE * debug_fp,
-    int debug_pos,
     char * error, size_t error_cap);
 
 extern "C" void mono27b_engine_free_logits(Mono27BLogitsOutput * output);
 
-// GPU-side argmax: avoids 1MB D2H logits copy. Returns the token id.
 extern "C" int mono27b_engine_argmax(Mono27BExecutorState * st, const float * logits, int n);
 extern "C" void mono27b_engine_print_timing(Mono27BExecutorState * st);

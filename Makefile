@@ -11,13 +11,13 @@ build:
 	cmake --build build -j$(shell nproc)
 
 test: build
-	./build/mono27b_chat -m $(MODEL_PATH) -p $(PROMPT) --gen $(GEN) --ctx $(CTX) --seed $(SEED) --quiet
+	./build/mono27b_chat -m $(MODEL_PATH) -p $(PROMPT) --gen $(GEN) --ctx $(CTX) --seed $(SEED)
 
 quick-test: build
-	./build/mono27b_chat -m $(MODEL_PATH) -p "The quick brown fox" --gen 5 --ctx 2048 --quiet
+	./build/mono27b_chat -m $(MODEL_PATH) -p "The quick brown fox" --gen 5 --ctx 2048
 
 large-test: build
-	./build/mono27b_chat -m $(MODEL_PATH) -p "Artificial intelligence is" --gen 20 --ctx 8192 --quiet
+	./build/mono27b_chat -m $(MODEL_PATH) -p "Artificial intelligence is" --gen 20 --ctx 8192
 
 verify: build
 	$(MAKE) -f debug/verify/Makefile verify GGUF=$(MODEL_PATH)
@@ -43,7 +43,7 @@ compare-perf:
 	@cmake -S . -B build -DCMAKE_CXX_COMPILER=/usr/bin/g++ -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release -DMONO27B_TIMING=ON
 	@cmake --build build -j$(shell nproc)
 	@echo "Running mono27b with timing instrumentation (gen 30)..."
-	@./build/mono27b_chat -m $(MODEL_PATH) -p "The quick brown fox" --gen 30 --ctx $(CTX) --seed $(SEED) --quiet > /tmp/mono27b_timing.txt 2>&1
+	@./build/mono27b_chat -m $(MODEL_PATH) -p "The quick brown fox" --gen 30 --ctx $(CTX) --seed $(SEED) > /tmp/mono27b_timing.txt 2>&1
 	@echo "Running llama-bench for reference..."
 	@/mnt/data1/projects/llm/llama.cpp/build/bin/llama-bench -m $(MODEL_PATH) -p 4 -n 30 > /tmp/llama_bench.txt 2>&1
 	@python3 scripts/compare_perf.py /tmp/mono27b_timing.txt $(MODEL_PATH)

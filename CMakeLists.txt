@@ -9,7 +9,6 @@ add_executable(mono27b_chat
     src/mono27b_chat.cpp
     src/mono27b_cli.cpp
     src/mono27b_blob.cpp
-    src/mono27b_packer.cpp
     src/mono27b_gguf.cpp
     src/mono27b_tokenizer.cpp
     src/mono27b_executor.cu

@@ -1,0 +1,13 @@
+{
+  "sampling": {
+    "top_k": 40,
+    "top_p": 0.95,
+    "min_p": 0.05,
+    "temperature": 0.8
+  },
+  "defaults": {
+    "seed": 944990222,
+    "max_ctx": 131072,
+    "max_gen": 512
+  }
+}
