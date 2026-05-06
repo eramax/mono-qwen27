@@ -14,7 +14,7 @@ test: build
 	./build/mono27b_chat -m $(MODEL_PATH) -p $(PROMPT) --gen $(GEN) --ctx $(CTX) --seed $(SEED)
 
 run: build
-	./build/mono27b_chat -m $(MODEL_PATH) -p "$(PROMPT)" --chat --ctx 8192 --gen 8192
+	./build/mono27b_chat -m $(MODEL_PATH) -p "$(PROMPT)" --gen $(GEN) --ctx $(CTX)
 
 quick-test: build
 	./build/mono27b_chat -m $(MODEL_PATH) -p "The quick brown fox" --gen 5 --ctx 2048
