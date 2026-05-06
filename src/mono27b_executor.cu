@@ -676,16 +676,30 @@ __global__ static void k_rms_norm_mulw_batched(
     if (row >= n_rows) return;
     const float * xr = x + (size_t)row * row_len;
     float * yr = y + (size_t)row * row_len;
-    __shared__ double sh[256];
-    double sum = 0.0;
-    for (int i = threadIdx.x; i < row_len; i += 256) sum += (double)xr[i] * (double)xr[i];
-    sh[threadIdx.x] = sum;
+    constexpr int BLK = 256;
+    constexpr int NWARPS = BLK / 32;
+    int tid = threadIdx.x;
+    float tmp = 0.0f;
+    for (int i = tid; i < row_len; i += BLK) { float v = xr[i]; tmp += v * v; }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) tmp += __shfl_xor_sync(0xffffffff, tmp, o);
+    __shared__ float sp[NWARPS];
+    int warp = tid >> 5, lane = tid & 31;
+    if (lane == 0) sp[warp] = tmp;
     __syncthreads();
-    for (int s = 128; s > 0; s >>= 1) { if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s]; __syncthreads(); }
-    double total = sh[0];
-    double scale = 1.0 / sqrt(total / (double)row_len + (double)eps);
-    for (int i = threadIdx.x; i < row_len; i += 256)
-        yr[i] = (float)((double)xr[i] * scale * (double)(w ? w[i] : 1.0f));
+    if (warp == 0) {
+        tmp = (lane < NWARPS) ? sp[lane] : 0.0f;
+        #pragma unroll
+        for (int o = NWARPS / 2; o > 0; o >>= 1) tmp += __shfl_xor_sync(0xffffffff, tmp, o);
+        if (lane == 0) sp[0] = tmp;
+    }
+    __syncthreads();
+    const float scale = rsqrtf(sp[0] / (float)row_len + eps);
+    if (w) {
+        for (int i = tid; i < row_len; i += BLK) yr[i] = scale * xr[i] * w[i];
+    } else {
+        for (int i = tid; i < row_len; i += BLK) yr[i] = scale * xr[i];
+    }
 }
 
 // Batched fused kernel: RMS norm + element-wise multiply in one launch
@@ -700,18 +714,26 @@ __global__ static void k_rms_norm_mulw_mul_batched(
     const float * xr = x + (size_t)row * row_len;
     const float * gr = gate + (size_t)row * row_len;
     float * yr = y + (size_t)row * row_len;
-
-    __shared__ double sh[256];
-    double sum = 0.0;
-    for (int i = threadIdx.x; i < row_len; i += 256) sum += (double)xr[i] * (double)xr[i];
-    sh[threadIdx.x] = sum;
+    constexpr int BLK = 256;
+    constexpr int NWARPS = BLK / 32;
+    int tid = threadIdx.x;
+    float tmp = 0.0f;
+    for (int i = tid; i < row_len; i += BLK) { float v = xr[i]; tmp += v * v; }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) tmp += __shfl_xor_sync(0xffffffff, tmp, o);
+    __shared__ float sp[NWARPS];
+    int warp = tid >> 5, lane = tid & 31;
+    if (lane == 0) sp[warp] = tmp;
     __syncthreads();
-    for (int s = 128; s > 0; s >>= 1) { if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s]; __syncthreads(); }
-    double total = sh[0];
-    double scale = 1.0 / sqrt(total / (double)row_len + (double)eps);
-
-    for (int i = threadIdx.x; i < row_len; i += 256)
-        yr[i] = ((float)((double)xr[i] * scale * (double)w[i])) * gr[i];
+    if (warp == 0) {
+        tmp = (lane < NWARPS) ? sp[lane] : 0.0f;
+        #pragma unroll
+        for (int o = NWARPS / 2; o > 0; o >>= 1) tmp += __shfl_xor_sync(0xffffffff, tmp, o);
+        if (lane == 0) sp[0] = tmp;
+    }
+    __syncthreads();
+    const float scale = rsqrtf(sp[0] / (float)row_len + eps);
+    for (int i = tid; i < row_len; i += BLK) yr[i] = (scale * xr[i] * w[i]) * gr[i];
 }
 
 // ─── Elementwise kernels ─────────────────────────────────────────────────────
