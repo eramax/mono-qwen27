@@ -277,7 +277,8 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
 // than llama.cpp's sequential accumulation in warp 0
 // Grid: rc blocks (one per output row)
 // Block: (32, 4) = 128 threads total (4 warps)
-__global__ static void k_q4k_mv_q8_dp4a(const BlockQ4K * W, const BlockQ8_1 * q8, float * y, int rb, int rc) {
+__launch_bounds__(128, 1)
+__global__ static void k_q4k_mv_q8_dp4a(const BlockQ4K * __restrict__ W, const BlockQ8_1 * __restrict__ q8, float * __restrict__ y, int rb, int rc) {
     constexpr int VDR = 2;       // Vector Dot Ratio
     constexpr int QI = 32;       // Q4_K quant dimension
     constexpr int NWARPS = 4;    // Warps per block
@@ -302,31 +303,18 @@ __global__ static void k_q4k_mv_q8_dp4a(const BlockQ4K * W, const BlockQ8_1 * q8
         sum += vec_dot_q4_K_q8_1(wp, q8 + kby, kbx, kqs);
     }
 
-    // Each warp reduces its own partial sums (all warps work in parallel)
-#pragma unroll
-    for (int offset = WARP_SZ / 2; offset > 0; offset >>= 1) {
-        sum += __shfl_xor_sync(0xffffffff, sum, offset);
-    }
+    // Warp-level reduction within each warp
+    #pragma unroll
+    for (int offset = WARP_SZ / 2; offset > 0; offset >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, offset);
 
-    // One value per warp; store to shared memory and reduce across warps
     __shared__ float smem[NWARPS];
-    if (threadIdx.x == 0) {
-        smem[threadIdx.y] = sum;
-    }
+    if (threadIdx.x == 0) smem[threadIdx.y] = sum;
     __syncthreads();
-
-    // Final cross-warp reduction in warp 0
     if (threadIdx.y == 0 && threadIdx.x < NWARPS) {
         sum = smem[threadIdx.x];
-        // Shuffle-reduce NWARPS values within first few lanes of warp 0
-#pragma unroll
-        for (int offset = NWARPS / 2; offset > 0; offset >>= 1) {
-            sum += __shfl_xor_sync(0xffffffff, sum, offset);
-        }
-    }
-
-    if (threadIdx.x == 0 && threadIdx.y == 0) {
-        y[row] = sum;
+        #pragma unroll
+        for (int offset = NWARPS / 2; offset > 0; offset >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, offset);
+        if (threadIdx.x == 0) y[row] = sum;
     }
 }
 
@@ -411,71 +399,88 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, *(const __half2 *)&bq5_K->d, d8);
 }
 
-__global__ static void k_q5k_mv_q8(const BlockQ5K * W, const BlockQ8_1 * q8, float * y, int rb, int rc) {
-    int row = blockIdx.x;
-    if (row >= rc) return;
-    float sum = 0.0f;
-    const BlockQ5K * wp = W + (size_t)row * rb;
-    for (int idx = threadIdx.x; idx < rb * 16; idx += 128) {
-        int b = idx / 16;
-        int iqs = (idx % 16) * 2;
-        sum += vec_dot_q5_K_q8_1(wp, q8 + b * 8, b, iqs);
-    }
-    sum = block_reduce_sum<128>(sum);
-    if (threadIdx.x == 0) y[row] = sum;
-}
-
-// Optimized Q5_K matvec kernel using 4-warp 2D layout (matching Q4_K)
-// Grid: rc blocks (one per output row), Block: dim3(32, 4) = 128 threads total
-__global__ static void k_q5k_mv_q8_dp4a(const BlockQ5K * W, const BlockQ8_1 * q8, float * y, int rb, int rc) {
-    constexpr int VDR = 2;       // Vector Dot Ratio
-    constexpr int QI = 32;       // iqs values per Q5_K block = 16 unique pairs
-    constexpr int NWARPS = 4;    // Warps per block
+// Multi-warp Q5_K dp4a kernel (mirrors Q4_K layout: 4 warps, warp-level reduction)
+__launch_bounds__(128, 1)
+__global__ static void k_q5k_mv_q8(const BlockQ5K * __restrict__ W, const BlockQ8_1 * __restrict__ q8,
+                                   float * __restrict__ y, int rb, int rc) {
+    constexpr int VDR = 2;
+    constexpr int QI = 32;
+    constexpr int NWARPS = 4;
     constexpr int WARP_SZ = 32;
+    constexpr int blocks_per_iter = VDR * NWARPS * WARP_SZ / QI;  // = 8
 
     const int tid = WARP_SZ * threadIdx.y + threadIdx.x;
     const int row = blockIdx.x;
-
     if (row >= rc) return;
 
     const BlockQ5K * wp = W + (size_t)row * rb;
-
-    // All threads stride through blocks in parallel
-    constexpr int blocks_per_iter = VDR * NWARPS * WARP_SZ / QI;  // = 8
-
     float sum = 0.0f;
 
     for (int kbx = tid / (QI / VDR); kbx < rb; kbx += blocks_per_iter) {
         const int kqs = VDR * (tid % (QI / VDR));
-        const int kby = kbx * 8;
-        sum += vec_dot_q5_K_q8_1(wp, q8 + kby, kbx, kqs);
+        sum += vec_dot_q5_K_q8_1(wp, q8 + kbx * 8, kbx, kqs);
     }
 
-    // Each warp reduces its own partial sums (all warps work in parallel)
-#pragma unroll
-    for (int offset = WARP_SZ / 2; offset > 0; offset >>= 1) {
-        sum += __shfl_xor_sync(0xffffffff, sum, offset);
-    }
+    #pragma unroll
+    for (int o = WARP_SZ / 2; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, o);
 
-    // One value per warp; store to shared memory and reduce across warps
     __shared__ float smem[NWARPS];
-    if (threadIdx.x == 0) {
-        smem[threadIdx.y] = sum;
-    }
+    if (threadIdx.x == 0) smem[threadIdx.y] = sum;
     __syncthreads();
-
-    // Final cross-warp reduction in warp 0
     if (threadIdx.y == 0 && threadIdx.x < NWARPS) {
         sum = smem[threadIdx.x];
-        // Shuffle-reduce NWARPS values within first few lanes of warp 0
-#pragma unroll
-        for (int offset = NWARPS / 2; offset > 0; offset >>= 1) {
-            sum += __shfl_xor_sync(0xffffffff, sum, offset);
+        #pragma unroll
+        for (int o = NWARPS / 2; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, o);
+        if (threadIdx.x == 0) y[row] = sum;
+    }
+}
+
+// ─── Q8_0 dp4a matvec (ported from llama.cpp mmvq) ──────────────────────────
+// rb = q8_0 blocks per row. q8_1 input has 1:1 block correspondence (both 32 elem).
+__launch_bounds__(128, 1)
+__global__ static void k_q80_mv_q8_dp4a(const BlockQ8 * __restrict__ W, const BlockQ8_1 * __restrict__ q8,
+                                        float * __restrict__ y, int rb, int rc) {
+    constexpr int VDR = 2;
+    constexpr int QI = 8;        // QI8_0 = QK8_0/4 = 8 ints per block
+    constexpr int NWARPS = 4;
+    constexpr int WARP_SZ = 32;
+    constexpr int blocks_per_iter = VDR * NWARPS * WARP_SZ / QI;  // = 32
+
+    const int tid = WARP_SZ * threadIdx.y + threadIdx.x;
+    const int row = blockIdx.x;
+    if (row >= rc) return;
+
+    const BlockQ8 * wp = W + (size_t)row * rb;
+    float sum = 0.0f;
+
+    for (int kbx = tid / (QI / VDR); kbx < rb; kbx += blocks_per_iter) {
+        const int iqs = VDR * (tid % (QI / VDR));
+        const BlockQ8 * bq = wp + kbx;
+        const BlockQ8_1 * by = q8 + kbx;
+
+        int sumi = 0;
+        #pragma unroll
+        for (int i = 0; i < VDR; ++i) {
+            // bq->qs is at byte offset 2 within BlockQ8 (after __half d): unaligned int read
+            int v = get_int_b2(bq->qs, iqs + i);
+            int u = ((const int *)by->qs)[iqs + i];
+            sumi = ggml_cuda_dp4a(v, u, sumi);
         }
+        sum += __half2float(bq->d) * __low2float(by->ds) * (float)sumi;
     }
 
-    if (threadIdx.x == 0 && threadIdx.y == 0) {
-        y[row] = sum;
+    // Warp reduce
+    #pragma unroll
+    for (int o = WARP_SZ / 2; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, o);
+
+    __shared__ float smem[NWARPS];
+    if (threadIdx.x == 0) smem[threadIdx.y] = sum;
+    __syncthreads();
+    if (threadIdx.y == 0 && threadIdx.x < NWARPS) {
+        sum = smem[threadIdx.x];
+        #pragma unroll
+        for (int o = NWARPS / 2; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, o);
+        if (threadIdx.x == 0) y[row] = sum;
     }
 }
 
@@ -527,18 +532,39 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, __half2float(bq6_K->d), d8);
 }
 
-__global__ static void k_q6k_mv_q8_dp4a(const BlockQ6K * W, const BlockQ8_1 * q8, float * y, int rb, int rc) {
-    int row = blockIdx.x;
+// Multi-warp Q6_K dp4a kernel (4 warps, warp-level reduction)
+__launch_bounds__(128, 1)
+__global__ static void k_q6k_mv_q8_dp4a(const BlockQ6K * __restrict__ W, const BlockQ8_1 * __restrict__ q8,
+                                        float * __restrict__ y, int rb, int rc) {
+    constexpr int NWARPS = 4;
+    constexpr int WARP_SZ = 32;
+    constexpr int IQS_PER_BLOCK = 32;
+
+    const int tid = WARP_SZ * threadIdx.y + threadIdx.x;
+    const int row = blockIdx.x;
     if (row >= rc) return;
-    float sum = 0.0f;
+
     const BlockQ6K * wp = W + (size_t)row * rb;
-    for (int idx = threadIdx.x; idx < rb * 32; idx += 128) {
-        int b = idx / 32;
-        int iqs = idx % 32;
+    float sum = 0.0f;
+
+    for (int idx = tid; idx < rb * IQS_PER_BLOCK; idx += NWARPS * WARP_SZ) {
+        int b   = idx / IQS_PER_BLOCK;
+        int iqs = idx % IQS_PER_BLOCK;
         sum += vec_dot_q6_K_q8_1(wp, q8 + b * 8, b, iqs);
     }
-    sum = block_reduce_sum<128>(sum);
-    if (threadIdx.x == 0) y[row] = sum;
+
+    #pragma unroll
+    for (int o = WARP_SZ / 2; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, o);
+
+    __shared__ float smem[NWARPS];
+    if (threadIdx.x == 0) smem[threadIdx.y] = sum;
+    __syncthreads();
+    if (threadIdx.y == 0 && threadIdx.x < NWARPS) {
+        sum = smem[threadIdx.x];
+        #pragma unroll
+        for (int o = NWARPS / 2; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, o);
+        if (threadIdx.x == 0) y[row] = sum;
+    }
 }
 
 // ─── IQ4_XS vec_dot (from vecdotq.cuh, mmvq path) ───────────────────────────
@@ -967,27 +993,6 @@ __global__ static void k_l2_norm_g(float * d, int gs, int ng) {
     for (int i = threadIdx.x; i < gs; i += 128) x[i] *= scale;
 }
 
-// Fused dual L2 norm: handles Q (first n_groups blocks) and K (next n_groups blocks) in one launch
-__global__ static void k_l2_norm_qk(float * q, float * k, int gs, int ng) {
-    int g = blockIdx.x;
-    int is_k = (g >= ng) ? 1 : 0;
-    float * x = is_k ? (k + (size_t)(g - ng) * gs) : (q + (size_t)g * gs);
-    if (g >= 2 * ng) return;
-
-    __shared__ double sh[128];
-    double s = 0.0;
-    for (int i = threadIdx.x; i < gs; i += 128) s += (double)x[i] * (double)x[i];
-    sh[threadIdx.x] = s;
-    __syncthreads();
-    for (int step = 64; step > 0; step >>= 1) {
-        if (threadIdx.x < step) sh[threadIdx.x] += sh[threadIdx.x + step];
-        __syncthreads();
-    }
-    double sum_sq = sh[0];
-    const float scale = rsqrtf(fmaxf((float)sum_sq, MONO27B_RMS_EPS * MONO27B_RMS_EPS));
-    for (int i = threadIdx.x; i < gs; i += 128) x[i] *= scale;
-}
-
 // ─── M-RoPE ──────────────────────────────────────────────────────────────────
 // Qwen3.5 uses multi-section RoPE with 4 position streams.
 // For text tokens, llama.cpp expands a 1D token position into:
@@ -1034,7 +1039,7 @@ __global__ static void k_mrope(
 // ─── Q4_K embedding gather (for single token) ────────────────────────────────
 
 __global__ static void k_q4k_embed(const BlockQ4K * T, float * out, int row_elems, int row_blocks) {
-    int tok = g_tok_id;  // read device symbol — safe for CUDA graph replay
+    int tok = g_tok_id;
     const BlockQ4K * rp = T + (size_t)tok * row_blocks;
     int tid = threadIdx.x;
     // Each thread handles one element position
@@ -1154,21 +1159,6 @@ __global__ static void k_write_kv_cache(
     size_t off = ((size_t)pos * n_kvh + hh) * hd + h;
     kv_k[off] = kb[hh * hd + h];
     kv_v[off] = kb[n_kvh * hd + hh * hd + h];
-}
-
-// ─── SSM dt (fused sigmoid + softplus + mul) ────────────────────────────────
-// Replaces three separate kernels: k_elem_sigmoid, k_elem_softplus, k_elem_mul
-__global__ static void k_ssm_dt_triple(
-    float * beta_out, float * alpha_out,
-    const float * dt_bias, const float * ssm_a_log, int dr)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= dr) return;
-    // beta: sigmoid
-    beta_out[i] = 1.0f / (1.0f + expf(-beta_out[i]));
-    // alpha: softplus(x + bias) * a_log
-    float x = alpha_out[i] + dt_bias[i];
-    alpha_out[i] = ((x > 20.0f) ? x : logf(1.0f + expf(x))) * ssm_a_log[i];
 }
 
 // ─── SSM conv1d (1 thread per channel) ───────────────────────────────────────
@@ -1680,17 +1670,21 @@ static int g_q8_cached_rb = 0;
 static void l_mv_q8(void * W, uint32_t ggml_type, int rb, int rc, float * y);
 static void l_mv_fallback(void * W, uint32_t ggml_type, int rb, int rc, const float * x, float * y);
 
-// Quantize x to Q8_1 in the global scratch buffer; returns n_q8 blocks used
-static int l_quant_q8(const float * x, int rb) {
-    int n_q8 = rb * 8;
+// Number of q8_1 input blocks needed for a matvec with weight type `t` and rb weight blocks per row.
+// Q8_0: 1:1 (block size 32). All K-quants: 1:8 (block size 256 → 8 q8_1 blocks of 32).
+static inline int l_n_q8_for(uint32_t t, int rb) {
+    return (t == MONO27B_GGML_TYPE_Q8_0) ? rb : rb * 8;
+}
+
+// Quantize x to Q8_1 in the global scratch buffer; returns n_q8 blocks used.
+// n_q8 is the q8_1 block count (each block = 32 input elements).
+static int l_quant_q8_n(const float * x, int n_q8) {
     if (g_q8_scratch && n_q8 <= g_kernel_cfg.q8_scratch_max_blocks) {
-        // Skip if this exact input+rb was already quantized (common within a layer)
-        if (g_q8_cached_input == x && g_q8_cached_rb == rb) {
-            return n_q8;
-        }
-        k_quant_q8_1<<<(n_q8 + g_kernel_cfg.quant_threads - 1) / g_kernel_cfg.quant_threads, g_kernel_cfg.quant_threads>>>(x, g_q8_scratch, n_q8 * 32);
+        if (g_q8_cached_input == x && g_q8_cached_rb == n_q8) return n_q8;
+        k_quant_q8_1<<<(n_q8 + g_kernel_cfg.quant_threads - 1) / g_kernel_cfg.quant_threads,
+                      g_kernel_cfg.quant_threads>>>(x, g_q8_scratch, n_q8 * 32);
         g_q8_cached_input = x;
-        g_q8_cached_rb = rb;
+        g_q8_cached_rb = n_q8;
     }
     return n_q8;
 }
@@ -1698,13 +1692,15 @@ static int l_quant_q8(const float * x, int rb) {
 // Single matvec: quantizes input, launches matvec (convenience wrapper)
 static void l_mv_quant(void * W, uint32_t ggml_type, int rb, int rc, const float * x, float * y) {
     if (rc == 0 || !W) return;
-    if (g_q8_scratch && rb * 8 <= g_kernel_cfg.q8_scratch_max_blocks) {
+    int n_q8 = l_n_q8_for(ggml_type, rb);
+    if (g_q8_scratch && n_q8 <= g_kernel_cfg.q8_scratch_max_blocks) {
         switch (ggml_type) {
             case MONO27B_GGML_TYPE_Q4_K:
             case MONO27B_GGML_TYPE_Q5_K:
             case MONO27B_GGML_TYPE_Q6_K:
+            case MONO27B_GGML_TYPE_Q8_0:
             case 23:
-                l_quant_q8(x, rb);
+                l_quant_q8_n(x, n_q8);
                 l_mv_q8(W, ggml_type, rb, rc, y);
                 return;
             default: break;
@@ -1717,17 +1713,23 @@ static void l_mv_quant(void * W, uint32_t ggml_type, int rb, int rc, const float
 // stream = 0 for default stream, or a custom CUDA stream for concurrency
 static void l_mv_q8_on(void * W, uint32_t ggml_type, int rb, int rc, float * y, cudaStream_t stream) {
     if (rc == 0 || !W) return;
-    if (!g_q8_scratch || rb * 8 > g_kernel_cfg.q8_dp4a_fallback) return;
+    if (!g_q8_scratch) return;
+    int n_q8 = l_n_q8_for(ggml_type, rb);
+    if (n_q8 > g_kernel_cfg.q8_scratch_max_blocks) return;
     switch (ggml_type) {
         case MONO27B_GGML_TYPE_Q4_K:
-            // 2D block (32, 4) = 128 threads; extra smem helps bandwidth utilization via reduced occupancy
-            k_q4k_mv_q8_dp4a<<<rc, dim3(32, g_kernel_cfg.q4k_q8_warp_count), 32 * (size_t)g_kernel_cfg.q4k_q8_smem_per_warp * sizeof(float), stream>>>((const BlockQ4K *)W, g_q8_scratch, y, rb, rc);
+            k_q4k_mv_q8_dp4a<<<rc, dim3(32, g_kernel_cfg.q4k_q8_warp_count),
+                32 * (size_t)g_kernel_cfg.q4k_q8_smem_per_warp * sizeof(float), stream>>>(
+                (const BlockQ4K *)W, g_q8_scratch, y, rb, rc);
             return;
         case MONO27B_GGML_TYPE_Q5_K:
-            k_q5k_mv_q8_dp4a<<<rc, dim3(32, g_kernel_cfg.q4k_q8_warp_count), 0, stream>>>((const BlockQ5K *)W, g_q8_scratch, y, rb, rc);
+            k_q5k_mv_q8<<<rc, dim3(32, 4), 0, stream>>>((const BlockQ5K *)W, g_q8_scratch, y, rb, rc);
             return;
         case MONO27B_GGML_TYPE_Q6_K:
-            k_q6k_mv_q8_dp4a<<<rc, g_kernel_cfg.q4k_q8_threads, 0, stream>>>((const BlockQ6K *)W, g_q8_scratch, y, rb, rc);
+            k_q6k_mv_q8_dp4a<<<rc, dim3(32, 4), 0, stream>>>((const BlockQ6K *)W, g_q8_scratch, y, rb, rc);
+            return;
+        case MONO27B_GGML_TYPE_Q8_0:
+            k_q80_mv_q8_dp4a<<<rc, dim3(32, 4), 0, stream>>>((const BlockQ8 *)W, g_q8_scratch, y, rb, rc);
             return;
         case 23:
             k_iq4xs_mv_q8_dp4a<<<rc, g_kernel_cfg.q4k_q8_threads, 0, stream>>>((const BlockIQ4XS *)W, g_q8_scratch, y, rb, rc);
@@ -1748,8 +1750,11 @@ static void l_mv_pair(void * w1, uint32_t t1, int rb1, int rc1, float * y1,
     if (rc1 == 0 || !w1) { l_mv_quant(w2, t2, rb2, rc2, x, y2); return; }
     if (rc2 == 0 || !w2) { l_mv_quant(w1, t1, rb1, rc1, x, y1); return; }
     // Both need Q8_1 path — quantize once, then run both on stream 0
-    if (g_q8_scratch && rb * 8 <= g_kernel_cfg.q8_scratch_max_blocks) {
-        l_quant_q8(x, rb);
+    int n_q8_1 = l_n_q8_for(t1, rb1);
+    int n_q8_2 = l_n_q8_for(t2, rb2);
+    int n_q8 = std::max(n_q8_1, n_q8_2);  // both pair members must operate on the same input
+    if (g_q8_scratch && n_q8 <= g_kernel_cfg.q8_scratch_max_blocks && n_q8_1 == n_q8_2) {
+        l_quant_q8_n(x, n_q8);
         l_mv_q8_on(w1, t1, rb1, rc1, y1, 0);
         l_mv_q8_on(w2, t2, rb2, rc2, y2, 0);
         return;
@@ -1943,25 +1948,29 @@ extern "C" bool mono27b_engine_decode_step(
     timing_start(st);
 #endif
 
-    // CUDA graph: update device symbols before replay/capture
-    // These are always updated, before graph begins capture or before graph replays
+    // Update device-side step parameters (read by embed/mrope/attn/kv kernels).
+    // Doing this before capture/replay makes the layer loop graph-replayable.
     cudaMemcpyToSymbol(g_tok_id, &tok, sizeof(int));
     cudaMemcpyToSymbol(g_mrope_pos, &pos, sizeof(int));
     cudaMemcpyToSymbol(g_kv_pos, &pos, sizeof(int));
 
-#ifndef MONO27B_TIMING  // graph capture incompatible with per-kernel event timing
-    // CUDA graph capture/replay logic
-    if (!st->graph_captured) {
-        // First call: capture the layer loop into a graph
-        cudaStreamBeginCapture(0, cudaStreamCaptureModeThreadLocal);
+#ifndef MONO27B_TIMING
+    // CUDA graph fast path: capture once, replay each step.
+    if (st->graph_captured) {
+        cudaGraphLaunch((cudaGraphExec_t)st->cuda_graph_exec, 0);
+        goto after_layers;
+    }
+    cudaStreamBeginCapture(0, cudaStreamCaptureModeRelaxed);
+#endif
 
-        // ─── Captured layer loop begins ───
-        mono27b_engine_embed(we, tok, h, error, error_cap);
-        TRACE("emb");
+    mono27b_engine_embed(we, tok, h, error, error_cap);
+    TRACE("emb");
 
-        // Only run first 4 layers to debug
-        // Skip all layers to isolate LM head issue
-        for (il = 0; il < MONO27B_TARGET_LAYERS; ++il) {
+
+
+    // Only run first 4 layers to debug
+    // Skip all layers to isolate LM head issue
+    for (il = 0; il < MONO27B_TARGET_LAYERS; ++il) {
         bool is_a = ((il + 1) % MONO27B_TARGET_FA_INTERVAL) == 0;
         TRACE("pre");
 
@@ -2049,9 +2058,11 @@ extern "C" bool mono27b_engine_decode_step(
             if (L.ssm_beta.ptr && L.ssm_alpha.ptr && L.ssm_dt_bias.ptr && L.ssm_a_log.ptr) {
                 int dr = MONO27B_SSM_DT_RANK;
                 MV(L.ssm_beta, h2, kb);
+                k_elem_sigmoid<<<(dr + 31) / 32, 32>>>(kb, dr);
+                CHECK_FINITE("ssm beta", kb, dr);
                 MV(L.ssm_alpha, h2, qb);
-                // Fused sigmoid + softplus + mul in single kernel
-                k_ssm_dt_triple<<<(dr + 127) / 128, 128>>>(kb, qb, WV(L.ssm_dt_bias), WV(L.ssm_a_log), dr);
+                k_elem_softplus<<<(dr + 31) / 32, 32>>>(qb, WV(L.ssm_dt_bias), qb, dr);
+                k_elem_mul<<<(dr + 31) / 32, 32>>>(qb, WV(L.ssm_a_log), dr);
                 CHECK_FINITE("ssm dt", qb, dr);
 
             // Conv1D
@@ -2073,7 +2084,8 @@ extern "C" bool mono27b_engine_decode_step(
                 float * kr = sb + MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K;
                 float * vr = sb + 2 * MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K;
 
-                k_l2_norm_qk<<<2 * MONO27B_SSM_N_GROUP, 128>>>(qr, kr, MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP);
+                k_l2_norm_g<<<MONO27B_SSM_N_GROUP, 128>>>(qr, MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP);
+                k_l2_norm_g<<<MONO27B_SSM_N_GROUP, 128>>>(kr, MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP);
                 CHECK_FINITE("ssm qk", sb, MONO27B_SSM_CONV_CH);
 
                 // Gated DeltaNet
@@ -2125,216 +2137,50 @@ extern "C" bool mono27b_engine_decode_step(
             ssm_i++;
         }
     }
-
-        // ─── End of captured layer loop ───
-        // End capture and instantiate graph
-        cudaGraph_t g = nullptr;
-        cudaStreamEndCapture(0, &g);
-        if (g) {
-            cudaGraphInstantiate((cudaGraphExec_t*)&st->cuda_graph_exec, g, nullptr, nullptr, 0);
-            cudaGraphDestroy(g);
-            st->graph_captured = 1;
-        }
-
-        // Capture mode does NOT execute kernels — launch immediately to process token 0
-        cudaGraphLaunch((cudaGraphExec_t)st->cuda_graph_exec, 0);
-        cudaStreamSynchronize(0);
-    } else {
-        // Subsequent calls: launch the pre-built graph
-        cudaGraphLaunch((cudaGraphExec_t)st->cuda_graph_exec, 0);
-        cudaStreamSynchronize(0);
-    }
-#else
-    // Timing mode: no graph capture, run layer loop normally
-    mono27b_engine_embed(we, tok, h, error, error_cap);
-    TRACE("emb");
-
-    for (il = 0; il < MONO27B_TARGET_LAYERS; ++il) {
-        bool is_a = ((il + 1) % MONO27B_TARGET_FA_INTERVAL) == 0;
-        TRACE("pre");
-
-        if (is_a) {
-            const auto & L = we->layers[il].attn;
-            int max_ctx = st->max_ctx > 0 ? st->max_ctx : 8192;
-
-            l_rms(h2, h, WV(L.attn_norm), MONO27B_TARGET_HIDDEN); TRACE("rms");
-            MV(L.wq, h2, qb); TRACE("wq");
-            {
-                cudaMemcpyAsync(kb, qb, MONO27B_TARGET_Q_DIM * 2 * sizeof(float), cudaMemcpyDeviceToDevice);
-                int n_h = MONO27B_TARGET_N_HEAD;
-                int hd = MONO27B_TARGET_HEAD_DIM;
-                k_deinterleave_qg<<<n_h, hd>>>(kb, qb, qb + MONO27B_TARGET_Q_DIM, n_h, hd);
-            }
-            MV(L.wk, h2, kb); TRACE("wk");
-            MV(L.wv, h2, kb + MONO27B_TARGET_KV_DIM); TRACE("wv");
-            if (L.q_norm.ptr)
-                k_rms_norm_mulw_batched<<<MONO27B_TARGET_N_HEAD, g_kernel_cfg.rms_norm_threads>>>(
-                    qb, WV(L.q_norm), qb, MONO27B_TARGET_HEAD_DIM, MONO27B_TARGET_N_HEAD, g_kernel_cfg.rms_eps);
-            if (L.k_norm.ptr)
-                k_rms_norm_mulw_batched<<<MONO27B_TARGET_N_KV_HEAD, g_kernel_cfg.rms_norm_threads>>>(
-                    kb, WV(L.k_norm), kb, MONO27B_TARGET_HEAD_DIM, MONO27B_TARGET_N_KV_HEAD, g_kernel_cfg.rms_eps);
-            TRACE("qkn");
-
-            k_mrope<<<MONO27B_TARGET_N_HEAD, 64>>>(
-                qb, MONO27B_TARGET_N_HEAD, MONO27B_TARGET_HEAD_DIM,
-                11, 11, 10, 0,
-                MONO27B_N_ROT_DIMS); TRACE("mq");
-            k_mrope<<<MONO27B_TARGET_N_KV_HEAD, 64>>>(
-                kb, MONO27B_TARGET_N_KV_HEAD, MONO27B_TARGET_HEAD_DIM,
-                11, 11, 10, 0,
-                MONO27B_N_ROT_DIMS); TRACE("mk");
-
-            k_write_kv_cache<<<MONO27B_TARGET_N_KV_HEAD, MONO27B_TARGET_HEAD_DIM>>>(
-                kb, st->kv_cache_k[fa_i], st->kv_cache_v[fa_i],
-                MONO27B_TARGET_N_KV_HEAD, MONO27B_TARGET_HEAD_DIM);
-            TRACE("kvc");
-
-            {
-                int smem_kvl = max_ctx > 0 ? max_ctx : 8192;
-                size_t smem_sz = ((size_t)smem_kvl + 2 + MONO27B_TARGET_HEAD_DIM) * sizeof(float);
-                k_attn_parallel<<<MONO27B_TARGET_N_HEAD, MONO27B_TARGET_HEAD_DIM, smem_sz>>>(
-                    qb, st->kv_cache_k[fa_i], st->kv_cache_v[fa_i], qb,
-                    MONO27B_TARGET_N_HEAD, MONO27B_TARGET_N_KV_HEAD,
-                    MONO27B_TARGET_HEAD_DIM, max_ctx, 1.0f / sqrtf(MONO27B_TARGET_HEAD_DIM));
-            }
-            k_elem_sigmoid_mul<<<(MONO27B_TARGET_Q_DIM + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(
-                qb, qb + MONO27B_TARGET_Q_DIM, qb, MONO27B_TARGET_Q_DIM); TRACE("gt");
-
-            MV(L.wo, qb, h2); TRACE("wo");
-            k_elem_add<<<(MONO27B_TARGET_HIDDEN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(h2, h, MONO27B_TARGET_HIDDEN); TRACE("res1");
-
-            l_rms(h, h2, WV(L.post_norm), MONO27B_TARGET_HIDDEN); TRACE("porm");
-            MV_PAIR(L.ffn_gate, L.ffn_up, h, fb, kb); TRACE("fg+fu");
-            k_elem_swiglu<<<(MONO27B_TARGET_FFN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(fb, kb, MONO27B_TARGET_FFN); TRACE("mul");
-            MV(L.ffn_down, fb, h); TRACE("fd");
-            k_elem_add<<<(MONO27B_TARGET_HIDDEN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(h, h2, MONO27B_TARGET_HIDDEN);
-            CHECK_FINITE_FMT("attn layer %d output", il, h, MONO27B_TARGET_HIDDEN);
-            fa_i++;
-
-        } else {
-            const auto & L = we->layers[il].ssm;
-
-            if (!L.wqkv.ptr || !L.wqkv_gate.ptr) {
-                k_elem_copy<<<(MONO27B_TARGET_HIDDEN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(h2, h, MONO27B_TARGET_HIDDEN);
-                goto ssm_ffn;
-            }
-
-            l_rms(h2, h, WV(L.attn_norm), MONO27B_TARGET_HIDDEN);
-            MV_PAIR(L.wqkv, L.wqkv_gate, h2, sb, gb);
-            cudaMemcpyAsync(fb, gb, MONO27B_SSM_D_INNER * sizeof(float), cudaMemcpyDeviceToDevice);
-
-            if (L.ssm_beta.ptr && L.ssm_alpha.ptr && L.ssm_dt_bias.ptr && L.ssm_a_log.ptr) {
-                int dr = MONO27B_SSM_DT_RANK;
-                MV(L.ssm_beta, h2, kb);
-                MV(L.ssm_alpha, h2, qb);
-                // Fused sigmoid + softplus + mul in single kernel
-                k_ssm_dt_triple<<<(dr + 127) / 128, 128>>>(kb, qb, WV(L.ssm_dt_bias), WV(L.ssm_a_log), dr);
-                CHECK_FINITE("ssm dt", qb, dr);
-
-            if (st->conv_state[ssm_i]) {
-                if (L.ssm_conv1d.ggml_type == MONO27B_GGML_TYPE_F16) {
-                    k_ssm_conv1d_u_f16<<<(MONO27B_SSM_CONV_CH + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(
-                        sb, (const __half *)L.ssm_conv1d.ptr, st->conv_state[ssm_i], sb,
-                        MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_KERN);
-                } else {
-                    k_ssm_conv1d_u<<<(MONO27B_SSM_CONV_CH + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(
-                        sb, (const float *)L.ssm_conv1d.ptr, st->conv_state[ssm_i], sb,
-                        MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_KERN);
-                }
-            }
-                CHECK_FINITE("ssm conv", sb, MONO27B_SSM_CONV_CH);
-
-                float * qr = sb;
-                float * kr = sb + MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K;
-                float * vr = sb + 2 * MONO27B_SSM_N_GROUP * MONO27B_SSM_HEAD_K;
-
-                k_l2_norm_qk<<<2 * MONO27B_SSM_N_GROUP, 128>>>(qr, kr, MONO27B_SSM_HEAD_K, MONO27B_SSM_N_GROUP);
-                CHECK_FINITE("ssm qk", sb, MONO27B_SSM_CONV_CH);
-
-                if (st->ssm_state[ssm_i]) {
-                    k_deltanet_ggml_launch(qr, kr, vr, qb, kb,
-                        st->ssm_state[ssm_i], gb, st->ssm_state[ssm_i],
-                        MONO27B_SSM_N_GROUP, MONO27B_SSM_DT_RANK,
-                        MONO27B_SSM_HEAD_V, MONO27B_SSM_HEAD_K);
-                    CHECK_FINITE("ssm deltanet", gb, MONO27B_SSM_D_INNER);
-                }
-
-                TRACE("re-g");
-                k_rms_norm_mulw_mul_batched<<<MONO27B_SSM_DT_RANK, g_kernel_cfg.rms_norm_threads>>>(
-                    gb, WV(L.ssm_norm), fb, kb, MONO27B_SSM_HEAD_V, MONO27B_SSM_DT_RANK, g_kernel_cfg.rms_eps);
-                TRACE("grms+gmul2");
-                MV(L.ssm_out, kb, sb); TRACE("ssmo");
-                k_elem_copy_add<<<(MONO27B_TARGET_HIDDEN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(sb, h, h2, MONO27B_TARGET_HIDDEN); TRACE("scp+sadd");
-                CHECK_FINITE_FMT("ssm layer %d output", il, h2, MONO27B_TARGET_HIDDEN);
-            } else {
-                if (st->conv_state[ssm_i]) {
-                    if (L.ssm_conv1d.ggml_type == MONO27B_GGML_TYPE_F16) {
-                        k_ssm_conv1d_u_f16<<<(MONO27B_SSM_CONV_CH + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(
-                            sb, (const __half *)L.ssm_conv1d.ptr, st->conv_state[ssm_i], sb,
-                            MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_KERN);
-                    } else {
-                        k_ssm_conv1d_u<<<(MONO27B_SSM_CONV_CH + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(
-                            sb, (const float *)L.ssm_conv1d.ptr, st->conv_state[ssm_i], sb,
-                            MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_KERN);
-                    }
-                }
-                MV(L.ssm_out, sb, h2);
-                k_elem_add<<<(MONO27B_TARGET_HIDDEN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(h2, h, MONO27B_TARGET_HIDDEN);
-                CHECK_FINITE_FMT("ssm layer %d output", il, h2, MONO27B_TARGET_HIDDEN);
-            }
-
-        ssm_ffn:
-            l_rms(h, h2, WV(L.post_norm), MONO27B_TARGET_HIDDEN); TRACE("porm");
-            MV_PAIR(L.ffn_gate, L.ffn_up, h, fb, kb); TRACE("fg+fu");
-            k_elem_swiglu<<<(MONO27B_TARGET_FFN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(fb, kb, MONO27B_TARGET_FFN); TRACE("mul");
-            MV(L.ffn_down, fb, h); TRACE("fd");
-            k_elem_add<<<(MONO27B_TARGET_HIDDEN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(h, h2, MONO27B_TARGET_HIDDEN); TRACE("res1");
-            ssm_i++;
-        }
-    }
-#endif
-
     TRACE("post-loop");
 
-    // Sync after all layers — needed once before reading output
-    sync_err = cudaDeviceSynchronize();
-    if (sync_err != cudaSuccess) {
-        std::snprintf(error, error_cap, "layers: %s", cudaGetErrorString(sync_err));
-        goto cleanup;
-    }
-
-    // Output norm + LM head
+    // Output norm + LM head (Q6_K dp4a). Kept inside the captured graph so the
+    // entire forward pass is one launch + one sync per step.
     l_rms(h2, h, WV(we->output_norm), MONO27B_TARGET_HIDDEN);
-    // REAL LM head: quantize h2 to Q8_1 once, then use dp4a for all vocab rows.
     {
         int total = (int)we->lm_head.row_count;
         int rb = (int)we->lm_head.row_blocks;
         auto * base = (const BlockQ6K *)we->lm_head.ptr;
         int n_q8 = rb * 8;
         if (g_q8_scratch && n_q8 <= g_kernel_cfg.q8_scratch_max_blocks) {
-            k_quant_q8_1<<<(n_q8 + g_kernel_cfg.quant_threads - 1) / g_kernel_cfg.quant_threads, g_kernel_cfg.quant_threads>>>(h2, g_q8_scratch, MONO27B_TARGET_HIDDEN);
-            // No sync needed — quantize and matvec are on same stream, already ordered
-            k_q6k_mv_q8_dp4a<<<total, g_kernel_cfg.q4k_q8_threads>>>(base, g_q8_scratch, out->logits, rb, total);
-            sync_err = cudaDeviceSynchronize();
-        }
-        if (!g_q8_scratch || n_q8 > g_kernel_cfg.q8_dp4a_fallback || sync_err != cudaSuccess) {
-            sync_err = cudaSuccess;
+            k_quant_q8_1<<<(n_q8 + g_kernel_cfg.quant_threads - 1) / g_kernel_cfg.quant_threads,
+                          g_kernel_cfg.quant_threads>>>(h2, g_q8_scratch, MONO27B_TARGET_HIDDEN);
+            k_q6k_mv_q8_dp4a<<<total, dim3(32, 4)>>>(base, g_q8_scratch, out->logits, rb, total);
+        } else {
             int chunk = g_kernel_cfg.lm_head_chunk_rows;
             for (int off = 0; off < total; off += chunk) {
                 int n = (off + chunk > total) ? total - off : chunk;
                 k_q6k_mt<<<n, g_kernel_cfg.q6k_mt_threads>>>(base + (size_t)off * rb, h2, out->logits + off, rb, n);
             }
-            sync_err = cudaDeviceSynchronize();
         }
-        if (sync_err != cudaSuccess) {
-            cudaMemset(out->logits, 0, MONO27B_TARGET_VOCAB * sizeof(float));
-            float v = 1.0f;
-            cudaMemcpy(out->logits, &v, 4, cudaMemcpyHostToDevice);
-            sync_err = cudaDeviceSynchronize();
-        }
-
     }
 
+#ifndef MONO27B_TIMING
+    // End graph capture, instantiate, and launch for this token.
+    {
+        cudaGraph_t g = nullptr;
+        cudaStreamEndCapture(0, &g);
+        if (g) {
+            if (cudaGraphInstantiate((cudaGraphExec_t*)&st->cuda_graph_exec, g, nullptr, nullptr, 0) == cudaSuccess) {
+                st->graph_captured = 1;
+                cudaGraphLaunch((cudaGraphExec_t)st->cuda_graph_exec, 0);
+            }
+            cudaGraphDestroy(g);
+        }
+    }
+after_layers:;
+#endif
+
+    sync_err = cudaDeviceSynchronize();
+    if (sync_err != cudaSuccess) {
+        std::snprintf(error, error_cap, "layers: %s", cudaGetErrorString(sync_err));
+        goto cleanup;
+    }
     st->kv_len = pos + 1;
 
 cleanup:

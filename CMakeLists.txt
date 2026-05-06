@@ -33,4 +33,6 @@ set_target_properties(mono27b_chat PROPERTIES
 target_link_libraries(mono27b_chat PRIVATE CUDA::cudart)
 target_compile_options(mono27b_chat PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--allow-unsupported-compiler>
+    $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
+    $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>
 )
