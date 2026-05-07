@@ -1157,7 +1157,7 @@ __global__ static void k_mrope(
     const int sec012 = sec01 + sec2;
     const int n_rot_pairs = n_rot_dims / 2;
     const int half = n_rot_pairs;
-    int pos = g_mrope_pos;  // read from device memory for graph replay
+    int pos = g_mrope_pos;
 
     for (int p = threadIdx.x; p < n_rot_pairs; p += blockDim.x) {
         int d0 = p;
@@ -1285,7 +1285,6 @@ __global__ static void k_attn_decode_online(
     float out_acc = 0.0f;
     float m_prev = -1e30f;
     float l_prev = 0.0f;
-
     for (int p = 0; p < kv_len; ++p) {
         const float * kr = K + (size_t)p * pos_stride + (size_t)kvh * hd;
         float dot_local = 0.0f;
@@ -2297,8 +2296,8 @@ extern "C" bool mono27b_engine_decode_step(
             l_rms(h, h2, WV(L.post_norm), MONO27B_TARGET_HIDDEN); TRACE("porm");
             l_ffn_gate_up_swiglu(L.ffn_gate, L.ffn_up, h, fb, kb); TRACE("fg+fu+swi");
             /* fused into l_ffn_gate_up_swiglu */
-            MV(L.ffn_down, fb, h); TRACE("fd");
-            k_elem_add<<<(MONO27B_TARGET_HIDDEN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(h, h2, MONO27B_TARGET_HIDDEN);
+            l_mv_quant_residual(L.ffn_down.ptr, L.ffn_down.ggml_type, L.ffn_down.row_blocks, L.ffn_down.row_count,
+                                fb, h, h2); TRACE("fd+res1");
             CHECK_FINITE_FMT("attn layer %d output", il, h, MONO27B_TARGET_HIDDEN);
             fa_i++;
 
@@ -2387,8 +2386,8 @@ extern "C" bool mono27b_engine_decode_step(
             l_rms(h, h2, WV(L.post_norm), MONO27B_TARGET_HIDDEN); TRACE("porm");
             l_ffn_gate_up_swiglu(L.ffn_gate, L.ffn_up, h, fb, kb); TRACE("fg+fu+swi");
             /* fused into l_ffn_gate_up_swiglu */
-            MV(L.ffn_down, fb, h); TRACE("fd");
-            k_elem_add<<<(MONO27B_TARGET_HIDDEN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(h, h2, MONO27B_TARGET_HIDDEN); TRACE("res1");
+            l_mv_quant_residual(L.ffn_down.ptr, L.ffn_down.ggml_type, L.ffn_down.row_blocks, L.ffn_down.row_count,
+                                fb, h, h2); TRACE("fd+res1");
             ssm_i++;
         }
     }

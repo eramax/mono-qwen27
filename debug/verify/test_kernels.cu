@@ -242,7 +242,6 @@ __global__ static void k_attn_decode_online(
     float out_acc = 0.0f;
     float m_prev = -1e30f;
     float l_prev = 0.0f;
-
     for (int p = 0; p < kv_len; ++p) {
         const float * kr = K + (size_t) p * pos_stride + (size_t) kvh * hd;
         float dot_local = 0.0f;
