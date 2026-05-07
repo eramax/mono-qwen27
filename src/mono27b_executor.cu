@@ -1958,25 +1958,6 @@ static void l_mv_pair(void * w1, uint32_t t1, int rb1, int rc1, float * y1,
     l_mv_quant(w2, t2, rb2, rc2, x, y2);
 }
 
-static bool l_mv_triple_shared_q8(
-    void * w1, uint32_t t1, int rb1, int rc1, float * y1,
-    void * w2, uint32_t t2, int rb2, int rc2, float * y2,
-    void * w3, uint32_t t3, int rb3, int rc3, float * y3,
-    const float * x) {
-    if (!g_q8_scratch || !w1 || !w2 || !w3 || rc1 == 0 || rc2 == 0 || rc3 == 0) return false;
-    if (!l_can_use_q8_path(t1) || !l_can_use_q8_path(t2) || !l_can_use_q8_path(t3)) return false;
-    int n_q8_1 = l_n_q8_for(t1, rb1);
-    int n_q8_2 = l_n_q8_for(t2, rb2);
-    int n_q8_3 = l_n_q8_for(t3, rb3);
-    if (n_q8_1 != n_q8_2 || n_q8_1 != n_q8_3) return false;
-    if (n_q8_1 > g_kernel_cfg.q8_scratch_max_blocks) return false;
-    l_quant_q8_n(x, n_q8_1);
-    l_mv_q8_on(w1, t1, rb1, rc1, y1, nullptr, 0);
-    l_mv_q8_on(w2, t2, rb2, rc2, y2, nullptr, 0);
-    l_mv_q8_on(w3, t3, rb3, rc3, y3, nullptr, 0);
-    return true;
-}
-
 // Fallback path (F32 dequant)
 static void l_mv_fallback(void * W, uint32_t ggml_type, int rb, int rc, const float * x, float * y) {
     switch (ggml_type) {
@@ -2219,7 +2200,6 @@ extern "C" bool mono27b_engine_decode_step(
 
             l_rms(h2, h, WV(L.attn_norm), MONO27B_TARGET_HIDDEN); TRACE("rms");
             bool parallel_qkv = false;
-            bool shared_q8_qkv = false;
             if (st->stream1 && st->sync_event && g_q8_scratch &&
                 l_can_use_q8_path(L.wq.ggml_type) &&
                 l_can_use_q8_path(L.wk.ggml_type) &&
@@ -2241,16 +2221,9 @@ extern "C" bool mono27b_engine_decode_step(
                 }
             }
             if (!parallel_qkv) {
-                shared_q8_qkv = l_mv_triple_shared_q8(
-                    L.wq.ptr, L.wq.ggml_type, L.wq.row_blocks, L.wq.row_count, fb,
-                    L.wk.ptr, L.wk.ggml_type, L.wk.row_blocks, L.wk.row_count, kb,
-                    L.wv.ptr, L.wv.ggml_type, L.wv.row_blocks, L.wv.row_count, kb + MONO27B_TARGET_KV_DIM,
-                    h2);
-                if (!shared_q8_qkv) {
-                    MV(L.wq, h2, fb);
-                    MV(L.wk, h2, kb); TRACE("wk");
-                    MV(L.wv, h2, kb + MONO27B_TARGET_KV_DIM); TRACE("wv");
-                }
+                MV(L.wq, h2, fb);
+                MV(L.wk, h2, kb); TRACE("wk");
+                MV(L.wv, h2, kb + MONO27B_TARGET_KV_DIM); TRACE("wv");
             }
             TRACE("wq");
             // Qwen3Next: Q projection outputs interleaved Q+gate per head:
@@ -2262,7 +2235,7 @@ extern "C" bool mono27b_engine_decode_step(
                 int hd = MONO27B_TARGET_HEAD_DIM;
                 k_deinterleave_qg<<<n_h, hd>>>(fb, qb, qb + MONO27B_TARGET_Q_DIM, n_h, hd);
             }
-            if (parallel_qkv || shared_q8_qkv) {
+            if (parallel_qkv) {
                 TRACE("wk");
                 TRACE("wv");
             }
