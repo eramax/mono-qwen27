@@ -1336,6 +1336,153 @@ __global__ static void k_attn_decode_online(
     }
 }
 
+__global__ static void k_attn_decode_split_partial(
+    const float * __restrict__ Q,
+    const float * __restrict__ K,
+    const float * __restrict__ V,
+    float * __restrict__ part_o,
+    float * __restrict__ part_m,
+    float * __restrict__ part_l,
+    int n_h, int n_kvh, int hd, int n_splits, float scale) {
+
+    const int qh = blockIdx.x;
+    const int split = blockIdx.y;
+    if (qh >= n_h || split >= n_splits) return;
+
+    const int kvh = qh / (n_h / n_kvh);
+    const int kv_len = g_kv_pos + 1;
+    const int active_splits = kv_len > 64 ? n_splits : 1;
+    const int begin = split < active_splits ? (kv_len * split) / active_splits : 0;
+    const int end = split < active_splits ? (kv_len * (split + 1)) / active_splits : 0;
+    const size_t pos_stride = (size_t) n_kvh * hd;
+    const float * qr = Q + (size_t) qh * hd;
+    const int t = threadIdx.x;
+    const int i0 = t;
+    const int i1 = t + blockDim.x;
+    const int part_idx = split * n_h + qh;
+    float out0 = 0.0f;
+    float out1 = 0.0f;
+    float m_prev = -1e30f;
+    float l_prev = 0.0f;
+
+    __shared__ float s_partials[4];
+    __shared__ float s_m_prev;
+    __shared__ float s_l_prev;
+    __shared__ float s_alpha;
+    __shared__ float s_beta;
+
+    if (split >= active_splits) {
+        if (t == 0) {
+            part_m[part_idx] = -1e30f;
+            part_l[part_idx] = 0.0f;
+        }
+        const size_t o_base = (size_t) part_idx * hd;
+        if (i0 < hd) part_o[o_base + i0] = 0.0f;
+        if (i1 < hd) part_o[o_base + i1] = 0.0f;
+        return;
+    }
+
+    for (int p = begin; p < end; ++p) {
+        const float * kr = K + (size_t) p * pos_stride + (size_t) kvh * hd;
+        float dot_local = 0.0f;
+        if (i0 < hd) dot_local += qr[i0] * kr[i0];
+        if (i1 < hd) dot_local += qr[i1] * kr[i1];
+
+        const int lane = t & 31;
+        const int wid = t >> 5;
+        dot_local = warp_reduce_sum<32>(dot_local);
+        if (lane == 0) s_partials[wid] = dot_local;
+        __syncthreads();
+
+        if (wid == 0) {
+            float v = (lane < (blockDim.x >> 5)) ? s_partials[lane] : 0.0f;
+            v = warp_reduce_sum<32>(v);
+            if (lane == 0) {
+                float dot = v * scale;
+                if (dot > 64.0f) dot = 64.0f;
+                const float m_new = fmaxf(m_prev, dot);
+                s_alpha = expf(m_prev - m_new);
+                s_beta = expf(fmaxf(dot - m_new, -64.0f));
+                s_m_prev = m_new;
+                s_l_prev = l_prev * s_alpha + s_beta;
+            }
+        }
+        __syncthreads();
+
+        const float * vr = V + (size_t) p * pos_stride + (size_t) kvh * hd;
+        if (i0 < hd) out0 = out0 * s_alpha + s_beta * vr[i0];
+        if (i1 < hd) out1 = out1 * s_alpha + s_beta * vr[i1];
+
+        m_prev = s_m_prev;
+        l_prev = s_l_prev;
+        __syncthreads();
+    }
+
+    if (t == 0) {
+        part_m[part_idx] = m_prev;
+        part_l[part_idx] = l_prev;
+    }
+
+    const size_t o_base = (size_t) part_idx * hd;
+    const float inv_l = l_prev > 0.0f ? 1.0f / (l_prev + 1e-10f) : 0.0f;
+    if (i0 < hd) part_o[o_base + i0] = out0 * inv_l;
+    if (i1 < hd) part_o[o_base + i1] = out1 * inv_l;
+}
+
+__global__ static void k_attn_decode_split_reduce(
+    const float * __restrict__ part_o,
+    const float * __restrict__ part_m,
+    const float * __restrict__ part_l,
+    float * __restrict__ O,
+    int n_h, int hd, int n_splits) {
+
+    const int qh = blockIdx.x;
+    if (qh >= n_h) return;
+
+    const int t = threadIdx.x;
+    const int i0 = t;
+    const int i1 = t + blockDim.x;
+    __shared__ float s_m[MONO27B_ATTN_DECODE_SPLITS];
+    __shared__ float s_l[MONO27B_ATTN_DECODE_SPLITS];
+    __shared__ float s_coeff[MONO27B_ATTN_DECODE_SPLITS];
+    __shared__ float s_inv_l;
+
+    if (t < n_splits) {
+        const int idx = t * n_h + qh;
+        s_m[t] = part_m[idx];
+        s_l[t] = part_l[idx];
+    }
+    __syncthreads();
+
+    if (t == 0) {
+        float global_m = -1e30f;
+        for (int s = 0; s < n_splits; ++s) {
+            if (s_l[s] > 0.0f) global_m = fmaxf(global_m, s_m[s]);
+        }
+        float global_l = 0.0f;
+        for (int s = 0; s < n_splits; ++s) {
+            const float coeff = s_l[s] > 0.0f ? expf(s_m[s] - global_m) * s_l[s] : 0.0f;
+            s_coeff[s] = coeff;
+            global_l += coeff;
+        }
+        s_inv_l = global_l > 0.0f ? 1.0f / (global_l + 1e-10f) : 0.0f;
+    }
+    __syncthreads();
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (int s = 0; s < n_splits; ++s) {
+        const float coeff = s_coeff[s];
+        const size_t base = (size_t) (s * n_h + qh) * hd;
+        if (i0 < hd) acc0 += coeff * part_o[base + i0];
+        if (i1 < hd) acc1 += coeff * part_o[base + i1];
+    }
+
+    const size_t o_base = (size_t) qh * hd;
+    if (i0 < hd) O[o_base + i0] = acc0 * s_inv_l;
+    if (i1 < hd) O[o_base + i1] = acc1 * s_inv_l;
+}
+
 // ─── SSM conv1d (1 thread per channel) ───────────────────────────────────────
 
 __global__ static void k_ssm_conv1d_u(const float * inp, const float * w, float * cs, float * out,
@@ -1715,6 +1862,9 @@ extern "C" bool mono27b_engine_init_state(int max_ctx, Mono27BExecutorState * st
     size_t ss_sb = (size_t)MONO27B_SSM_DT_RANK *
                    MONO27B_SSM_HEAD_V * MONO27B_SSM_HEAD_K * sizeof(float);
     size_t ss_cb = (size_t)(MONO27B_SSM_CONV_KERN - 1) * MONO27B_SSM_CONV_CH * sizeof(float);
+    size_t attn_split_o = (size_t)MONO27B_ATTN_DECODE_SPLITS * MONO27B_TARGET_N_HEAD *
+                          MONO27B_TARGET_HEAD_DIM * sizeof(float);
+    size_t attn_split_s = (size_t)MONO27B_ATTN_DECODE_SPLITS * MONO27B_TARGET_N_HEAD * sizeof(float);
     size_t sk = std::max((size_t)MONO27B_TARGET_KV_DIM * 2, (size_t)MONO27B_TARGET_FFN);
     size_t ws = (size_t)MONO27B_TARGET_HIDDEN * 2 + (size_t)MONO27B_TARGET_Q_DIM * 2 +
                 sk + (size_t)MONO27B_TARGET_FFN +
@@ -1739,6 +1889,18 @@ extern "C" bool mono27b_engine_init_state(int max_ctx, Mono27BExecutorState * st
         cudaError_t ec = cudaMalloc(&state->conv_state[i], ss_cb);
         if (ec != cudaSuccess) { state->conv_state[i] = nullptr; fprintf(stderr, "warn: conv_state[%d] OOM\n", i); }
         else cudaMemset(state->conv_state[i], 0, ss_cb);
+    }
+    if (cudaSuccess != cudaMalloc(&state->attn_split_o, attn_split_o)) {
+        std::snprintf(error, error_cap, "attn_split_o: %s", cudaGetErrorString(cudaGetLastError()));
+        goto fail;
+    }
+    if (cudaSuccess != cudaMalloc(&state->attn_split_m, attn_split_s)) {
+        std::snprintf(error, error_cap, "attn_split_m: %s", cudaGetErrorString(cudaGetLastError()));
+        goto fail;
+    }
+    if (cudaSuccess != cudaMalloc(&state->attn_split_l, attn_split_s)) {
+        std::snprintf(error, error_cap, "attn_split_l: %s", cudaGetErrorString(cudaGetLastError()));
+        goto fail;
     }
     // Pre-allocate working buffers for decode_step (saves fragmentation)
     if (cudaSuccess != cudaMalloc(&state->work_buf, ws)) {
@@ -1804,6 +1966,9 @@ extern "C" void mono27b_engine_free_state(Mono27BExecutorState * state) {
     for (int i = 0; i < sl; ++i) {
         cudaFree(state->ssm_state[i]); cudaFree(state->conv_state[i]);
     }
+    cudaFree(state->attn_split_o);
+    cudaFree(state->attn_split_m);
+    cudaFree(state->attn_split_l);
     cudaFree(state->work_buf);
     if (state->q8_scratch) cudaFree(state->q8_scratch);
     if (state->argmax_result) { cudaFree(state->argmax_result); state->argmax_result = nullptr; }
@@ -2047,6 +2212,17 @@ extern "C" void mono27b_engine_print_timing(Mono27BExecutorState * st) {
     }
     std::fprintf(stderr, "=========================================\n");
 }
+extern "C" void mono27b_engine_reset_timing(Mono27BExecutorState * st) {
+    if (!st) return;
+    st->timing_event_count = 0;
+    st->timing_acc_entries = 0;
+    st->timing_tokens = 0;
+    for (int i = 0; i < Mono27BExecutorState::MAX_TIMING_LABELS; ++i) {
+        st->timing_acc_ms[i] = 0.0f;
+        st->timing_acc_count[i] = 0;
+        st->timing_acc_label[i] = nullptr;
+    }
+}
 #define TRACE(lbl) timing_record(st, lbl)
 #else
 #define TRACE(lbl) ((void)0)
@@ -2262,10 +2438,15 @@ extern "C" bool mono27b_engine_decode_step(
 
             // Attention: parallel cooperative kernel
             {
-                k_attn_decode_online<<<MONO27B_TARGET_N_HEAD, MONO27B_TARGET_HEAD_DIM>>>(
-                    qb, st->kv_cache_k[fa_i], st->kv_cache_v[fa_i], qb,
+                k_attn_decode_split_partial<<<dim3(MONO27B_TARGET_N_HEAD, MONO27B_ATTN_DECODE_SPLITS), 128>>>(
+                    qb, st->kv_cache_k[fa_i], st->kv_cache_v[fa_i],
+                    st->attn_split_o, st->attn_split_m, st->attn_split_l,
                     MONO27B_TARGET_N_HEAD, MONO27B_TARGET_N_KV_HEAD,
-                    MONO27B_TARGET_HEAD_DIM, max_ctx, 1.0f / sqrtf(MONO27B_TARGET_HEAD_DIM));
+                    MONO27B_TARGET_HEAD_DIM, MONO27B_ATTN_DECODE_SPLITS,
+                    1.0f / sqrtf(MONO27B_TARGET_HEAD_DIM));
+                k_attn_decode_split_reduce<<<MONO27B_TARGET_N_HEAD, 128>>>(
+                    st->attn_split_o, st->attn_split_m, st->attn_split_l, qb,
+                    MONO27B_TARGET_N_HEAD, MONO27B_TARGET_HEAD_DIM, MONO27B_ATTN_DECODE_SPLITS);
             }
             // Gate: sigmoid(gate_q) * attn_output
             int n_q8_wo = l_n_q8_for(L.wo.ggml_type, (int)L.wo.row_blocks);

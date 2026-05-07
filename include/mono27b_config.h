@@ -37,6 +37,7 @@ constexpr int MONO27B_TARGET_FA_INTERVAL = 4;
 constexpr float MONO27B_TARGET_ROPE_THETA = 10000000.0f;
 constexpr float MONO27B_RMS_EPS         = 1e-6f;
 constexpr int MONO27B_TARGET_FA_LAYERS  = MONO27B_TARGET_LAYERS / MONO27B_TARGET_FA_INTERVAL;
+constexpr int MONO27B_ATTN_DECODE_SPLITS = 32;
 
 // SSM dimensions
 constexpr int MONO27B_SSM_D_INNER   = 6144;
@@ -117,6 +118,9 @@ struct Mono27BExecutorState {
     float * kv_cache_v[MONO27B_TARGET_FA_LAYERS];
     float * ssm_state[MONO27B_TARGET_LAYERS - MONO27B_TARGET_FA_LAYERS];
     float * conv_state[MONO27B_TARGET_LAYERS - MONO27B_TARGET_FA_LAYERS];
+    float * attn_split_o;
+    float * attn_split_m;
+    float * attn_split_l;
     float * work_buf;
     size_t work_buf_size;
     void * q8_scratch;
@@ -177,3 +181,4 @@ extern "C" void mono27b_engine_free_logits(Mono27BLogitsOutput * output);
 
 extern "C" int mono27b_engine_argmax(Mono27BExecutorState * st, const float * logits, int n);
 extern "C" void mono27b_engine_print_timing(Mono27BExecutorState * st);
+extern "C" void mono27b_engine_reset_timing(Mono27BExecutorState * st);

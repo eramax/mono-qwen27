@@ -403,6 +403,10 @@ int main(int argc, char **argv) {
     }
     t1 = clock::now();
 
+#ifdef MONO27B_TIMING
+    mono27b_engine_reset_timing(&state);
+#endif
+
     if (ok) {
         if (!cfg.chat_template.visible_tail.empty()) {
             fwrite(cfg.chat_template.visible_tail.data(), 1,
