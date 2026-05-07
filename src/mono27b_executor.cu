@@ -780,38 +780,6 @@ __global__ static void k_elem_add(float * a, const float * b, int n) {
     }
 }
 
-// Fused copy + residual: out[i] = src[i] + res[i]
-__global__ static void k_elem_copy_add(const float * src, const float * res, float * out, int n) {
-    int limit = n / 4;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < limit; i += gridDim.x * blockDim.x) {
-        const float4 * vsrc = reinterpret_cast<const float4 *>(&src[i * 4]);
-        const float4 * vres = reinterpret_cast<const float4 *>(&res[i * 4]);
-        float4 * vout = reinterpret_cast<float4 *>(&out[i * 4]);
-        float4 s = *vsrc;
-        const float4 r = *vres;
-        s.x += r.x; s.y += r.y; s.z += r.z; s.w += r.w;
-        *vout = s;
-    }
-    for (int i = limit * 4 + blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-        out[i] = src[i] + res[i];
-    }
-}
-
-__global__ static void k_elem_mul(float * a, const float * b, int n) {
-    int limit = n / 4;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < limit; i += gridDim.x * blockDim.x) {
-        float4 * va_ptr = reinterpret_cast<float4 *>(&a[i * 4]);
-        const float4 * vb_ptr = reinterpret_cast<const float4 *>(&b[i * 4]);
-        float4 va = *va_ptr;
-        const float4 vb = *vb_ptr;
-        va.x *= vb.x; va.y *= vb.y; va.z *= vb.z; va.w *= vb.w;
-        *va_ptr = va;
-    }
-    for (int i = limit * 4 + blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-        a[i] *= b[i];
-    }
-}
-
 __global__ static void k_elem_copy(float * d, const float * s, int n) {
     int limit = n / 4;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < limit; i += gridDim.x * blockDim.x) {
@@ -841,16 +809,20 @@ __global__ static void k_elem_silu(float * x, int n) {
     }
 }
 
-__global__ static void k_elem_softplus(const float * x, const float * bias, float * out, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-        float z = x[i] + bias[i];
-        out[i] = (z > 20.0f) ? z : logf(1.0f + expf(z));
-    }
+__device__ static inline float d_silu(float x) {
+    return x / (1.0f + expf(-x));
 }
 
-__global__ static void k_elem_sigmoid(float * x, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
-        x[i] = 1.0f / (1.0f + expf(-x[i]));
+__global__ static void k_ssm_params_fused(
+    const float * beta_raw, const float * alpha_raw,
+    const float * dt_bias, const float * a_log,
+    float * beta, float * dt, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        beta[i] = 1.0f / (1.0f + expf(-beta_raw[i]));
+        float z = alpha_raw[i] + dt_bias[i];
+        float softplus = (z > 20.0f) ? z : logf(1.0f + expf(z));
+        dt[i] = softplus * a_log[i];
+    }
 }
 
 __global__ static void k_elem_sigmoid_mul(float * out, const float * sig, const float * other, int n) {
@@ -1379,7 +1351,7 @@ __global__ static void k_ssm_conv1d_u(const float * inp, const float * w, float 
     s += inp[ch] * w[(size_t)ch * ck + sl];
     for (int k = 0; k < sl - 1; ++k) cs[(size_t)ch * sl + k] = cs[(size_t)ch * sl + k + 1];
     cs[(size_t)ch * sl + (sl - 1)] = inp[ch];
-    out[ch] = s;
+    out[ch] = d_silu(s);
 }
 
 __global__ static void k_ssm_conv1d_u_f16(const float * inp, const __half * w, float * cs, float * out,
@@ -1397,7 +1369,7 @@ __global__ static void k_ssm_conv1d_u_f16(const float * inp, const __half * w, f
         cs[(size_t)ch * sl + k] = cs[(size_t)ch * sl + k + 1];
     }
     cs[(size_t)ch * sl + (sl - 1)] = inp[ch];
-    out[ch] = s;
+    out[ch] = d_silu(s);
 }
 
 // ─── Gated DeltaNet (ggml-style warp-level parallelism) ──────────────────────
@@ -1950,6 +1922,21 @@ static void l_mv_q8(void * W, uint32_t ggml_type, int rb, int rc, float * y) {
     l_mv_q8_on(W, ggml_type, rb, rc, y, nullptr, 0);
 }
 
+static void l_mv_quant_residual(void * W, uint32_t ggml_type, int rb, int rc,
+                                const float * x, float * y, const float * residual) {
+    if (rc == 0 || !W) return;
+    int n_q8 = l_n_q8_for(ggml_type, rb);
+    if (residual && g_q8_scratch && n_q8 <= g_kernel_cfg.q8_scratch_max_blocks) {
+        l_quant_q8_n(x, n_q8);
+        l_mv_q8_on(W, ggml_type, rb, rc, y, residual, 0);
+        return;
+    }
+    l_mv_quant(W, ggml_type, rb, rc, x, y);
+    if (residual) {
+        k_elem_add<<<(rc + 255) / 256, 256>>>(y, residual, rc);
+    }
+}
+
 // Launch two matvecs concurrently on the same Q8_1 input.
 // Quantize x once, then run w1→y1 on stream 0 and w2→y2 on stream 1.
 static void l_mv_pair(void * w1, uint32_t t1, int rb1, int rc1, float * y1,
@@ -2324,33 +2311,29 @@ extern "C" bool mono27b_engine_decode_step(
             }
 
             l_rms(h2, h, WV(L.attn_norm), MONO27B_TARGET_HIDDEN);
-            MV_PAIR(L.wqkv, L.wqkv_gate, h2, sb, gb);
-            // Save wqkv_gate before deltanet overwrites gb (using fb as temporary storage)
-            cudaMemcpyAsync(fb, gb, MONO27B_SSM_D_INNER * sizeof(float), cudaMemcpyDeviceToDevice);
+            MV_PAIR(L.wqkv, L.wqkv_gate, h2, sb, fb);
 
             if (L.ssm_beta.ptr && L.ssm_alpha.ptr && L.ssm_dt_bias.ptr && L.ssm_a_log.ptr) {
                 int dr = MONO27B_SSM_DT_RANK;
                 MV(L.ssm_beta, h2, kb);
-                k_elem_sigmoid<<<(dr + 31) / 32, 32>>>(kb, dr);
-                CHECK_FINITE("ssm beta", kb, dr);
                 MV(L.ssm_alpha, h2, qb);
-                k_elem_softplus<<<(dr + 31) / 32, 32>>>(qb, WV(L.ssm_dt_bias), qb, dr);
-                k_elem_mul<<<(dr + 31) / 32, 32>>>(qb, WV(L.ssm_a_log), dr);
+                k_ssm_params_fused<<<(dr + 31) / 32, 32>>>(
+                    kb, qb, WV(L.ssm_dt_bias), WV(L.ssm_a_log), kb, qb, dr);
+                CHECK_FINITE("ssm beta", kb, dr);
                 CHECK_FINITE("ssm dt", qb, dr);
 
-            // Conv1D
-            if (st->conv_state[ssm_i]) {
-                if (L.ssm_conv1d.ggml_type == MONO27B_GGML_TYPE_F16) {
-                    k_ssm_conv1d_u_f16<<<(MONO27B_SSM_CONV_CH + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(
-                        sb, (const __half *)L.ssm_conv1d.ptr, st->conv_state[ssm_i], sb,
-                        MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_KERN);
-                } else {
-                    k_ssm_conv1d_u<<<(MONO27B_SSM_CONV_CH + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(
-                        sb, (const float *)L.ssm_conv1d.ptr, st->conv_state[ssm_i], sb,
-                        MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_KERN);
+                // Conv1D now writes SiLU-activated output directly to sb.
+                if (st->conv_state[ssm_i]) {
+                    if (L.ssm_conv1d.ggml_type == MONO27B_GGML_TYPE_F16) {
+                        k_ssm_conv1d_u_f16<<<(MONO27B_SSM_CONV_CH + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(
+                            sb, (const __half *)L.ssm_conv1d.ptr, st->conv_state[ssm_i], sb,
+                            MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_KERN);
+                    } else {
+                        k_ssm_conv1d_u<<<(MONO27B_SSM_CONV_CH + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(
+                            sb, (const float *)L.ssm_conv1d.ptr, st->conv_state[ssm_i], sb,
+                            MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_KERN);
+                    }
                 }
-            }
-                k_elem_silu<<<(MONO27B_SSM_CONV_CH + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(sb, MONO27B_SSM_CONV_CH);
                 CHECK_FINITE("ssm conv", sb, MONO27B_SSM_CONV_CH);
 
                 float * qr = sb;
@@ -2380,9 +2363,8 @@ extern "C" bool mono27b_engine_decode_step(
                         gb, w_norm, fb, kb, MONO27B_SSM_HEAD_V, MONO27B_SSM_DT_RANK, g_kernel_cfg.rms_eps);
                 }
                 TRACE("grms+gmul2");
-                MV(L.ssm_out, kb, sb); TRACE("ssmo");
-                // Fused copy + residual add: h2 = sb + h
-                k_elem_copy_add<<<(MONO27B_TARGET_HIDDEN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(sb, h, h2, MONO27B_TARGET_HIDDEN); TRACE("scp+sadd");
+                l_mv_quant_residual(L.ssm_out.ptr, L.ssm_out.ggml_type, L.ssm_out.row_blocks, L.ssm_out.row_count,
+                                    kb, h2, h); TRACE("ssmo+res");
                 CHECK_FINITE_FMT("ssm layer %d output", il, h2, MONO27B_TARGET_HIDDEN);
             } else {
                 if (st->conv_state[ssm_i]) {

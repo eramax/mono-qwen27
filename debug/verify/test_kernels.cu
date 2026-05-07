@@ -24,6 +24,15 @@ static float cpu_softplus(float x) {
     return (x > 20.0f) ? x : logf(1.0f + expf(x));
 }
 
+static void ssm_params_ref(const float * beta_raw, const float * alpha_raw,
+                           const float * dt_bias, const float * a_log,
+                           float * beta, float * dt, int n) {
+    for (int i = 0; i < n; ++i) {
+        beta[i] = cpu_sigmoid(beta_raw[i]);
+        dt[i] = cpu_softplus(alpha_raw[i] + dt_bias[i]) * a_log[i];
+    }
+}
+
 template <int W>
 __device__ float warp_reduce_sum(float v) {
     #pragma unroll
@@ -159,15 +168,19 @@ __global__ static void k_rms_norm_mulw(const float * x, const float * w, float *
     }
 }
 
-__global__ static void k_elem_silu(float * x, int n) {
+__global__ static void k_ssm_params_fused(const float * beta_raw, const float * alpha_raw,
+                                          const float * dt_bias, const float * a_log,
+                                          float * beta, float * dt, int n) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-        float v = x[i];
-        x[i] = v / (1.0f + expf(-v));
+        beta[i] = 1.0f / (1.0f + expf(-beta_raw[i]));
+        float z = alpha_raw[i] + dt_bias[i];
+        float softplus = (z > 20.0f) ? z : logf(1.0f + expf(z));
+        dt[i] = softplus * a_log[i];
     }
 }
 
-__global__ static void k_ssm_conv1d_u(const float * inp, const float * w, float * cs, float * out,
-                                       int cc, int ck) {
+__global__ static void k_ssm_conv1d_silu_u(const float * inp, const float * w, float * cs, float * out,
+                                           int cc, int ck) {
     int ch = blockIdx.x * blockDim.x + threadIdx.x;
     if (ch >= cc) return;
     int sl = ck - 1;
@@ -176,7 +189,7 @@ __global__ static void k_ssm_conv1d_u(const float * inp, const float * w, float 
     s += inp[ch] * w[(size_t)ch * ck + sl];
     for (int k = 0; k < sl - 1; ++k) cs[(size_t)ch * sl + k] = cs[(size_t)ch * sl + k + 1];
     cs[(size_t)ch * sl + (sl - 1)] = inp[ch];
-    out[ch] = s;
+    out[ch] = s / (1.0f + expf(-s));
 }
 
 __global__ static void k_deltanet(
@@ -475,8 +488,7 @@ static bool test_conv1d_silu() {
     cudaMemcpy(d_inp, h_inp.data(), cc * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_w, h_w.data(), cc * ck * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_cs, h_cs.data(), cc * sl * sizeof(float), cudaMemcpyHostToDevice);
-    k_ssm_conv1d_u<<<(cc + 255) / 256, 256>>>(d_inp, d_w, d_cs, d_out, cc, ck);
-    k_elem_silu<<<(cc + 255) / 256, 256>>>(d_out, cc);
+    k_ssm_conv1d_silu_u<<<(cc + 255) / 256, 256>>>(d_inp, d_w, d_cs, d_out, cc, ck);
     cudaMemcpy(h_gpu.data(), d_out, cc * sizeof(float), cudaMemcpyDeviceToHost);
     cudaFree(d_inp); cudaFree(d_w); cudaFree(d_cs); cudaFree(d_out);
 
@@ -484,6 +496,51 @@ static bool test_conv1d_silu() {
     for (int i = 0; i < cc; ++i) max_diff = std::max(max_diff, (double)std::fabs(h_ref[i] - h_gpu[i]));
     printf("Conv1D+SiLU test: max_diff = %.9g %s\n", max_diff, max_diff < 1e-4 ? "PASS" : "FAIL");
     return max_diff < 1e-4;
+}
+
+static bool test_ssm_params_fused() {
+    const int n = 256;
+    std::vector<float> h_beta_raw(n), h_alpha_raw(n), h_dt_bias(n), h_a_log(n);
+    std::vector<float> h_beta_ref(n), h_dt_ref(n), h_beta_gpu(n), h_dt_gpu(n);
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-4.0f, 4.0f);
+    std::uniform_real_distribution<float> pos_dist(0.01f, 2.0f);
+    for (int i = 0; i < n; ++i) {
+        h_beta_raw[i] = dist(rng);
+        h_alpha_raw[i] = dist(rng);
+        h_dt_bias[i] = dist(rng);
+        h_a_log[i] = pos_dist(rng);
+    }
+    ssm_params_ref(h_beta_raw.data(), h_alpha_raw.data(), h_dt_bias.data(), h_a_log.data(),
+                   h_beta_ref.data(), h_dt_ref.data(), n);
+
+    float *d_beta_raw, *d_alpha_raw, *d_dt_bias, *d_a_log, *d_beta, *d_dt;
+    cudaMalloc(&d_beta_raw, n * sizeof(float));
+    cudaMalloc(&d_alpha_raw, n * sizeof(float));
+    cudaMalloc(&d_dt_bias, n * sizeof(float));
+    cudaMalloc(&d_a_log, n * sizeof(float));
+    cudaMalloc(&d_beta, n * sizeof(float));
+    cudaMalloc(&d_dt, n * sizeof(float));
+    cudaMemcpy(d_beta_raw, h_beta_raw.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_alpha_raw, h_alpha_raw.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_dt_bias, h_dt_bias.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_a_log, h_a_log.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+    k_ssm_params_fused<<<(n + 255) / 256, 256>>>(d_beta_raw, d_alpha_raw, d_dt_bias, d_a_log, d_beta, d_dt, n);
+    cudaMemcpy(h_beta_gpu.data(), d_beta, n * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_dt_gpu.data(), d_dt, n * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(d_beta_raw); cudaFree(d_alpha_raw); cudaFree(d_dt_bias); cudaFree(d_a_log);
+    cudaFree(d_beta); cudaFree(d_dt);
+
+    double max_beta_diff = 0.0;
+    double max_dt_diff = 0.0;
+    for (int i = 0; i < n; ++i) {
+        max_beta_diff = std::max(max_beta_diff, (double)std::fabs(h_beta_ref[i] - h_beta_gpu[i]));
+        max_dt_diff = std::max(max_dt_diff, (double)std::fabs(h_dt_ref[i] - h_dt_gpu[i]));
+    }
+    bool ok = max_beta_diff < 1e-5 && max_dt_diff < 1e-5;
+    printf("SSM params test:  beta_diff = %.9g dt_diff = %.9g %s\n",
+           max_beta_diff, max_dt_diff, ok ? "PASS" : "FAIL");
+    return ok;
 }
 
 static bool test_deltanet() {
@@ -610,6 +667,7 @@ int main() {
     ok &= test_l2_norm();
     ok &= test_rms_norm();
     ok &= test_conv1d_silu();
+    ok &= test_ssm_params_fused();
     ok &= test_deltanet();
     ok &= test_deltanet_ggml();
     ok &= test_attn_decode_online();
