@@ -2289,8 +2289,8 @@ extern "C" bool mono27b_engine_decode_step(
             } else {
                 k_elem_sigmoid_mul<<<(MONO27B_TARGET_Q_DIM + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(
                     qb, qb + MONO27B_TARGET_Q_DIM, qb, MONO27B_TARGET_Q_DIM); TRACE("gt");
-                MV(L.wo, qb, h2); TRACE("wo");
-                k_elem_add<<<(MONO27B_TARGET_HIDDEN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(h2, h, MONO27B_TARGET_HIDDEN); TRACE("res1");
+                l_mv_quant_residual(L.wo.ptr, L.wo.ggml_type, L.wo.row_blocks, L.wo.row_count,
+                                    qb, h2, h); TRACE("wo+res1");
             }
 
             l_rms(h, h2, WV(L.post_norm), MONO27B_TARGET_HIDDEN); TRACE("porm");
@@ -2377,8 +2377,8 @@ extern "C" bool mono27b_engine_decode_step(
                             MONO27B_SSM_CONV_CH, MONO27B_SSM_CONV_KERN);
                     }
                 }
-                MV(L.ssm_out, sb, h2);
-                k_elem_add<<<(MONO27B_TARGET_HIDDEN + g_kernel_cfg.elementwise_threads - 1) / g_kernel_cfg.elementwise_threads, g_kernel_cfg.elementwise_threads>>>(h2, h, MONO27B_TARGET_HIDDEN);
+                l_mv_quant_residual(L.ssm_out.ptr, L.ssm_out.ggml_type, L.ssm_out.row_blocks, L.ssm_out.row_count,
+                                    sb, h2, h);
                 CHECK_FINITE_FMT("ssm layer %d output", il, h2, MONO27B_TARGET_HIDDEN);
             }
 
