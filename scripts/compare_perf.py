@@ -5,9 +5,9 @@ import sys, re, subprocess, json, os
 def parse_mono27b_timing(path):
     with open(path) as f:
         text = f.read()
-    gen_m = re.search(r'Generate\s+([\d.]+)\s+ms\s+/\s+(\d+)\s+tok\s+=\s+([\d.]+)\s+tok/s', text)
+    gen_m = re.search(r'Gen:\s+([\d.]+)\s+ms\s+/\s+(\d+)\s+tok\s+=\s+([\d.]+)\s+tok/s', text)
     gen_ms, gen_tok, gen_tps = (float(gen_m.group(1)), int(gen_m.group(2)), float(gen_m.group(3))) if gen_m else (0, 0, 0)
-    prefill_m = re.search(r'Prefill\s+([\d.]+)\s+ms\s+/\s+(\d+)\s+tok\s+=\s+([\d.]+)\s+tok/s', text)
+    prefill_m = re.search(r'Prefill:\s+([\d.]+)\s+ms\s+/\s+(\d+)\s+tok\s+=\s+([\d.]+)\s+tok/s', text)
     prefill_ms, prefill_tok, prefill_tps = (float(prefill_m.group(1)), int(prefill_m.group(2)), float(prefill_m.group(3))) if prefill_m else (0, 0, 0)
 
     m = re.search(r'Timing breakdown \((\d+) tokens, total ([\d.]+) ms/tok\) =+\n(.*?)={3,}', text, re.DOTALL)
@@ -90,7 +90,7 @@ def main():
     print()
     print(f"{'Metric':<30} {'Mono27B':>15} {'llama.cpp':>15} {'Gap':>10}")
     print("-" * 70)
-    print(f"{'Token generation (tok/s)':<30} {data['gen_tps']:>15.2f} {llama_tps or 0:>15.2f} {(llama_tps/data['gen_tps'] if llama_tps else 0):>10.2f}x")
+    print(f"{'Token generation (tok/s)':<30} {data['gen_tps']:>15.2f} {llama_tps or 0:>15.2f} {(llama_tps/data['gen_tps'] if llama_tps and data['gen_tps'] else 0):>10.2f}x")
     print()
 
     cats = categorize(data['rows'])
@@ -98,7 +98,7 @@ def main():
     print("GPU Time Breakdown (Mono27B, ms/tok):")
     print(f"{'Category':<30} {'Mono27B':>12} {'%':>8} {'Est. llama':>12} {'Gap':>10}")
     print("-" * 70)
-    ratio = llama_tps / data['gen_tps'] if llama_tps else 1.0
+    ratio = llama_tps / data['gen_tps'] if llama_tps and data['gen_tps'] else 1.0
     for cat, ms in sorted(cats.items(), key=lambda x: -x[1]):
         pct = ms / total * 100
         est_llama = ms / ratio
@@ -107,11 +107,14 @@ def main():
     print(f"{'Total GPU':<30} {total:>12.2f} {'100.0%':>8} {total/ratio:>12.2f} {total-total/ratio:>10.2f}")
     print()
 
-    wall_ms = data['gen_ms'] / data['gen_tok']
+    wall_ms = data['gen_ms'] / data['gen_tok'] if data['gen_tok'] else 0
     overhead = wall_ms - total
     print(f"Wall clock ms/tok:         {wall_ms:.2f}")
     print(f"GPU work ms/tok:           {total:.2f}")
-    print(f"CPU/overhead ms/tok:       {overhead:.2f}  ({overhead/wall_ms*100:.1f}%)")
+    if wall_ms:
+        print(f"CPU/overhead ms/tok:       {overhead:.2f}  ({overhead/wall_ms*100:.1f}%)")
+    else:
+        print(f"CPU/overhead ms/tok:       {overhead:.2f}  (N/A)")
     print()
 
     print("Top 10 Individual Kernels:")
