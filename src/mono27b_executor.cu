@@ -2212,7 +2212,7 @@ extern "C" bool mono27b_engine_decode_step(
                     l_quant_q8_n(h2, n_q8_q);
                     cudaEventRecord((cudaEvent_t)st->sync_event, 0);
                     cudaStreamWaitEvent((cudaStream_t)st->stream1, (cudaEvent_t)st->sync_event, 0);
-                    l_mv_q8_on(L.wq.ptr, L.wq.ggml_type, L.wq.row_blocks, L.wq.row_count, qb, nullptr, 0);
+                    l_mv_q8_on(L.wq.ptr, L.wq.ggml_type, L.wq.row_blocks, L.wq.row_count, fb, nullptr, 0);
                     l_mv_q8_on(L.wk.ptr, L.wk.ggml_type, L.wk.row_blocks, L.wk.row_count, kb, nullptr, (cudaStream_t)st->stream1);
                     l_mv_q8_on(L.wv.ptr, L.wv.ggml_type, L.wv.row_blocks, L.wv.row_count, kb + MONO27B_TARGET_KV_DIM, nullptr, (cudaStream_t)st->stream1);
                     cudaEventRecord((cudaEvent_t)st->sync_event, (cudaStream_t)st->stream1);
@@ -2221,18 +2221,16 @@ extern "C" bool mono27b_engine_decode_step(
                 }
             }
             if (!parallel_qkv) {
-                MV(L.wq, h2, qb);
+                MV(L.wq, h2, fb);
                 MV(L.wk, h2, kb); TRACE("wk");
                 MV(L.wv, h2, kb + MONO27B_TARGET_KV_DIM); TRACE("wv");
             }
             TRACE("wq");
             // Qwen3Next: Q projection outputs interleaved Q+gate per head:
             // [Q0(256), G0(256), Q1(256), G1(256), ...]
-            // Deinterleave to contiguous Q (6144) and gate (6144).
-            // Use fb as a temporary source buffer to avoid in-place race
-            // (head N overwrites src data that head 0..N-1 still need to read).
+            // Deinterleave from fb to contiguous Q (6144) and gate (6144).
+            // fb is the direct wq output buffer, avoiding an extra D2D copy.
             {
-                cudaMemcpyAsync(fb, qb, MONO27B_TARGET_Q_DIM * 2 * sizeof(float), cudaMemcpyDeviceToDevice);
                 int n_h = MONO27B_TARGET_N_HEAD;
                 int hd = MONO27B_TARGET_HEAD_DIM;
                 k_deinterleave_qg<<<n_h, hd>>>(fb, qb, qb + MONO27B_TARGET_Q_DIM, n_h, hd);
